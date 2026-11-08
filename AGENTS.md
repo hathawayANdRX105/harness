@@ -86,7 +86,8 @@ Follow `.agent/rules/testing-ci.md`. Highlights:
 - Tests live under each crate's `tests/` directory; assert **real behavior** — never `assert!(true)`.
 - Every test carries an English comment stating purpose, scenarios covered, and acceptance criterion.
 - Test runner is nextest (process-per-test) when installed, else `cargo test`; testless narrows to affected tests when installed, else a full run — both fallbacks are fail-open (see `scripts/test-fast.sh`).
-- CI is not set up yet; until it is, `just verify` is the local gate.
+- **GitHub PR CI is the primary test path — prefer it, never "finish locally".** PR CI runs the committed tree's lint + nextest and is the merge gate; fix failures on the same PR. Local loops exist for fast feedback on small scopes only — they never stand in for CI and never authorize a push. (The CI is not set up yet on this branch; until it is, `just verify` + `just test-fast` carry it.)
+- **When you do run locally, use `just test-fast`, not bare `cargo test`** — testless narrows to what the diff can actually break, while `cargo test` re-runs whole crates. Every fallback is loud and declared.
 
 ## 5. Wrap up
 
