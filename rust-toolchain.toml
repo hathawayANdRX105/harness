@@ -1,13 +1,16 @@
-# The repo builds host targets with the Cranelift codegen backend (see
+# Harness builds host targets with the Cranelift codegen backend (see
 # .cargo/config.toml); stable cargo hard-errors on `[profile.*] codegen-backend`,
 # so the whole workspace pins this nightly. It is the same nightly the dylint
-# gate already required (scripts/lint-dioxus.sh), so no second toolchain.
+# gate already required, so no second toolchain.
 #
 # rustc-codegen-cranelift: the alternate backend itself. rustc-dev: the dylint
-# rule-library gate (scripts/lint-dioxus.sh). rust-src: rust-analyzer + dylint.
+# rule-library gate. rust-src: rust-analyzer + dylint.
 [toolchain]
 channel = "nightly-2026-08-20"
-components = ["rustfmt", "clippy", "rust-src", "rustc-dev", "rustc-codegen-cranelift-preview"]
-# wasm32-unknown-unknown: the browser crate set (ui/*, apps/*/web, dev/web,
-# agent-loop) compiles for it via wasm-check.sh and dx.
-targets = ["wasm32-unknown-unknown"]
+components = [
+    "rustfmt",
+    "clippy",
+    "rust-src",
+    "rustc-dev",
+    "rustc-codegen-cranelift-preview",
+]

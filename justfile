@@ -54,81 +54,16 @@ spec-check *args:
 	bash scripts/spec-check.sh {{args}}
 verify: fmt-check clippy check gate
 
-# Product entries → combinations → domains/pages; dev entries stay isolated.
-# The policy source is scripts/layering-policy.toml.
-layering-check:
-	python3 scripts/check-layering.py
-
-# Application capability contract: each app under arch/ declares its capabilities and
-# the crates implementing them; this checks the declaration against the real build
-# conservative ordinary dependency closure from Cargo declarations.
-apps-check:
-	python3 scripts/arch-apps.py
-
-# Normative gate: spec-check + cratebook freshness + layering policy + capability contract
-gate: spec-check cratebook-check layering-check apps-check
+# Normative gate: spec-check only (harness is a standalone headless crate set;
+# no layering/apps/cratebook gates like ferrite's monorepo).
+gate: spec-check
 
 # Pre-merge pipeline: verify -> cratebook freshness -> audit ledger
-premerge: verify cratebook-check audit-check
-
-# Audit ledger: generate / check / panel
-audit-generate:
-	python3 scripts/merge-audit.py generate --worktree
-
-audit-check:
-	python3 scripts/merge-audit.py check --worktree
-
-audit-html:
-	python3 scripts/merge-audit.py html --worktree
-
-# Cratebook: regenerate docs and lock file
-cratebook:
-	python3 scripts/cratebook.py
-
-# Cratebook freshness check
-cratebook-check:
-	python3 scripts/cratebook.py --check
-
-# ---------- worktree cleanup ----------
-# List: just wt-candidates | clean: just wt-clean | dry run: just wt-clean-dry | targets: just wt-targets-clean
-wt-candidates:
-	bash scripts/wt-clean.sh candidates
-
-wt-clean:
-	bash scripts/wt-clean.sh clean
-
-wt-clean-dry:
-	bash scripts/wt-clean.sh clean --dry-run
-
-# Compile diagnosis (read-only)
-build-doctor:
-	bash scripts/build-doctor.sh
-
-# List orphan builds (cwd deleted)
-build-orphans:
-	bash scripts/build-orphans.sh
-
-# Kill orphan builds
-build-orphans-kill:
-	bash scripts/build-orphans.sh --kill
-
-# Clean all .wt/*/target and root target
-wt-targets-clean:
-	#!/usr/bin/env bash
-	set -u; total=0
-	for t in .wt/*/target target; do
-	  [ -d "$t" ] || continue
-	  sz=$(du -sh "$t" | cut -f1); n=0
-	  find "$t" -mindepth 1 -maxdepth 1 -exec sh -c 'gio trash "$1" 2>/dev/null && true' _ {} \; 2>/dev/null
-	  gio trash "$t" 2>/dev/null && { echo "  ✓ trashed $t ($sz)"; total=$((total+1)); }
-	done
-	[ "$total" -eq 0 ] && echo "no cleanable target"
+premerge: verify
 
 # Dev environment health check
 dev-check:
 	#!/usr/bin/env bash
-	echo "== orphan build check (cargo/rustc/sccache with deleted cwd) =="
-	bash scripts/build-orphans.sh --brief || true
 	echo "== process hygiene (see AGENTS.md) =="
 	echo "  1. Long-running services: never 'nohup &' (process group reaped when call ends); use persistent background task + ss"
 	echo "  2. Never pkill -f cargo/rustc (T state != dead, kills parallel session builds); readlink /proc/<pid>/cwd first"
@@ -144,7 +79,3 @@ lint-shell:
 # Testless test selection (function-level impact analysis). Usage: just test-fast [main]
 test-fast base="HEAD":
 	bash scripts/test-fast.sh "{{base}}"
-
-# wasm32 compile gate (testless-gated). Usage: just wasm-check [main]
-wasm-check base="origin/main":
-	scripts/wasm-check.sh "{{base}}"

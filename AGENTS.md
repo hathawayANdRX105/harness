@@ -9,28 +9,24 @@ look them up when needed instead of reading them end to end.
 Read these first (five minutes to a global picture):
 
 1. Root `README.md` crate manifest — the **single source of truth** for module
-   responsibilities; per-crate responsibility lives in the cratebook sources under
-   `arch/cratebook/`.
+   responsibilities.
 2. Root `Cargo.toml` `[workspace.lints.clippy]` — the idiom lints this repo denies;
    skim before writing code so you do not run into them.
 3. Root `checks.toml` — spec policy: which paths each rule covers, severities, the
    semantic-layer endpoint.
 4. `.agent/rules/` — the rule bodies; follow the navigation table above instead of
    reading everything.
-5. `arch/*.toml` — the **application capability contract**: what each product can do
-   and which crates implement each capability. Read it before adding a capability, a
-   dependency, or a feature.
 
 ## Common entry points
 
-| Purpose                        | Command                            |
-| ------------------------------ | ---------------------------------- |
-| Environment checkup            | `just dev-check`                   |
-| Local tests (the only local test entry) | `just test-fast`              |
-| Full check suite (fmt + clippy + check + gates) | `just verify`        |
-| Spec gates                     | `just spec-check`                  |
-| Rust syntax lint (rust-specs dylint) | `cargo +nightly-2026-08-20 dylint --path ~/projects/rust-specs --pattern 'lints/*' --all --workspace` |
-| Worktree cleanup               | `just wt-candidates` → `just wt-clean` |
+| Purpose                                         | Command                                                                                               |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Environment checkup                             | `just dev-check`                                                                                      |
+| Local tests (the only local test entry)         | `just test-fast`                                                                                      |
+| Full check suite (fmt + clippy + check + gates) | `just verify`                                                                                         |
+| Spec gates                                      | `just spec-check`                                                                                     |
+| Rust syntax lint (rust-specs dylint)            | `cargo +nightly-2026-08-20 dylint --path ~/projects/rust-specs --pattern 'lints/*' --all --workspace` |
+| Worktree cleanup                                | `just wt-candidates` → `just wt-clean`                                                                |
 
 ## 2. Prepare the development environment
 
@@ -64,8 +60,6 @@ Cranelift backend per profile in `.cargo/config.toml`: `dev` (host builds, tests
 compiles with Cranelift — roughly 2x faster codegen than LLVM; `ci` and everything else
 stays on LLVM.
 
-- Never run a wasm32 build on the `dev` profile: Cranelift has no wasm32 backend and
-  rustc hard-errors.
 - Never set `[profile.dev] codegen-backend` in `Cargo.toml`: the manifest form needs
   `cargo-features = ["codegen-backend"]`, which breaks any stable cargo parsing the
   manifest. The `.cargo/config.toml` form is the only supported one.
@@ -89,9 +83,7 @@ stays on LLVM.
 - Comments — including doc comments — are written in **English**; keep them true to the code and explain why, not what.
 - Function names are verb-noun and self-explanatory (`parse_channel_config`, not `do_config`); type names state their role.
 - Unit, integration and contract tests live under `tests/`, never inside `src/`.
-- `harness/agent-loop` and frontend libraries under `ui/*` must build for
-  `wasm32-unknown-unknown`. Shared loop/protocol code must not acquire coding host
-  implementations through its Cargo dependency closure.
+- Shared loop/protocol code must not acquire coding host implementations through its Cargo dependency closure.
 - Do not add dead fields or dead code, and never add `#[allow(dead_code)]` to silence a
   warning — delete it or write down why it must stay.
 
@@ -174,12 +166,12 @@ cargo +nightly-2026-08-20 dylint --no-deps --path ~/projects/rust-specs --patter
 - Run locally: `just test-fast` (the only local test entry; testless selects affected cases
   from the diff and exits loudly on anomalies or zero hits — it never skips silently).
 - Also cheap locally: `cargo check -p <crate>`, `cargo clippy -p <crate> --all-targets --
-  -D warnings`, `cargo fmt --check`, and single-case debugging that finishes in about three
+-D warnings`, `cargo fmt --check`, and single-case debugging that finishes in about three
   seconds.
 - Forbidden locally: whole-package tests, a full test binary, e2e, `just test`, and
   `just test-scoped` / `scripts/test-full.sh` (conditional full runs are CI-only; `just test`
   refuses and prints the dispatch command). For a full run via the shell repo: `just ci
-  --full <PR>`.
+--full <PR>`.
 
 ### How tests are written here
 
@@ -246,16 +238,16 @@ checks are not an excuse to open another PR.
   the body follows `.github/PULL_REQUEST_TEMPLATE.md` — section headings in English with
   Chinese content.
 - Validate before creating — run from the rust-specs repo: `cd ~/projects/rust-specs && cargo
-  xtask check github-pr --title "<PR title>" --body-file <body file>`; do not wait for `gh pr
-  create` to reject it.
+xtask check github-pr --title "<PR title>" --body-file <body file>`; do not wait for `gh pr
+create` to reject it.
 - Review findings are fixed on the **same PR**; after opening or updating, watch `gh pr
-  checks` and repair failures immediately instead of waiting to be asked.
+checks` and repair failures immediately instead of waiting to be asked.
 
 ### Merging
 
 - Squash only: `gh pr merge <N> --squash --delete-branch --body "Agent 🤖 - Merge: <reason>"`.
 - `--merge` and `--rebase` are forbidden (including `-m` / `-r`), and so is a local `git merge
-  <branch>` pushed to main — merging goes through a PR.
+<branch>` pushed to main — merging goes through a PR.
 
 ### Issues
 
@@ -263,36 +255,11 @@ checks are not an excuse to open another PR.
   the form name and type label are English; the title and body are written in Chinese; one
   issue describes one main outcome; no unredacted agent output, keys, or user data goes in.
 - Validate title and body before `gh issue create` — run from the rust-specs repo: `cargo
-  xtask check github-issue --title "<issue title>" --body-file <body file>`.
+xtask check github-issue --title "<issue title>" --body-file <body file>`.
 - Creating issues is otherwise forbidden by default (only when the maintainer explicitly asks,
   and report first); findings are fixed on the PR instead of a new issue.
 - Closing an issue needs the maintainer's instruction, and its Done when checklist must be
   fully checked first.
-
-### Merge-audit ledger (optional deep self-check)
-
-`scripts/merge-audit.py` is an optional review tool, not a gate. `just audit-generate` splits
-the working diff into units (file + hunk) and writes `.tmp/merge-audit.md`; `just audit-html`
-renders the maintainer's review panel. Ledger and panel live in `.tmp/` and are never
-committed; `--ledger` re-renders any ledger file through the same template.
-
-- Fill every `Intent:` in Chinese: why the change exists, what was changed, and (for cross-crate
-  moves) which cratebook boundary applies.
-- Then have a subagent review each unit and write `Review:` in Chinese — findings must cite
-  concrete diff evidence; a clean unit is recorded as `Review: ok` (the only English keyword).
-- Findings that stand get a Chinese `Fix:` line describing the action taken; an adjudicated
-  non-fix states the reason. The html panel is what the maintainer reviews before merge.
-
-### Keep the cratebook docs in sync before merge
-
-- If you added, removed, moved, or renamed a crate, changed internal dependencies, edited a
-  cratebook md source, or added/removed `.rs` files: run `just cratebook` and commit the
-  changed docs plus `arch/cratebook/lock.json`.
-- `cratebook_freshness` is a FAIL-level pre-push/merge rule: a stale cratebook blocks the
-  merge and lists the changed crates.
-- The fix path is fixed: edit the `arch/cratebook/files/<layer>.md` source, run `just
-  cratebook`, commit the regenerated docs. Never hand-edit the overview docs or the lock to
-  make the check pass.
 
 ### Delivery record
 

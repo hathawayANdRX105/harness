@@ -1,6 +1,6 @@
 # Harness — inherited from ferrite .cargo/config.toml (dev profile conventions).
 # mold: parallel linker, 5-10x faster than GNU ld, lower link-time memory peak.
-# Requires `mold` package (Arch: pacman -S mold). wasm targets unaffected.
+# Requires `mold` package (Arch: pacman -S mold).
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=--ld-path=/usr/bin/mold"]
@@ -41,11 +41,6 @@ codegen-backend = true
 [profile.dev]
 codegen-backend = "cranelift"
 
-# CI is the quality gate for code that ships (LLVM), and wasm-check.sh compiles
-# the browser crate set for wasm32 under --profile ci.
+# CI is the quality gate for code that ships (LLVM).
 [profile.ci]
-codegen-backend = "llvm"
-
-# dioxus (dx serve/build) compiles the browser apps with --profile wasm-dev.
-[profile.wasm-dev]
 codegen-backend = "llvm"

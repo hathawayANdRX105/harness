@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# pre-push gate — runs spec-check and layering-check.
+# pre-push gate — runs spec-check.
 # FAIL/WARN findings block the push; INFO findings (recorded debt, advisory signals) are
 # printed but do not block: they are owned by their own cleanup PRs.
 #
-# NOTE (harness): this hook assumes the harness repo provides its own `just spec-check`
-# and `just layering-check` (see justfile + scripts/). Until those exist, the hook will
-# print a warning and exit 0 — do not treat that as a clean gate.
+# NOTE (harness): this hook assumes the harness repo provides `just spec-check`
+# (see justfile + scripts/spec-check.sh). Until it exists, the hook will print a
+# warning and exit 0 — do not treat that as a clean gate.
 set -euo pipefail
 REPO=$(git rev-parse --show-toplevel 2>/dev/null)
 cd "$REPO" || exit 1
@@ -28,12 +28,5 @@ if printf '%s\n' "$output" | grep -qE '^\[(FAIL|WARN)\]'; then
 fi
 if ! printf '%s\n' "$output" | grep -qE '^PASS: [0-9]+ findings, 0 failures$'; then
     echo "pre-push blocked: spec-check reported no clean summary (toolchain failure?)." >&2
-    exit 1
-fi
-
-layering="$(just layering-check 2>&1)" || true
-printf '%s\n' "$layering"
-if printf '%s\n' "$layering" | grep -q '"severity": "FAIL"'; then
-    echo "pre-push blocked: layering policy FAIL findings." >&2
     exit 1
 fi
