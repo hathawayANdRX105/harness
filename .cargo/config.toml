@@ -1,0 +1,51 @@
+# Harness — inherited from ferrite .cargo/config.toml (dev profile conventions).
+# mold: parallel linker, 5-10x faster than GNU ld, lower link-time memory peak.
+# Requires `mold` package (Arch: pacman -S mold). wasm targets unaffected.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=--ld-path=/usr/bin/mold"]
+
+[build]
+# Concurrent-session ceiling: each cargo process runs at most 6 parallel units
+# (8 logical cores, leaving ~2 for the desktop).
+jobs = 6
+# sccache compile cache (limits/basedirs: see ~/.config/sccache/config). Rust's
+# cache keys are not isolated per worktree, so dependency artifacts hit across
+# worktrees.
+# (Don't use [env] RUSTC_WRAPPER: cargo reads it itself at startup.)
+rustc-wrapper = "sccache"
+
+[env]
+# Compile in the calling session's cgroup (the .githooks/heavy scope), not in the
+# shared sccache.service cgroup, which has a machine-wide CPUQuota=400%. Client-side
+# mode keeps the shared cache daemon for reads/writes; cache keys and hits are unchanged.
+SCCACHE_CLIENT_SIDE = "1"
+
+# rust-specs checkout for the rule-library gate (`just spec-check` -> `cargo xtask
+# structure`). The entry infers a sibling of the repo root, which only holds for the
+# <projects>/<repo>/.wt/<name> layout; this default makes the gate work from any
+# worktree root. A real RUST_SPECS_DIR in the environment wins (force = false).
+RUST_SPECS_DIR = { value = "/home/hathaway/projects/rust-specs", force = false }
+
+[net]
+git-fetch-with-cli = true
+
+# Cranelift codegen backend: host (non-wasm) debug/test builds use Cranelift,
+# ~2x faster codegen than LLVM in the dev loop. Profile-scoped, NOT target-scoped,
+# so every wasm path that compiles for wasm32 must run on a profile opted back out
+# to "llvm" — the wasm32 backend is not implemented in Cranelift and rustc
+# hard-errors for it.
+[unstable]
+codegen-backend = true
+
+[profile.dev]
+codegen-backend = "cranelift"
+
+# CI is the quality gate for code that ships (LLVM), and wasm-check.sh compiles
+# the browser crate set for wasm32 under --profile ci.
+[profile.ci]
+codegen-backend = "llvm"
+
+# dioxus (dx serve/build) compiles the browser apps with --profile wasm-dev.
+[profile.wasm-dev]
+codegen-backend = "llvm"
