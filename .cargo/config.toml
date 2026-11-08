@@ -1,46 +1,12 @@
-# Harness — inherited from ferrite .cargo/config.toml (dev profile conventions).
-# mold: parallel linker, 5-10x faster than GNU ld, lower link-time memory peak.
-# Requires `mold` package (Arch: pacman -S mold).
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=--ld-path=/usr/bin/mold"]
-
+# harness — cargo 共享基线配置（手机 / 桌面同一份, 不写死任何本机工具）。
+#
+# 设计原则：本文件只放"任何机器都能跑"的通用基线。会因机器而异的优化
+# （sccache 缓存、mold 链接器）不写死在这里——没有该工具的机器会因为
+# cargo 启动时找不到 wrapper / 链接器而直接报错。
+# 优化改为按机器能力**探测式注入**：见 scripts/dev-env.sh，source 进
+# shell 后用 env var 覆盖（env 优先级 > 本文件）。桌面有 sccache/mold
+# 就启用, termux 探测失败则什么也不注入, 自动裸跑。
 [build]
-# Concurrent-session ceiling: each cargo process runs at most 6 parallel units
-# (8 logical cores, leaving ~2 for the desktop).
+# Concurrent-session ceiling: each cargo process runs at most 6 parallel units.
+# 上限语义: 核数少的机器不会超, 手机上也不会塞爆。
 jobs = 6
-# sccache compile cache (limits/basedirs: see ~/.config/sccache/config). Rust's
-# cache keys are not isolated per worktree, so dependency artifacts hit across
-# worktrees.
-# (Don't use [env] RUSTC_WRAPPER: cargo reads it itself at startup.)
-rustc-wrapper = "sccache"
-
-[env]
-# Compile in the calling session's cgroup (the .githooks/heavy scope), not in the
-# shared sccache.service cgroup, which has a machine-wide CPUQuota=400%. Client-side
-# mode keeps the shared cache daemon for reads/writes; cache keys and hits are unchanged.
-SCCACHE_CLIENT_SIDE = "1"
-
-# rust-specs checkout for the rule-library gate (`just spec-check` -> `cargo xtask
-# structure`). The entry infers a sibling of the repo root, which only holds for the
-# <projects>/<repo>/.wt/<name> layout; this default makes the gate work from any
-# worktree root. A real RUST_SPECS_DIR in the environment wins (force = false).
-RUST_SPECS_DIR = { value = "/home/hathaway/projects/rust-specs", force = false }
-
-[net]
-git-fetch-with-cli = true
-
-# Cranelift codegen backend: host (non-wasm) debug/test builds use Cranelift,
-# ~2x faster codegen than LLVM in the dev loop. Profile-scoped, NOT target-scoped,
-# so every wasm path that compiles for wasm32 must run on a profile opted back out
-# to "llvm" — the wasm32 backend is not implemented in Cranelift and rustc
-# hard-errors for it.
-[unstable]
-codegen-backend = true
-
-[profile.dev]
-codegen-backend = "cranelift"
-
-# CI is the quality gate for code that ships (LLVM).
-[profile.ci]
-codegen-backend = "llvm"

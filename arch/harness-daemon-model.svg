@@ -1,0 +1,200 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="980" viewBox="0 0 1280 980" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans CJK SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#d97706"/>
+    </marker>
+    <marker id="arr-purple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#7c3aed"/>
+    </marker>
+    <marker id="arr-gray" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#94a3b8"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+      <feOffset dx="2" dy="4" result="offsetblur"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.15"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <linearGradient id="g-core" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#eff6ff"/><stop offset="100%" stop-color="#dbeafe"/>
+    </linearGradient>
+    <linearGradient id="g-loop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f0fdf4"/><stop offset="100%" stop-color="#dcfce7"/>
+    </linearGradient>
+    <linearGradient id="g-store" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fffbeb"/><stop offset="100%" stop-color="#fef3c7"/>
+    </linearGradient>
+    <linearGradient id="g-acc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#faf5ff"/><stop offset="100%" stop-color="#f3e8ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="980" fill="#f8fafc" rx="18"/>
+
+  <text x="640" y="38" text-anchor="middle" font-size="21" font-weight="700" fill="#0f172a">Harness Daemon 重写心智模型</text>
+  <text x="640" y="60" text-anchor="middle" font-size="13" fill="#64748b">单进程 · 多 Tokio Task · 全局调度 / 会话 / 工具 / 上下文 / 配置装配</text>
+
+  <!-- ================= 顶部：外部客户端（与接入层三段对齐） ================= -->
+  <g filter="url(#shadow)">
+    <rect x="335" y="80" width="280" height="86" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+    <rect x="640" y="80" width="280" height="86" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+    <rect x="945" y="80" width="280" height="86" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  </g>
+  <text x="475" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#334155">HTTP 客户端 / Webhook</text>
+  <text x="475" y="128" text-anchor="middle" font-size="11" fill="#64748b">HTTP + SSE 流式</text>
+  <text x="475" y="148" text-anchor="middle" font-size="11" fill="#64748b">请求 / 事件推送</text>
+
+  <text x="780" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#334155">UI（桌面 / 移动 / Web）</text>
+  <text x="780" y="128" text-anchor="middle" font-size="11" fill="#64748b">WebSocket 长连接</text>
+  <text x="780" y="148" text-anchor="middle" font-size="11" fill="#64748b">wire 协议（harness/protocol）</text>
+
+  <text x="1085" y="106" text-anchor="middle" font-size="13" font-weight="600" fill="#334155">CLI / IDE / 本机脚本</text>
+  <text x="1085" y="128" text-anchor="middle" font-size="11" fill="#64748b">UDS 控制面（本机）</text>
+  <text x="1085" y="148" text-anchor="middle" font-size="11" fill="#64748b">生命周期 / 单实例锁</text>
+
+  <!-- 外部 → 接入层 -->
+  <line x1="475" y1="166" x2="475" y2="246" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr-gray)"/>
+  <line x1="780" y1="166" x2="780" y2="246" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr-gray)"/>
+  <line x1="1085" y1="166" x2="1085" y2="246" stroke="#94a3b8" stroke-width="2" marker-end="url(#arr-gray)"/>
+
+  <!-- ================= 进程边界 ================= -->
+  <rect x="315" y="196" width="930" height="620" rx="16" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="331" y="216" font-size="14" font-weight="600" fill="#334155">Harness Daemon</text>
+  <text x="331" y="234" font-size="11.5" fill="#64748b">单 OS 进程</text>
+
+  <!-- ================= 接入层（横条） ================= -->
+  <rect x="335" y="248" width="890" height="64" rx="10" fill="#f0f9ff" stroke="#0284c7" stroke-width="2" filter="url(#shadow)"/>
+  <text x="355" y="274" font-size="13" font-weight="700" fill="#0369a1">接入层 Transport</text>
+  <text x="355" y="296" font-size="11" fill="#475569">HTTP+SSE · WebSocket 会话 · UDS 控制面 · 鉴权 · slash 命令解析 · 路由到 scheduler</text>
+  <text x="1205" y="274" text-anchor="end" font-size="10.5" fill="#0369a1">harness/protocol</text>
+
+  <!-- 接入层 → scheduler -->
+  <line x1="552" y1="312" x2="552" y2="356" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-blue)"/>
+
+  <!-- ================= 调度 + 会话（横排两块） ================= -->
+  <g filter="url(#shadow)">
+    <rect x="335" y="360" width="435" height="120" rx="10" fill="url(#g-core)" stroke="#2563eb" stroke-width="2"/>
+    <rect x="790" y="360" width="435" height="120" rx="10" fill="url(#g-core)" stroke="#2563eb" stroke-width="2"/>
+  </g>
+  <text x="355" y="384" font-size="14" font-weight="700" fill="#1d4ed8">Global Scheduler 全局调度器</text>
+  <text x="355" y="406" font-size="11" fill="#475569">• 请求 → Tokio Task 路由 · 优先级队列</text>
+  <text x="355" y="424" font-size="11" fill="#475569">• 背压 / 限流 · Task 生命周期监管</text>
+  <text x="355" y="442" font-size="11" fill="#475569">• 事件总线：loop 事件 → 接入层回推</text>
+  <text x="750" y="466" text-anchor="end" font-size="10.5" fill="#1e40af">harness/daemon</text>
+
+  <text x="810" y="384" font-size="14" font-weight="700" fill="#1d4ed8">Global Session Manager 会话管理</text>
+  <text x="810" y="406" font-size="11" fill="#475569">• 创建 / 恢复 / 销毁 · Session ↔ Task 绑定</text>
+  <text x="810" y="424" font-size="11" fill="#475569">• 多会话并发 · 会话恢复（断线重连）</text>
+  <text x="810" y="442" font-size="11" fill="#475569">• 快照 → 持久层（harness/session）</text>
+  <text x="1205" y="466" text-anchor="end" font-size="10.5" fill="#1e40af">harness/session + daemon</text>
+
+  <!-- scheduler → loops / session → loops -->
+  <line x1="552" y1="480" x2="552" y2="516" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-blue)"/>
+  <line x1="1007" y1="480" x2="1007" y2="516" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-blue)"/>
+
+  <!-- ================= Harness Loop（大块） ================= -->
+  <g filter="url(#shadow)">
+    <rect x="335" y="520" width="890" height="150" rx="10" fill="url(#g-loop)" stroke="#16a34a" stroke-width="2"/>
+  </g>
+  <text x="355" y="544" font-size="14" font-weight="700" fill="#15803d">Harness Loop × N（每个 Tokio Task 一个运行 loop）</text>
+  <text x="355" y="562" font-size="11" fill="#166534">run() → LLM 流式请求 → 流事件 → tool call → 结果回灌 → 循环，直到结束 / 被打断</text>
+
+  <g filter="url(#shadow)">
+    <rect x="355" y="576" width="275" height="76" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.5"/>
+    <rect x="640" y="576" width="275" height="76" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.5"/>
+    <rect x="925" y="576" width="280" height="76" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.5"/>
+  </g>
+  <text x="492" y="598" text-anchor="middle" font-size="12" font-weight="600" fill="#14532d">Agent Loop（harness/agent-loop）</text>
+  <text x="492" y="618" text-anchor="middle" font-size="10.5" fill="#475569">流式事件泵 · Tool 调用契约</text>
+  <text x="492" y="636" text-anchor="middle" font-size="10.5" fill="#475569">上下文卫生（截断 / 防护）</text>
+
+  <text x="777" y="598" text-anchor="middle" font-size="12" font-weight="600" fill="#14532d">LLM Client（harness/llm）</text>
+  <text x="777" y="618" text-anchor="middle" font-size="10.5" fill="#475569">OpenAI 兼容 SSE 适配</text>
+  <text x="777" y="636" text-anchor="middle" font-size="10.5" fill="#475569">上游选择 / 重试 / 降级</text>
+
+  <text x="1065" y="598" text-anchor="middle" font-size="12" font-weight="600" fill="#14532d">Tool Executor（harness/tools）</text>
+  <text x="1065" y="618" text-anchor="middle" font-size="10.5" fill="#475569">terminal / subagent / jobs / skill</text>
+  <text x="1065" y="636" text-anchor="middle" font-size="10.5" fill="#475569">权限门 / 审计</text>
+
+  <!-- loop → 底部服务（三条竖线） -->
+  <line x1="475" y1="670" x2="475" y2="706" stroke="#d97706" stroke-width="2" marker-end="url(#arr-orange)"/>
+  <line x1="780" y1="670" x2="780" y2="706" stroke="#d97706" stroke-width="2" marker-end="url(#arr-orange)"/>
+  <line x1="1085" y1="670" x2="1085" y2="706" stroke="#d97706" stroke-width="2" marker-end="url(#arr-orange)"/>
+  <text x="483" y="694" font-size="10" fill="#b45309">压缩</text>
+  <text x="788" y="694" font-size="10" fill="#b45309">调用</text>
+  <text x="1093" y="694" font-size="10" fill="#b45309">落盘</text>
+
+  <!-- ================= 底部：三个全局服务 ================= -->
+  <g filter="url(#shadow)">
+    <rect x="335" y="710" width="280" height="86" rx="10" fill="url(#g-core)" stroke="#2563eb" stroke-width="2"/>
+    <rect x="640" y="710" width="280" height="86" rx="10" fill="url(#g-core)" stroke="#2563eb" stroke-width="2"/>
+    <rect x="945" y="710" width="280" height="86" rx="10" fill="url(#g-store)" stroke="#d97706" stroke-width="2"/>
+  </g>
+  <text x="475" y="734" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">Context Compaction</text>
+  <text x="475" y="754" text-anchor="middle" font-size="11" fill="#475569">预算校验的三层压缩</text>
+  <text x="475" y="772" text-anchor="middle" font-size="11" fill="#475569">harness/compaction</text>
+
+  <text x="780" y="734" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">MCP Client Pool</text>
+  <text x="780" y="754" text-anchor="middle" font-size="11" fill="#475569">JSON-RPC over stdio / HTTP</text>
+  <text x="780" y="772" text-anchor="middle" font-size="11" fill="#475569">harness/mcp</text>
+
+  <text x="1085" y="734" text-anchor="middle" font-size="13" font-weight="700" fill="#b45309">Session Store 持久层</text>
+  <text x="1085" y="754" text-anchor="middle" font-size="11" fill="#78350f">Turso / PG · 消息 / 快照 / 图索引 / 任务账本</text>
+  <text x="1085" y="772" text-anchor="middle" font-size="11" fill="#78350f">harness/session</text>
+
+  <!-- session manager → store（右缘走廊绕行，避开 loops 大块） -->
+  <path d="M 1205 484 L 1235 484 L 1235 745 L 1229 745" fill="none" stroke="#d97706" stroke-width="2" marker-end="url(#arr-orange)"/>
+  <text x="1232" y="620" font-size="10" fill="#b45309" transform="rotate(-90 1232,620)" text-anchor="middle">快照落盘</text>
+
+  <!-- ================= 左列：启动装配（Presets → Builder → Config） ================= -->
+  <g filter="url(#shadow)">
+    <rect x="40" y="248" width="235" height="96" rx="10" fill="url(#g-acc)" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="40" y="360" width="235" height="120" rx="10" fill="url(#g-acc)" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="40" y="520" width="235" height="150" rx="10" fill="url(#g-acc)" stroke="#7c3aed" stroke-width="2"/>
+  </g>
+  <text x="157" y="270" text-anchor="middle" font-size="13.5" font-weight="700" fill="#6d28d9">Presets 预设</text>
+  <text x="157" y="290" text-anchor="middle" font-size="10.5" fill="#475569">产品形态差异 = 应用组合</text>
+  <text x="157" y="307" text-anchor="middle" font-size="10.5" fill="#475569">coder / tavern / relay 各选能力</text>
+  <text x="157" y="324" text-anchor="middle" font-size="10.5" fill="#475569">arch/*.toml 能力契约</text>
+  <text x="157" y="338" text-anchor="middle" font-size="10" fill="#7c3aed">preset 决定 Builder 参数</text>
+
+  <text x="157" y="384" text-anchor="middle" font-size="13.5" font-weight="700" fill="#6d28d9">Builder（结构体）</text>
+  <text x="157" y="404" text-anchor="middle" font-size="10.5" fill="#475569">HarnessBuilder::new()</text>
+  <text x="157" y="421" text-anchor="middle" font-size="10.5" fill="#475569">.with_tools / .with_mcp / .with_hooks</text>
+  <text x="157" y="438" text-anchor="middle" font-size="10.5" fill="#475569">.build() → daemon 运行时</text>
+  <text x="157" y="455" text-anchor="middle" font-size="10.5" fill="#475569">显式注入 · 无 coding 默认 fallback</text>
+  <text x="157" y="472" text-anchor="middle" font-size="10" fill="#7c3aed">组合根：combo/coder-host</text>
+
+  <text x="157" y="546" text-anchor="middle" font-size="13.5" font-weight="700" fill="#6d28d9">Config 配置加载</text>
+  <text x="157" y="568" text-anchor="middle" font-size="10.5" fill="#475569">config 文件 + env 覆盖 + 默认值</text>
+  <text x="157" y="585" text-anchor="middle" font-size="10.5" fill="#475569">harness/config 分层合并</text>
+  <text x="157" y="602" text-anchor="middle" font-size="10.5" fill="#475569">上游地址 / 模型别名 / 密钥变量名</text>
+  <text x="157" y="619" text-anchor="middle" font-size="10.5" fill="#475569">会话目录 / 压缩预算 / MCP server 清单</text>
+  <text x="157" y="636" text-anchor="middle" font-size="10.5" fill="#475569">hooks / skills / slash 注册来源</text>
+  <text x="157" y="658" text-anchor="middle" font-size="10" fill="#7c3aed">密钥只存变量名，不落盘明文</text>
+
+  <!-- Presets → Builder（纵短箭头） -->
+  <line x1="157" y1="344" x2="157" y2="356" stroke="#7c3aed" stroke-width="2" marker-end="url(#arr-purple)"/>
+  <!-- Builder → scheduler -->
+  <line x1="275" y1="420" x2="331" y2="420" stroke="#7c3aed" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#arr-purple)"/>
+  <!-- Config → loops -->
+  <line x1="275" y1="595" x2="331" y2="595" stroke="#7c3aed" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#arr-purple)"/>
+
+  <!-- ================= 底部：细节清单 ================= -->
+  <rect x="40" y="816" width="1185" height="146" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="60" y="840" font-size="13" font-weight="700" fill="#0f172a">细节机制（Agent 行为扩展点，全部经 Builder / Config 注入）</text>
+
+  <text x="60" y="864" font-size="11.5" fill="#475569">❑ Hooks：loop 前/后 · tool 调用前后 · 压缩触发时 — 可拦截 / 改写 / 短路</text>
+  <text x="60" y="884" font-size="11.5" fill="#475569">❑ Skills：技能包按需加载，Agent 自主调用（harness/tools/skill）</text>
+  <text x="60" y="904" font-size="11.5" fill="#475569">❑ Slash Commands：接入层解析用户快捷指令 → 映射 loop 操作</text>
+  <text x="60" y="924" font-size="11.5" fill="#475569">❑ Tools 全集：read / edit / write / glob / grep / terminal / webfetch / subagent / todo — Registry 统一注册 + 版本化 + 权限门</text>
+  <text x="60" y="944" font-size="11.5" fill="#475569">❑ 上游连接：OpenAI 兼容 SSE → ferrite relay / 任意兼容端点；模型别名解析 · 重试 · 降级</text>
+  <text x="60" y="958" font-size="10.5" fill="#94a3b8">颜色：蓝 = 全局单例 · 绿 = 每-Task 隔离 · 紫 = 启动装配 · 橙 = 持久化 · 虚线框 = 进程边界</text>
+
+</svg>

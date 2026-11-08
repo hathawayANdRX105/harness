@@ -1,32 +1,16 @@
 #!/usr/bin/env bash
-# pre-push gate — runs spec-check.
-# FAIL/WARN findings block the push; INFO findings (recorded debt, advisory signals) are
-# printed but do not block: they are owned by their own cleanup PRs.
+# pre-push gate — 本地轻量守卫：fmt --check + clippy（harn CI lint job 的本地版）。
 #
-# NOTE (harness): this hook assumes the harness repo provides `just spec-check`
-# (see justfile + scripts/spec-check.sh). Until it exists, the hook will print a
-# warning and exit 0 — do not treat that as a clean gate.
+# harn 暂无 rust-specs spec-check（无 xtask workspace，且 rust-specs dylint 需要
+# nightly；harn 日常用 stable）。待 rust-specs 接入后再在这里加 spec-check gate。
 set -euo pipefail
 REPO=$(git rev-parse --show-toplevel 2>/dev/null)
 cd "$REPO" || exit 1
 
-if ! command -v just >/dev/null 2>&1; then
-    echo "pre-push: 'just' not found — skipping gate (install just or implement hooks manually)." >&2
-    exit 0
-fi
+echo "== fmt --check =="
+cargo fmt --all -- --check
 
-if ! just spec-check >/dev/null 2>&1; then
-    echo "pre-push: 'just spec-check' failed — implement scripts/spec-check.sh or remove this block." >&2
-    exit 0
-fi
+echo "== clippy (workspace, -D warnings) =="
+cargo clippy --workspace --all-targets -- -D warnings
 
-output="$(just spec-check 2>&1)" || true
-printf '%s\n' "$output"
-if printf '%s\n' "$output" | grep -qE '^\[(FAIL|WARN)\]'; then
-    echo "pre-push blocked: spec-check FAIL/WARN findings must be fixed." >&2
-    exit 1
-fi
-if ! printf '%s\n' "$output" | grep -qE '^PASS: [0-9]+ findings, 0 failures$'; then
-    echo "pre-push blocked: spec-check reported no clean summary (toolchain failure?)." >&2
-    exit 1
-fi
+echo "✓ pre-push gate passed"

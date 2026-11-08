@@ -2,7 +2,7 @@
 # heavy — 用 cgroup CPU 配额跑 CPU 密集命令（cargo / npm / bun / makepkg / 测试 …）。
 #
 # 用法:
-#   .githooks/heavy cargo build -p api
+#   .githooks/heavy cargo build -p harn-core
 #   .githooks/heavy cargo test -p <crate>
 #
 # 为什么按核数现算, 而不是写死百分比:
@@ -17,9 +17,13 @@
 # 配额 = 一半核 (下限 100%): 8 核机器上 400% —— 比原来的 0.7 核快约 5.7 倍,
 # 同时留一半核给桌面与其它会话。
 #
+# 平台降级:
+#   无 systemd 的环境（termux 手机 / WSL1 / 纯容器）没有配额可言, 直接裸跑命令,
+#   只打印一行提示——heavy 的意义是防多会话抢占, 单用户环境无此需求。
+#
 # 环境变量:
 #   HEAVY_VERBOSE=1  打印实际配额到 stderr
-#   CANON_HEAVY=1    本脚本在 scope 内注入的"已在配额内"标记; 嵌套调用见到它就直接
+#   HEAVY_IN_SCOPE=1 本脚本在 scope 内注入的"已在配额内"标记; 嵌套调用见到它就直接
 #                    透传, 不再新建 scope(幂等)。理由见下方标记判断处的注释。
 set -eu
 
@@ -34,9 +38,17 @@ set -eu
 #   当成通过 —— 命令其实压根没跑, 门却变绿了。
 #   也不能改用"探测能否起 systemd"来判: 那种探测在没有用户 systemd 会话的环境里
 #   一样失败, 但那是**另一种**处境(该裸跑, 且没有配额可继承), 两者必须区分开。
-if [ "${CANON_HEAVY:-}" = "1" ]; then
+if [ "${HEAVY_IN_SCOPE:-}" = "1" ]; then
     if [ "${HEAVY_VERBOSE:-}" = "1" ]; then
-        echo "heavy: 已在配额内 (CANON_HEAVY=1), 直接执行不新建 scope" >&2
+        echo "heavy: 已在配额内 (HEAVY_IN_SCOPE=1), 直接执行不新建 scope" >&2
+    fi
+    exec "$@"
+fi
+
+# 无 systemd（termux 等）→ 裸跑, 打印提示。
+if ! command -v systemd-run >/dev/null 2>&1; then
+    if [ "${HEAVY_VERBOSE:-}" = "1" ]; then
+        echo "heavy: 无 systemd-run, 裸跑（无配额）" >&2
     fi
     exec "$@"
 fi
@@ -49,4 +61,4 @@ if [ "${HEAVY_VERBOSE:-}" = "1" ]; then
     echo "heavy: CPUQuota=${quota}% (nproc=${cores})" >&2
 fi
 
-exec systemd-run --user --scope -q -p "CPUQuota=${quota}%" --setenv=CANON_HEAVY=1 -- "$@"
+exec systemd-run --user --scope -q -p "CPUQuota=${quota}%" --setenv=HEAVY_IN_SCOPE=1 -- "$@"

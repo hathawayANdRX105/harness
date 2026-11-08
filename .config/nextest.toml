@@ -4,38 +4,19 @@
 # ------------------
 # nextest 是 **process-per-test**：每个测试用例独立起一个进程（官方设计，见
 # nextest 文档 "Why process-per-test?"）。这与 `cargo test` 的 shared-process
-# 模型根本不同。
+# 模型根本不同：同一个 test binary 内的用例不再共享进程，进程内互斥量
+# （`static SERIAL` 之类）跨用例失效，nextest 也会并行跑不同 test binary。
 #
-# 换成 nextest 后，原有的进程内互斥和 cargo 串行跑 test binary 的两道防线
-# 都会失效：
-#   ① 每个用例是独立进程 → `static SERIAL` 跨用例无效；
-#   ② nextest 并行跑所有 test binary → 不同 binary 之间也会并发。
+# 若将来出现「共享资源被并行测试插行」的问题（例如共享文件 / 端口 / mock
+# LSP 服务），用 nextest 的 **test group** 把相关测试归入单线程组：
+# test group 是 nextest 的跨进程互斥机制（需 nextest >= 0.9.48）。
 #
-# 于是「同一个 PG 库里、写同一批表、读全局计数」的不同测试会在彼此的
-# before/after 观测窗口里插行，差值断言从 1 变成 2/3。
-#
-# 修法
-# ----
-# 用 nextest 的 **test group** 把「碰同一个 PG 库」的测试归入单线程组。
-# test group 是 nextest 的跨进程互斥机制（需 nextest >= 0.9.48）。它替代
-# 原来那两道失效的防线。
-#
-# 纳入标准：测试用例会连到**同一个** PG 库并写/读其中的共享表。
-#   - CI 里 DATABASE_URL 与 HARNESS_E2E_DATABASE_URL 指向同一个库，
-#     故两条路径都算。
-#   - 各用独立 turso 文件 / 独立 schema 的测试**不纳入**。
-#
-# 成本：单线程组内的测试串行执行。组内用例总量约 200 条，实测单条多在
-# 秒级，串行代价远小于「CI 间歇红 + 反复重跑」。
+# harn 目前的测试是纯单元 / 集成 / TUI smoke，无共享数据库，暂不需要
+# test-group；保留本文件作为框架与说明。
 
-[test-groups]
-# 碰同一个 PG 库的测试：组内串行（max-threads = 1）。
-db-serial = { max-threads = 1 }
+# [test-groups]
+# serial = { max-threads = 1 }
 
 # [[profile.default.overrides]]
-# harness 尚无固定 crate 集，先留空。待测试 crate 确定后，按下列形式
-# 将写共享 PG 库的测试包纳入 db-serial 组：
-#
-# [[profile.default.overrides]]
-# filter = 'package(harness-tests-http) | package(harness-api-control-plane)'
-# test-group = 'db-serial'
+# filter = 'package(harn-ui)'
+# test-group = 'serial'

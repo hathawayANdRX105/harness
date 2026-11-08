@@ -1,16 +1,7 @@
-# Harness builds host targets with the Cranelift codegen backend (see
-# .cargo/config.toml); stable cargo hard-errors on `[profile.*] codegen-backend`,
-# so the whole workspace pins this nightly. It is the same nightly the dylint
-# gate already required, so no second toolchain.
+# harness 日常与 CI 都用 stable。
 #
-# rustc-codegen-cranelift: the alternate backend itself. rustc-dev: the dylint
-# rule-library gate. rust-src: rust-analyzer + dylint.
+# nightly 的用法：rustup 的 `+<toolchain>` 命令行参数优先级高于本文件，
+# 所以 rust-specs dylint 门可以显式 `cargo +nightly-2026-08-20 dylint ...`
+# 覆盖，而不影响日常构建。无 nightly 的机器（termux）该门 skip。
 [toolchain]
-channel = "nightly-2026-08-20"
-components = [
-    "rustfmt",
-    "clippy",
-    "rust-src",
-    "rustc-dev",
-    "rustc-codegen-cranelift-preview",
-]
+channel = "stable"
