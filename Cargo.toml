@@ -1,0 +1,18 @@
+# Harness workspace root — scaffold.
+#
+# Carries the toolchain + profile wiring the project builds on: the dev profile
+# compiles with the Cranelift codegen backend (.cargo/config.toml), the ci
+# profile stays on LLVM (the backend CI validates). [profile.ci] is defined
+# here so the config override resolves. Real crates land under crates/ as
+# members; until then this root package is the buildable anchor.
+
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"

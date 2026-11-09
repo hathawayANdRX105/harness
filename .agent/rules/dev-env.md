@@ -8,7 +8,7 @@
 
 The probe script is `scripts/dev-env.sh` — read its header comment for why each probe is written the way it is. Summary of the model:
 
-- `.cargo/config.toml` holds only the shared baseline (jobs ceiling). Never hardcode `sccache` / `mold` into it — machines lacking the tool then fail to start cargo.
+- `.cargo/config.toml` holds the shared baseline: the `jobs` ceiling plus the **profile-scoped Cranelift codegen backend** (a workspace build contract, not a machine detail). Never hardcode `sccache` / `mold` into it — machines lacking the tool then fail to start cargo.
 - Per-machine optimizations (sccache, mold) are injected by sourcing `scripts/dev-env.sh`, which probes and exports env vars (env > project config in cargo's precedence). Desktop enables them; termux probes find nothing and silently run plain cargo.
 - Command-path choices (nextest vs `cargo test`, testless vs full run, dylint gate vs skip) happen at run time via `command -v` in justfile/scripts.
 
@@ -33,5 +33,5 @@ HARNESS_DEV_ENV_VERBOSE=1 . scripts/dev-env.sh
 
 ## 4. Toolchain notes
 
-- Stable toolchain; harness targets `rust-version = "1.99"`, edition 2024. The cargo fork (`huacnlee/cargo`), if installed, replaces `~/.cargo/bin/cargo` and shares one target directory across all worktrees with a self-limited size.
+- **nightly-2026-08-20 + Cranelift**: `rust-toolchain.toml` pins this nightly (Cranelift needs the unstable `codegen-backend` gate). The dev profile compiles with Cranelift (`.cargo/config.toml`), the ci profile stays on LLVM — the backend CI validates and that ships. The cargo fork (`huacnlee/cargo`), if installed, replaces `~/.cargo/bin/cargo` and shares one target directory across all worktrees with a self-limited size.
 - nextest config, if any test-group serialization is needed, lives at `.config/nextest.toml` — that path is fixed by nextest, not movable into `.cargo/`.

@@ -4,7 +4,7 @@ default: check
 
 # Build check
 check:
-	cargo check
+	cargo check --workspace --all-targets
 
 # Format
 fmt:
@@ -14,25 +14,18 @@ fmt:
 fmt-check:
 	cargo fmt --all --check
 
-# Clippy
+# Clippy (same backend as CI: LLVM via --profile ci)
 clippy:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --profile ci -- -D warnings
 
 # Build binary
 build:
 	cargo build
 
-# Full test (local refused until the project has code / CI; TEST_FORCE=1 overrides)
+# Full test run (workspace). Daily entry is `just test-fast`; full runs belong
+# to CI, local is fine too — this suite is small.
 test:
-	#!/usr/bin/env bash
-	set -uo pipefail
-	if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ "${TEST_FORCE:-}" != "1" ]; then
-		echo "✗ Local full test rejected (project has no test code yet / CI not configured)"
-		echo "  Daily validation: just test-fast"
-		echo "  Maintainer forced local full: TEST_FORCE=1 just test"
-		exit 1
-	fi
-	exec cargo test --all
+	cargo nextest run --workspace
 
 # Normative checks (rust-specs dylint, pre-built library loading). Usage:
 #   just spec-check          # run the lint gate (skips with a notice when nightly/dylint/libs are missing)
@@ -64,6 +57,6 @@ lint-shell:
 	mapfile -t tracked < <(git ls-files '*.sh' 'bin/*.sh' 'lib/*.sh' | grep -v '^\.wt/')
 	shellcheck --format=gcc --severity=style "${tracked[@]}" && echo "✓ shellcheck passed (${#tracked[@]} files)"
 
-# Testless test selection (falls back to a full run when testless is absent). Usage: just test-fast [base]
-test-fast base="HEAD":
+# Testless test selection (testless → nextest). Usage: just test-fast [base]
+test-fast base="origin/master":
 	bash scripts/test-fast.sh "{{base}}"

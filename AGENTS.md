@@ -57,15 +57,11 @@ precedence). Desktops enable them; termux phones probe, find nothing, and
 silently run plain cargo — same files, no fork. Read the full story in
 `.agent/rules/dev-env.md` and the header comment of `scripts/dev-env.sh`.
 
-### Toolchain
+### Toolchain: pinned nightly, two codegen backends
 
-- `rust-toolchain.toml` pins **stable** — that is what CI and daily builds
-  use (edition 2024, resolver 3).
-- Nightly is only for the rust-specs dylint gate. rustup's `+<toolchain>`
-  command-line argument overrides `rust-toolchain.toml`, so run it as
-  `cargo +nightly-2026-08-20 dylint ...` without changing the pin (the
-  spec-check script already does this). On machines without nightly (termux),
-  the gate skips with a notice.
+- `rust-toolchain.toml` pins **nightly-2026-08-20** (Cranelift needs the unstable `codegen-backend` gate) with the `rustc-codegen-cranelift-preview`, `rustc-dev`, and `rust-src` components — one toolchain serves cranelift + the rust-specs dylint gate + rust-analyzer.
+- `.cargo/config.toml` selects the **Cranelift** backend for the `dev` profile (~2x faster codegen in the local loop) and **LLVM** for the `ci` profile — the backend CI validates and that ships. The same nightly the dylint gate uses, so `cargo +nightly-2026-08-20 dylint ...` needs no separate toolchain.
+- Never put `codegen-backend` into `Cargo.toml [profile.*]`: the manifest form needs `cargo-features`, which breaks stable cargo parsing. The `.cargo/config.toml` form is the only supported one.
 - If the `huacnlee/cargo` fork is installed, it replaces `~/.cargo/bin/cargo`
   and shares one target directory across all worktrees, self-limited in size.
 
@@ -86,7 +82,8 @@ Follow `.agent/rules/testing-ci.md`. Highlights:
 - Tests live under each crate's `tests/` directory; assert **real behavior** — never `assert!(true)`.
 - Every test carries an English comment stating purpose, scenarios covered, and acceptance criterion.
 - Test runner is nextest (process-per-test) when installed, else `cargo test`; testless narrows to affected tests when installed, else a full run — both fallbacks are fail-open (see `scripts/test-fast.sh`).
-- **GitHub PR CI is the primary test path — prefer it, never "finish locally".** PR CI runs the committed tree's lint + nextest and is the merge gate; fix failures on the same PR. Local loops exist for fast feedback on small scopes only — they never stand in for CI and never authorize a push. (The CI is not set up yet on this branch; until it is, `just verify` + `just test-fast` carry it.)
+- **Run `just spec-check` (rust-specs dylint) before pushing** — it is wired into `.githooks/pre-push` and the CI `spec-check` job. First time on a machine: `just spec-check build`.
+- **GitHub PR CI is the primary test path — prefer it, never "finish locally".** PR CI runs the committed tree's `lint` + `spec-check` (rust-specs dylint) + `test` (PR lane = `test-fast`, master-push lane = full workspace), all `--profile ci`, and is the merge gate; fix failures on the same PR. Local loops exist for fast feedback on small scopes only — they never stand in for CI and never authorize a push.
 - **When you do run locally, use `just test-fast`, not bare `cargo test`** — testless narrows to what the diff can actually break, while `cargo test` re-runs whole crates. Every fallback is loud and declared.
 
 ## 5. Wrap up

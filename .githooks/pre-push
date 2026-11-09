@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# pre-push gate — 本地轻量守卫：fmt --check + clippy（harn CI lint job 的本地版）。
+# pre-push gate — 本地轻量守卫：fmt --check + clippy + spec-check（dylint 语法门）。
 #
-# harn 暂无 rust-specs spec-check（无 xtask workspace，且 rust-specs dylint 需要
-# nightly；harn 日常用 stable）。待 rust-specs 接入后再在这里加 spec-check gate。
+# spec-check 是 rust-specs 的 dylint 语法门（预编译库加载，见 scripts/spec-check.sh）。
+# 缺 nightly/dylint/预编译库时它 skip 并 exit 0 —— 本地守卫不阻塞，CI 才是主门。
 set -euo pipefail
 REPO=$(git rev-parse --show-toplevel 2>/dev/null)
 cd "$REPO" || exit 1
@@ -10,7 +10,11 @@ cd "$REPO" || exit 1
 echo "== fmt --check =="
 cargo fmt --all -- --check
 
-echo "== clippy (workspace, -D warnings) =="
-cargo clippy --workspace --all-targets -- -D warnings
+echo "== clippy (workspace, --profile ci, -D warnings) =="
+# --profile ci：与 CI 同一后端（LLVM）做 lint，本地日常编译走 cranelift 不冲突。
+cargo clippy --workspace --all-targets --profile ci -- -D warnings
+
+echo "== spec-check (rust-specs dylint) =="
+bash scripts/spec-check.sh
 
 echo "✓ pre-push gate passed"

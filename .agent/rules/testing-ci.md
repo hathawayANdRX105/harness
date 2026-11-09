@@ -12,17 +12,17 @@ Read order: §1–§2 before writing a test, §3 when a gate blocks you, §4 whe
 - Every test carries an English comment stating its **purpose**, the **scenarios it covers**, and the **acceptance criterion** it asserts.
 - **A test that cannot reach its dependency fails; it does not return early.** A test that prints "skipping" and `return`s is recorded as passed — that is a false green, and it is a defect in the test, not a graceful fallback. If the environment is genuinely optional for that test, say so in the file header and make the case explicit.
 - Tests that share a mutable resource (a port, a temp dir root, a mock server) must be serialized: nextest runs **one process per test**, so a `static Mutex` cannot serialize two test binaries against the same resource. Add them to a `test-groups` entry in `.config/nextest.toml` (the config file path is fixed by nextest: `workspace-root/.config/nextest.toml`) and validate with `cargo nextest show-config test-groups`.
-- The toolchain is stable (harness targets `rust-version = "1.99"`, edition 2024). Do not pin nightly for daily work; the only nightly use is the rust-specs dylint gate (see §3).
+- The toolchain is pinned **nightly-2026-08-20** with the Cranelift dev profile (see `.agent/rules/dev-env.md` §4); the dylint gate (§3) rides the same nightly. CI runs the LLVM `ci` profile — a local Cranelift pass is normal, CI is the LLVM verdict.
 
 ## 2. What to run locally
 
-| Scenario | Command | Notes |
-|---|---|---|
-| Affected tests only | `just test-fast [base]` or `bash scripts/test-fast.sh` | Requires `testless`; when absent it falls back to a full run. Exits loudly on anomalies — never a silent skip. |
-| Verify compilation | `cargo check -p <crate>` | Wrap in `.githooks/heavy` on multi-session machines. |
-| Debug a single failing case | `cargo test -p <crate> -- <test name>` | Debug only, not acceptance; must finish in ~3 seconds. |
-| Full check suite | `just verify` | fmt + clippy + check + spec gate. The local "everything" entry. |
-| Full test runs | Prefer CI | The repo's own `.github/workflows/ci.yml` runs lint + workspace tests on every push/PR. Avoid `cargo test --workspace` locally on small machines; if needed, scope per crate. |
+| Scenario                    | Command                                                | Notes                                                                                                                                                                         |
+| --------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Affected tests only         | `just test-fast [base]` or `bash scripts/test-fast.sh` | Requires `testless`; when absent it falls back to a full run. Exits loudly on anomalies — never a silent skip.                                                                |
+| Verify compilation          | `cargo check -p <crate>`                               | Wrap in `.githooks/heavy` on multi-session machines.                                                                                                                          |
+| Debug a single failing case | `cargo test -p <crate> -- <test name>`                 | Debug only, not acceptance; must finish in ~3 seconds.                                                                                                                        |
+| Full check suite            | `just verify`                                          | fmt + clippy + check + spec gate. The local "everything" entry.                                                                                                               |
+| Full test runs              | Prefer CI                                              | The repo's own `.github/workflows/ci.yml` runs lint + workspace tests on every push/PR. Avoid `cargo test --workspace` locally on small machines; if needed, scope per crate. |
 
 **Do not rely on the `~/.local/bin/cargo` PATH shim** present on some machines: a
 cargo fork in `~/.cargo/bin/` shadows it, and CI does not have it at all. Invoke
@@ -42,7 +42,10 @@ expecting `cargo test` to be rerouted.
 
 ## 4. CI
 
-- CI is the repo's own `.github/workflows/ci.yml`: `lint` job (fmt --check + clippy `-D warnings`) and `test` job (`cargo test --workspace`), both on stable via `dtolnay/rust-toolchain@stable`, with `Swatinem/rust-cache` and shared cache keys.
+- CI is the repo's own `.github/workflows/ci.yml`, three jobs on the pinned nightly (LLVM `--profile ci` throughout):
+  - `lint`: `fmt --check` + clippy `-D warnings` + check.
+  - `spec-check`: the rust-specs dylint syntax gate (builds the pre-compiled lint libs from rust-specs, then loads each).
+  - `test`: **PR lane runs `test-fast`** (testless narrows to affected tests); **the master-push (merge) lane runs the full workspace** (`cargo nextest run --workspace --cargo-profile ci`).
 - A PR merges only when CI is green. When CI fails, pull the logs (`gh run view <id> --log-failed`) and fix on the same PR.
 - `gh run view --log-failed` returns empty while the run is not `completed` — check run state before concluding there are no logs.
 

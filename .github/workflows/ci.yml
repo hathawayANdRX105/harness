@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Same-branch re-push cancels queued runs to save runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Job 1: fmt + clippy + check. The toolchain is pinned by rust-toolchain.toml
+  # (nightly-2026-08-20); lint runs on --profile ci (LLVM), the same backend CI
+  # validates, while local dev loops use the Cranelift dev profile for speed.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-20
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-shared
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (workspace, --profile ci, -D warnings)
+        run: cargo clippy --workspace --all-targets --profile ci -- -D warnings
+      - name: Check
+        run: cargo check --workspace --all-targets --profile ci
+
+  # Job 2: rust-specs dylint syntax gate (pre-built lint libraries). Runs on the
+  # same nightly as the toolchain pin. Builds the lint libs from the rust-specs
+  # checkout once, then loads each against the workspace.
+  spec-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-20
+          components: rustfmt, clippy, rustc-dev, rust-src
+      - name: Install cargo-dylint
+        run: cargo +nightly-2026-08-20 install cargo-dylint --locked
+      - name: Clone rust-specs (lint rule library)
+        run: git clone --depth 1 https://github.com/hathawayANdRX105/rust-specs.git "$HOME/rust-specs"
+      - name: Build pre-compiled lint libraries
+        run: |
+          RUST_SPECS_DIR="$HOME/rust-specs" bash scripts/spec-check.sh build
+      - name: Run dylint gate
+        run: |
+          RUST_SPECS_DIR="$HOME/rust-specs" bash scripts/spec-check.sh
+
+  # Job 3: tests. PR lane narrows to affected tests via testless (test-fast);
+  # the master-push (merge) lane runs the full workspace. Both on the LLVM ci
+  # profile — the backend that ships.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # full history so test-fast can compute merge-base against origin/master
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-20
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-shared
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+      # PR lane: affected tests only (testless impact analysis).
+      - name: Test (PR: affected via testless)
+        if: github.event_name == 'pull_request'
+        run: |
+          cargo +nightly-2026-08-20 install testless --locked
+          TEST_FAST_PROFILE=ci bash scripts/test-fast.sh origin/master
+      # Merge lane: full workspace (the shipped-quality gate).
+      - name: Test (master: full workspace)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: cargo nextest run --workspace --cargo-profile ci
