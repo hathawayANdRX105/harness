@@ -4,11 +4,14 @@
 //!
 //! The deliberate difference from a "system prompt + history list" design
 //! (harness-rs's `Context{system,guides,history}`): the system prompt is a
-//! **ledger**. A `Message::System` carries `sections`, a named map; replaying
-//! the transcript's system messages in order reconstructs the current prompt
-//! and tool set — which is how pi hot-swaps prompt sections and tool
-//! declarations mid-session (`types.ts:559-585`), and what a daemon needs to
-//! resume a session from storage without a second "session config" object.
+//! **ledger**. A `Message::System` carries `sections`, a named map, and
+//! replaying the transcript's system messages reconstructs the current prompt
+//! — which is how pi hot-swaps prompt sections mid-session
+//! (`ai/src/types.ts:559-585`), and what a daemon needs to resume a session
+//! from storage without a second "session config" object. A section set to
+//! `None` removes it from the prompt (pi's `null` semantics); tool-set
+//! mutations are intentionally not modeled here — the toolset is owned by
+//! the loop (#8) and the builder (#10), not the transcript.
 //!
 //! Multimodal blocks beyond text are deferred (pi ships image content;
 //! harness-rs also carries audio). They join `Content` when the loop adopts
@@ -62,11 +65,15 @@ pub struct ToolCall {
 #[serde(tag = "role", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Message {
-    /// The prompt ledger: named sections in declaration order. Setting a
-    /// section replaces it; a later `System` message supersedes an earlier
-    /// one section by section. Replay of the transcript's system messages
-    /// reconstructs the prompt — no separate session-config object.
-    System { sections: BTreeMap<String, String> },
+    /// The prompt ledger: a named map of sections. A later `System` message
+    /// supersedes an earlier one section by section: a `Some` value replaces
+    /// the section, a `None` removes it (pi's `null` semantics — a guardrail
+    /// lifted mid-session is a removal, not an empty bullet). Replay of the
+    /// transcript's system messages reconstructs the prompt — no separate
+    /// session-config object.
+    System {
+        sections: BTreeMap<String, Option<String>>,
+    },
     /// User input, possibly multimodal (steering messages arrive this way).
     User { content: Vec<Content> },
     /// Assistant output: text, reasoning, and the tool calls it requested.

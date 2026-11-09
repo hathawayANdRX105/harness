@@ -16,8 +16,9 @@
 //!   and the message model, where the system prompt is a replayable
 //!   *ledger* of named sections ([`message::Message::System`]) — how a
 //!   daemon resumes a session without a second session-config object.
-//!   (Section *removal* and tool-set mutations are the parts of pi's
-//!   ledger we have not modeled yet — see issue #2 review.)
+//!   A `None` section removes it (pi's `null`); tool-set mutations stay
+//!   unmodeled here — the toolset is owned by the loop (#8) and the
+//!   builder (#10).
 //! - **nanoharness** (Python) contributes the run-level surface —
 //!   [`control::RunControl`] (await-able cancellation plus a steering
 //!   mailbox), the ordered run event log with a sequence counter

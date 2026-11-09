@@ -21,8 +21,11 @@ fn every_message_kind_round_trips() -> serde_json::Result<()> {
     let transcript = [
         Message::System {
             sections: BTreeMap::from([
-                ("identity".to_string(), "You are a harness.".to_string()),
-                ("tools".to_string(), "read, edit".to_string()),
+                (
+                    "identity".to_string(),
+                    Some("You are a harness.".to_string()),
+                ),
+                ("tools".to_string(), Some("read, edit".to_string())),
             ]),
         },
         Message::user_text("fix the bug"),
@@ -100,37 +103,73 @@ fn role_of_each_message_kind() {
     assert_eq!(result.role(), Role::Assistant);
 }
 
-/// Replaying a transcript's system messages merges sections: a later
-/// `System` message replaces the sections it names and adds the rest. This
-/// is the property pi calls the system-message ledger and the one
-/// harness-session (#12) depends on for resume.
+/// Replaying a transcript's system messages reconstructs the prompt: a
+/// `Some` section replaces, a `None` removes (pi's `null`), and untouched
+/// sections survive. This is the property pi calls the system-message
+/// ledger and the one harness-session (#12) depends on for resume.
 #[test]
-fn system_message_replay_merges_with_last_write_wins() {
+fn system_message_replay_replaces_and_removes() {
     let transcript = [
         Message::System {
             sections: BTreeMap::from([
-                ("identity".to_string(), "v1".to_string()),
-                ("constraints".to_string(), "first".to_string()),
+                ("identity".to_string(), Some("v1".to_string())),
+                ("constraints".to_string(), Some("first".to_string())),
             ]),
         },
         Message::user_text("hi"),
         Message::System {
             sections: BTreeMap::from([
-                ("identity".to_string(), "v2".to_string()),
-                ("tools".to_string(), "read".to_string()),
+                ("identity".to_string(), Some("v2".to_string())),
+                ("tools".to_string(), Some("read".to_string())),
             ]),
         },
+        Message::System {
+            sections: BTreeMap::<String, Option<String>>::from([("constraints".to_string(), None)]),
+        },
     ];
-    let merged: BTreeMap<String, String> = transcript
+    // Replay: apply the ledger entries in transcript order — Some replaces,
+    // None removes — and the surviving map is the prompt the model would see.
+    let mut prompt: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in replayed_sections(&transcript) {
+        match value {
+            Some(text) => {
+                prompt.insert(name.clone(), text.clone());
+            }
+            None => {
+                prompt.remove(name);
+            }
+        }
+    }
+    assert_eq!(prompt["identity"], "v2");
+    assert!(
+        !prompt.contains_key("constraints"),
+        "a None section removes it"
+    );
+    assert_eq!(prompt["tools"], "read");
+}
+
+fn replayed_sections(transcript: &[Message]) -> Vec<(&String, &Option<String>)> {
+    transcript
         .iter()
-        .filter_map(|m| match m {
+        .filter_map(|message| match message {
             Message::System { sections } => Some(sections),
             _ => None,
         })
         .flatten()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    assert_eq!(merged["identity"], "v2");
-    assert_eq!(merged["constraints"], "first");
-    assert_eq!(merged["tools"], "read");
+        .collect()
+}
+
+/// A `None` section survives the wire as JSON `null` — the removal travels
+/// with the transcript, which is what makes a persisted session replayable.
+#[test]
+fn none_section_round_trips_as_json_null() -> serde_json::Result<()> {
+    let message = Message::System {
+        sections: BTreeMap::from([("constraints".into(), None)]),
+    };
+    let wire = serde_json::to_value(&message)?;
+    assert_eq!(wire["role"], "system");
+    assert_eq!(wire["sections"]["constraints"], serde_json::Value::Null);
+    let back: Message = serde_json::from_value(wire)?;
+    assert_eq!(back, message);
+    Ok(())
 }
