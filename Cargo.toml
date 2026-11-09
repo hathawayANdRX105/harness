@@ -6,6 +6,10 @@
 # here so the config override resolves. Real crates land under crates/ as
 # members; until then this root package is the buildable anchor.
 
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
 [package]
 name = "harness"
 version = "0.1.0"
@@ -16,3 +20,39 @@ publish = false
 [profile.ci]
 inherits = "dev"
 debug = "line-tables-only"
+
+# The scaffold root package inherits the same policy as the crates.
+[lints]
+workspace = true
+
+# Workspace-wide lint policy (AGENTS.md .agent/rules/rust-code.md):
+# the denied set encodes the preferred syntax forms — hand-written
+# combinator disguises, if/else chains and needless returns are build
+# errors, not style nits. unwrap/expect are denied too: production paths
+# propagate Result; tests avoid them by returning Result from the test fn.
+[workspace.lints.clippy]
+obfuscated_if_else = "deny"
+manual_map = "deny"
+manual_filter = "deny"
+manual_filter_map = "deny"
+manual_find = "deny"
+manual_flatten = "deny"
+manual_unwrap_or = "deny"
+manual_ok_or = "deny"
+manual_let_else = "deny"
+question_mark = "deny"
+map_entry = "deny"
+while_let_on_iterator = "deny"
+needless_range_loop = "deny"
+bool_comparison = "deny"
+redundant_pattern_matching = "deny"
+derivable_impls = "deny"
+needless_return = "deny"
+collapsible_if = "deny"
+collapsible_else_if = "deny"
+single_match = "deny"
+redundant_else = "deny"
+unnecessary_map_or = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+useless_format = "allow"
