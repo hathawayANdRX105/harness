@@ -38,6 +38,9 @@ pub struct ModelRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Request sampling temperature. Note for callers comparing requests:
+    /// the field is `f32`, so `PartialEq` is NaN-hostile and
+    /// representation-sensitive — compare normalized forms, not the struct.
     pub temperature: Option<f32>,
 }
 

@@ -65,9 +65,10 @@ impl RunControl {
         self.cancel.is_cancelled()
     }
 
-    /// The await-able view: resolves when the run is cancelled. Race it
-    /// against model streams, approval asks and tool bodies.
-    pub fn cancelled(&self) -> CancellationToken {
+    /// The await-able view of cancellation: the token a caller races against
+    /// model streams, approval asks and tool bodies. Named for the handle it
+    /// returns, not a predicate — the poll view is `is_cancelled`.
+    pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
 

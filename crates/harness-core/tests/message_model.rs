@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 use harness_core::message::{Content, Message, Role, ToolCall, ToolResultMessage};
 use serde_json::json;
 
+/// Purpose: the transcript vocabulary survives serialization. Scenario: one
+/// message of each kind, with reasoning + tool call blocks. Acceptance:
+/// round-trip equals the input and the ledger/tool-card wire keys are pinned.
 #[test]
 fn every_message_kind_round_trips() -> serde_json::Result<()> {
     let transcript = [
@@ -51,6 +54,9 @@ fn every_message_kind_round_trips() -> serde_json::Result<()> {
     Ok(())
 }
 
+/// Purpose: a tool failure is a value on the wire. Scenario: a ToolResult
+/// message with is_error. Acceptance: the field round-trips as `true` —
+/// consumers never see a failed tool as a missing answer.
 #[test]
 fn failed_tools_are_values_not_missing_answers() -> serde_json::Result<()> {
     let failed = Message::ToolResult(ToolResultMessage {
@@ -66,6 +72,9 @@ fn failed_tools_are_values_not_missing_answers() -> serde_json::Result<()> {
     Ok(())
 }
 
+/// Purpose: the role view adapters key on. Scenario: every message kind.
+/// Acceptance: tool results report `Assistant` (they answer an assistant
+/// turn), so no "tool" role leaks into role-keyed renderers.
 #[test]
 fn role_of_each_message_kind() {
     assert_eq!(

@@ -9,11 +9,15 @@
 //!
 //! - **pi** (TypeScript) contributes the failure discipline — the stream-fn
 //!   contract: streams never reject, failures are terminal events
-//!   ([`model::ModelEvent::Error`]); failures are values
+//!   ([`model::ModelEvent::Error`]) — the item type carries no `Result`, so
+//!   failure-as-error does not compile; the terminal discipline itself
+//!   (nothing after `Stop`/`Error`) is on the adapter and documented; failures are values
 //!   (`is_error` on [`tool::ToolResult`] and [`message::ToolResultMessage`]);
 //!   and the message model, where the system prompt is a replayable
 //!   *ledger* of named sections ([`message::Message::System`]) — how a
 //!   daemon resumes a session without a second session-config object.
+//!   (Section *removal* and tool-set mutations are the parts of pi's
+//!   ledger we have not modeled yet — see issue #2 review.)
 //! - **nanoharness** (Python) contributes the run-level surface —
 //!   [`control::RunControl`] (await-able cancellation plus a steering
 //!   mailbox), the ordered run event log with a sequence counter

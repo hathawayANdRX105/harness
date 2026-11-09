@@ -8,6 +8,9 @@
 use futures::executor::block_on;
 use harness_core::control::RunControl;
 
+/// Purpose: the steering mailbox is FIFO and drain-moves. Scenario: two
+/// steers queued, drained twice. Acceptance: first drain returns both in
+/// order, second returns none — drain is not a peek.
 #[test]
 fn steering_is_fifo_and_drained_once() {
     let control = RunControl::new();
@@ -20,6 +23,9 @@ fn steering_is_fifo_and_drained_once() {
     );
 }
 
+/// Purpose: only meaningful steering reaches the loop. Scenario: empty and
+/// whitespace-only steers. Acceptance: they are dropped on arrival (the
+/// loop must never replay an empty user turn).
 #[test]
 fn empty_steering_messages_are_dropped() {
     let control = RunControl::new();
@@ -28,6 +34,8 @@ fn empty_steering_messages_are_dropped() {
     assert!(control.drain_steering().is_empty());
 }
 
+/// Purpose: steer payload fidelity. Scenario: one steer with punctuation.
+/// Acceptance: drained message equals the input verbatim.
 #[test]
 fn steer_messages_carry_their_text() {
     let control = RunControl::new();
@@ -47,13 +55,16 @@ fn cancellation_is_pollable_and_awaitable() {
 
     // The await-able view resolves once cancelled — driven without a
     // runtime because the token needs no reactor.
-    let token = control.cancelled();
+    let token = control.cancel_token();
     block_on(token.cancelled());
     assert!(control.is_cancelled());
 }
 
 /// Each `RunControl` is its own token tree: cancelling one run does not
 /// touch another.
+/// Purpose: each run owns its own control surface. Scenario: two
+/// RunControls, cancel one. Acceptance: the other run keeps running —
+/// cancellation never leaks across runs.
 #[test]
 fn controls_are_independent_per_run() {
     let a = RunControl::new();
@@ -64,6 +75,9 @@ fn controls_are_independent_per_run() {
 }
 
 /// A shared run: clones hand the same token and mailbox to every component.
+/// Purpose: clones are handles, not copies. Scenario: cancel and steer
+/// through a clone. Acceptance: the original observes both — one token tree,
+/// one mailbox.
 #[test]
 fn clones_share_one_control_surface() {
     let control = RunControl::new();

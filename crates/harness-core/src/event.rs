@@ -9,6 +9,12 @@
 //! `AssistantMessageEvent` rides pi's `message_update`) instead of inventing
 //! a second vocabulary.
 //!
+//! Format caveat: `RunEvent` flattens its tagged `kind` onto the top-level
+//! `type` tag, which round-trips through serde_json (the daemon's wire
+//! format) but not through non-self-describing formats, and forbids ever
+//! adding `deny_unknown_fields`. That is the price of the envelope shape
+//! subscribers parse with `ev["type"]`.
+//!
 //! The trap this design exists to avoid: pi's `Agent` awaits every event
 //! listener sequentially in the loop's critical path
 //! (`packages/agent/src/agent.ts:619-621`), so one slow subscriber stalls

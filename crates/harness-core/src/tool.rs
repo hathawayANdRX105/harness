@@ -109,6 +109,11 @@ pub struct ToolRequest {
 
 /// One model-callable tool.
 ///
+/// Invariant: `schema().name` must equal `name()` — the registry keys on
+/// `name()` and the model sees `schema()`, so drift means a tool the
+/// dispatcher can find but the model cannot ask for. The contract cannot
+/// enforce it (a `ToolSchema` is plain data), so implementors must.
+///
 /// `invoke` is async (remote/sandboxed workers — nanoharness's executor
 /// boundary), races the passed `CancellationToken`, and returns either a
 /// value-shaped result or a dispatch-level error. `risk` lets a policy

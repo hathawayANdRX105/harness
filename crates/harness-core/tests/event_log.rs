@@ -55,15 +55,24 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
         ),
         event(
             5,
+            RunEventKind::RunFinished {
+                reason: RunStopReason::BudgetBlocked {
+                    required_tokens: 4096,
+                    available_tokens: 1024,
+                },
+            },
+        ),
+        event(
+            6,
             RunEventKind::SteeringApplied {
                 message: "stop".into(),
             },
         ),
-        event(6, RunEventKind::TurnStarted { turn: 1 }),
-        event(7, RunEventKind::TurnFinished { turn: 1 }),
-        event(8, RunEventKind::TextDelta { text: "hi".into() }),
+        event(7, RunEventKind::TurnStarted { turn: 1 }),
+        event(8, RunEventKind::TurnFinished { turn: 1 }),
+        event(9, RunEventKind::TextDelta { text: "hi".into() }),
         event(
-            9,
+            10,
             RunEventKind::ToolCall(ToolCall {
                 id: "c1".into(),
                 name: "read".into(),
@@ -71,14 +80,14 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
             }),
         ),
         event(
-            10,
+            11,
             RunEventKind::ToolStarted {
                 call_id: "c1".into(),
                 name: "read".into(),
             },
         ),
         event(
-            11,
+            12,
             RunEventKind::ToolFinished {
                 call_id: "c1".into(),
                 name: "read".into(),
@@ -86,7 +95,7 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
             },
         ),
         event(
-            12,
+            13,
             RunEventKind::PolicyDecided {
                 stage: PolicyStage::BeforeTool,
                 outcome: PolicyOutcome::Deny,
@@ -94,20 +103,20 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
             },
         ),
         event(
-            13,
+            14,
             RunEventKind::ApprovalRequested {
                 call_id: "c1".into(),
             },
         ),
         event(
-            14,
+            15,
             RunEventKind::ApprovalResolved {
                 call_id: "c1".into(),
                 result: ApprovalResult::Approved,
             },
         ),
         event(
-            15,
+            16,
             RunEventKind::Error {
                 message: "boom".into(),
             },
@@ -129,7 +138,12 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
     assert_eq!(wire["type"], "run_started");
     assert_eq!(wire["run_id"], "r-1");
     assert_eq!(wire["seq"], 1);
-    let wire = serde_json::to_value(&events[7])?;
+    let wire = serde_json::to_value(&events[4])?;
+    assert_eq!(wire["type"], "run_finished");
+    assert_eq!(wire["reason"]["kind"], "budget_blocked");
+    assert_eq!(wire["reason"]["required_tokens"], 4096);
+    assert_eq!(wire["reason"]["available_tokens"], 1024);
+    let wire = serde_json::to_value(&events[8])?;
     assert_eq!(wire["type"], "text_delta");
     assert_eq!(wire["text"], "hi");
     let wire = serde_json::to_value(&events[1])?;

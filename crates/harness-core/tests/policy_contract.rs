@@ -10,12 +10,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::executor::block_on;
-use harness_core::message::ToolCall;
 use harness_core::policy::{
     ApprovalBroker, ApprovalResult, ExecutionStatus, PolicyDecision, PolicyOutcome, PolicyStage,
     ToolExecution, ToolPolicy,
 };
-use harness_core::run::{RunContext, RunId, SessionId, Task};
+use harness_core::run::{RunId, SessionId};
 use harness_core::tool::{ToolError, ToolRequest, ToolResult};
 use tokio_util::sync::CancellationToken;
 
@@ -27,20 +26,6 @@ fn sample_request(name: &str) -> ToolRequest {
         run_id: RunId("r-1".into()),
         session_id: SessionId("s-1".into()),
         turn: 0,
-    }
-}
-
-fn sample_run() -> RunContext {
-    RunContext {
-        run_id: RunId("r-1".into()),
-        session_id: SessionId("s-1".into()),
-        task: Task {
-            description: "demo".into(),
-            source: None,
-            deadline: None,
-        },
-        limits: Default::default(),
-        started_at_ms: 0,
     }
 }
 
@@ -123,11 +108,17 @@ fn after_stage_sees_execution_and_appends_suffix() {
     );
 }
 
-/// A policy may defer to a human — the outcome that parks the run on the
-/// broker.
-#[test]
-fn require_approval_is_a_first_class_outcome() {
-    let policy = |stage: PolicyStage, req: &ToolRequest| {
+/// A policy may defer to a human — `RequireApproval` parks the run on the
+/// broker. Exercised through the real trait surface, not a closure.
+struct DeployPolicy;
+
+impl ToolPolicy for DeployPolicy {
+    fn decide(
+        &self,
+        stage: PolicyStage,
+        req: &ToolRequest,
+        _execution: Option<&ToolExecution>,
+    ) -> PolicyDecision {
         if stage == PolicyStage::BeforeTool && req.name == "deploy" {
             PolicyDecision {
                 outcome: PolicyOutcome::RequireApproval,
@@ -139,11 +130,22 @@ fn require_approval_is_a_first_class_outcome() {
         } else {
             allow("deploy-policy")
         }
-    };
+    }
+}
+
+#[test]
+fn require_approval_parks_on_the_broker() {
+    let policy = DeployPolicy;
     let req = sample_request("deploy");
+    let decision = policy.decide(PolicyStage::BeforeTool, &req, None);
+    assert_eq!(decision.outcome, PolicyOutcome::RequireApproval);
+    assert_eq!(decision.source, "deploy-policy");
+    // Any other tool stays Allow under the same policy — the gate is
+    // per-tool, not a blanket defer.
+    let other = sample_request("read");
     assert_eq!(
-        policy(PolicyStage::BeforeTool, &req).outcome,
-        PolicyOutcome::RequireApproval
+        policy.decide(PolicyStage::BeforeTool, &other, None).outcome,
+        PolicyOutcome::Allow
     );
 }
 
@@ -225,32 +227,23 @@ fn unattended_approval_fails_closed() {
     assert!(matches!(err, ToolError::Permission(p) if p.contains("deploy")));
 }
 
-/// The policy seam sees the run the request belongs to — a host can key
-/// decisions per-run without extra context objects.
+/// The policy seam's wire shape is pinned: a persisted ToolRequest (the
+/// audit trail) round-trips with its run/session correlation intact.
 #[test]
-fn tool_request_carries_run_and_session() {
-    let run = sample_run();
+fn tool_request_round_trips_with_run_correlation() -> serde_json::Result<()> {
     let req = ToolRequest {
-        call_id: "c".into(),
-        name: "read".into(),
-        args: serde_json::json!({}),
-        run_id: run.run_id.clone(),
-        session_id: run.session_id.clone(),
-        turn: 2,
-    };
-    assert_eq!(req.run_id, RunId("r-1".into()));
-    assert_eq!(req.turn, 2);
-}
-
-// ToolCall on the policy path keeps parity with the model stream's calls.
-#[test]
-fn tool_call_shape_matches_stream_vocabulary() {
-    let call = ToolCall {
-        id: "call-1".into(),
+        call_id: "call-1".into(),
         name: "read".into(),
         args: serde_json::json!({"path": "src/lib.rs"}),
+        run_id: RunId("r-9".into()),
+        session_id: SessionId("s-2".into()),
+        turn: 3,
     };
-    let req = sample_request("read");
-    // A dispatcher maps a stream ToolCall into a ToolRequest keyed on id:
-    assert_eq!(req.call_id, call.id);
+    let wire = serde_json::to_value(&req)?;
+    assert_eq!(wire["run_id"], "r-9");
+    assert_eq!(wire["session_id"], "s-2");
+    assert_eq!(wire["turn"], 3);
+    let back: ToolRequest = serde_json::from_value(wire)?;
+    assert_eq!(back, req);
+    Ok(())
 }
