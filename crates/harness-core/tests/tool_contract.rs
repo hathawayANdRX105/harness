@@ -1,211 +1,192 @@
-//! Tool contract behavior: spec generation through a trait object, catalog
-//! registration/lookup, `ToolExecutor` dispatch, abort-signal bridging and
-//! output truncation.
+//! Tool contract behavior: the async `Tool` trait behind a trait object,
+//! risk classification, `serde_json::Value` arguments, and cancellation
+//! racing a tool body.
 //!
-//! Acceptance: a mock implementer of `Tool` driven through `Arc<dyn Tool>`
-//! and `dyn ToolExecutor` behaves exactly as the contract promises — the
-//! three primitives feed `spec()`, unknown names refuse with `ToolError`, and
-//! an aborted signal short-circuits a polling tool.
+//! Acceptance: `name`/`schema`/`risk` surface an implementor's three
+//! primitives, a failed invocation is a value (`is_error`) rather than an
+//! unwind, and a long-running `invoke` resolves `ToolError::Cancelled`
+//! once the run's token fires.
 
 use std::sync::Arc;
-use std::thread::sleep;
-use std::time::Duration;
 
-use harness_core::tool::{
-    AbortSignal, MAX_OUTPUT_LINES, Tool, ToolCallSpec, ToolCatalog, ToolError, ToolExecutor,
-    ToolResult, ToolSpec, arg_str, truncate_output,
-};
+use async_trait::async_trait;
+use futures::executor::block_on;
+use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
-/// A tool that echoes its `text` argument unless the abort signal fired.
+/// A tool that echoes the `text` argument.
 struct EchoTool;
 
+#[async_trait]
 impl Tool for EchoTool {
     fn name(&self) -> &str {
         "echo"
     }
-    fn description(&self) -> String {
-        "Echoes the `text` argument back.".to_string()
-    }
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } },
-            "required": ["text"],
-        })
-    }
-    fn execute(&self, args: &Value, abort: &AbortSignal) -> Result<ToolResult, ToolError> {
-        let text = arg_str(args, "text")?;
-        if abort.is_aborted() {
-            return Err(ToolError::Aborted);
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "echo".into(),
+            description: "Echoes the `text` argument back.".into(),
+            input: json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"],
+            }),
         }
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::ReadOnly
+    }
+    async fn invoke(
+        &self,
+        args: Value,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        let text =
+            args.get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    name: "echo".into(),
+                    reason: "missing string argument `text`".into(),
+                })?;
         Ok(ToolResult {
-            output: text.to_string(),
+            content: text.to_string(),
             is_error: false,
+            trace: None,
         })
     }
 }
 
-/// A tool that stands in for any long-running one: it polls the abort signal
-/// between work units and reports nothing until the signal fires.
-struct PollingTool;
+/// A tool that stands in for any long-running one: it polls the token
+/// between work units and only ever stops because the run was cancelled.
+struct SlowTool;
 
-impl Tool for PollingTool {
+#[async_trait]
+impl Tool for SlowTool {
     fn name(&self) -> &str {
-        "poll"
+        "slow"
     }
-    fn description(&self) -> String {
-        "Polls the abort signal until it fires.".to_string()
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "slow".into(),
+            description: "Polls the cancel token until it fires.".into(),
+            input: json!({"type": "object"}),
+        }
     }
-    fn parameters(&self) -> Value {
-        json!({"type": "object"})
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Idempotent
     }
-    fn execute(&self, _args: &Value, abort: &AbortSignal) -> Result<ToolResult, ToolError> {
-        // Bounded so a missing abort fails the test rather than hanging it;
-        // every test that reaches here aborts on the first poll.
-        for _ in 0..1000 {
-            if abort.is_aborted() {
-                return Err(ToolError::Aborted);
+    async fn invoke(
+        &self,
+        _args: Value,
+        cancel: &CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        // Bounded so a missing cancellation fails the test rather than
+        // hanging it; the loop must observe the token on every poll.
+        for _ in 0..10_000 {
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
             }
-            sleep(Duration::from_millis(1));
         }
         Ok(ToolResult {
-            output: "never reached".to_string(),
+            content: String::new(),
             is_error: true,
+            trace: None,
         })
     }
 }
 
-/// spec() must assemble exactly the three primitives an implementer supplies —
-/// this is the "schema generation through a trait object" acceptance: the
-/// implementor never builds a `ToolSpec` itself.
+/// The three primitives feed the schema; the risk class is separate from the
+/// name so a policy can decide without running anything.
 #[test]
-fn spec_assembles_the_three_primitives() {
+fn primitives_and_risk_surface_through_trait_object() {
     let tool: Arc<dyn Tool> = Arc::new(EchoTool);
-    let spec = tool.spec();
-    assert_eq!(spec.name, "echo");
-    assert_eq!(spec.description, "Echoes the `text` argument back.");
-    assert_eq!(
-        spec.params_schema,
-        json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } },
-            "required": ["text"],
-        })
-    );
+    let schema = tool.schema();
+    assert_eq!(schema.name, "echo");
+    assert_eq!(schema.description, "Echoes the `text` argument back.");
+    assert_eq!(schema.input["required"][0], "text");
+    assert_eq!(tool.risk(), ToolRisk::ReadOnly);
 }
 
-/// A catalog keeps registration order for `specs`/`all` and finds tools by
-/// the name the model sees.
+/// `Value` arguments pass through the contract unchanged — the dynamic
+/// boundary MCP and plugin tools require.
 #[test]
-fn catalog_registers_finds_and_lists_in_order() {
-    let catalog = ToolCatalog::new();
-    catalog.register(Arc::new(EchoTool));
-    catalog.register(Arc::new(PollingTool));
-
-    assert_eq!(
-        catalog.find("echo").map(|t| t.name().to_string()),
-        Some("echo".into())
-    );
-    assert!(catalog.find("missing").is_none());
-
-    let names: Vec<String> = catalog.specs().iter().map(|s| s.name.clone()).collect();
-    assert_eq!(names, vec!["echo", "poll"]);
-    assert_eq!(catalog.all().len(), 2);
-}
-
-/// Dispatching through `ToolExecutor for ToolCatalog` runs the registered
-/// tool with its own spec, and an unknown name is a value error, not a panic.
-#[test]
-fn executor_dispatches_known_and_refuses_unknown() -> Result<(), ToolError> {
-    let catalog = ToolCatalog::new();
-    catalog.register(Arc::new(EchoTool));
-
-    let spec = ToolSpec {
-        name: "echo".into(),
-        description: "ignored on dispatch".into(),
-        params_schema: json!({}),
-    };
-    let result = catalog.execute(&spec, &json!({"text": "hi"}), &AbortSignal::new())?;
-    assert_eq!(result.output, "hi");
+fn value_args_round_trip_into_results() {
+    let tool: Arc<dyn Tool> = Arc::new(EchoTool);
+    let token = CancellationToken::new();
+    let result = block_on(tool.invoke(json!({"text": "hi"}), &token));
+    let result = result.unwrap_or_else(|e| panic!("echo must succeed, got {e:?}"));
+    assert_eq!(result.content, "hi");
     assert!(!result.is_error);
-
-    let unknown = ToolSpec {
-        name: "nope".into(),
-        description: String::new(),
-        params_schema: json!({}),
-    };
-    let Err(err) = catalog.execute(&unknown, &json!({}), &AbortSignal::new()) else {
-        panic!("unknown tool must error, got Ok");
-    };
-    assert!(matches!(err, ToolError::Execute(msg) if msg.contains("unknown tool: nope")));
-    Ok(())
 }
 
-/// `execute_in` with no session cwd delegates to `execute`, so direct
-/// callers keep the process-cwd behavior.
+/// Missing-typed arguments are a `ToolError::InvalidArgs`, not a panic —
+/// validation failures are values the dispatch layer maps.
 #[test]
-fn execute_in_without_cwd_delegates() -> Result<(), ToolError> {
+fn invalid_args_is_a_value_error() {
     let tool: Arc<dyn Tool> = Arc::new(EchoTool);
-    let result = tool.execute_in(&json!({"text": "direct"}), &AbortSignal::new(), None)?;
-    assert_eq!(result.output, "direct");
-    Ok(())
-}
-
-/// Aborting before the first poll short-circuits a running tool, and `flag()`
-/// / `from_flag()` bridge two signals onto one shared `AtomicBool` — the
-/// shape a host uses to hand its own flag to a harness tool.
-#[test]
-fn abort_signal_short_circuits_and_bridges() -> Result<(), ToolError> {
-    let tool: Arc<dyn Tool> = Arc::new(PollingTool);
-    let abort = AbortSignal::new();
-    abort.abort();
-    let Err(err) = tool.execute(&json!({}), &abort) else {
-        panic!("pre-aborted tool must return Aborted, got Ok");
+    let token = CancellationToken::new();
+    let err = block_on(tool.invoke(json!({"count": 3}), &token));
+    let Err(ToolError::InvalidArgs { name, reason }) = err else {
+        panic!("expected InvalidArgs, got: {err:?}");
     };
-    assert!(matches!(err, ToolError::Aborted));
-
-    // Bridging: aborting the wrapper flips the flag the adapter kept.
-    let owner = AbortSignal::new();
-    let bridged = AbortSignal::from_flag(owner.flag());
-    bridged.abort();
-    assert!(owner.is_aborted());
-    Ok(())
+    assert_eq!(name, "echo");
+    assert!(reason.contains("missing string argument"));
 }
 
-/// Truncation keeps the tail (errors live at the end) and spills the full
-/// body to a temp file once a tool exceeds `MAX_OUTPUT_LINES` lines.
+// A failing tool reports `is_error`, not an Err — the model sees the failure
+// as text (the value-shaped failure contract).
 #[test]
-fn truncate_output_keeps_tail_and_spills() -> std::io::Result<()> {
-    let short = "alpha\nbeta\n";
-    assert_eq!(truncate_output(short)?, short.to_string());
-
-    let lines: Vec<String> = (0..MAX_OUTPUT_LINES + 50)
-        .map(|i| format!("line-{i}"))
-        .collect();
-    let body = lines.join("\n");
-    let kept = truncate_output(&body)?;
-    let kept_lines: Vec<&str> = kept.lines().collect();
-
-    // 1 marker line + MAX_OUTPUT_LINES tail lines; the last input line
-    // survives intact.
-    assert_eq!(kept_lines.len(), MAX_OUTPUT_LINES + 1);
-    assert!(kept.starts_with("[output truncated:"));
-    assert_eq!(kept_lines[kept_lines.len() - 1], "line-249");
-    Ok(())
+fn failed_executions_can_be_values_too() {
+    struct ExplodingTool;
+    #[async_trait]
+    impl Tool for ExplodingTool {
+        fn name(&self) -> &str {
+            "explode"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "explode".into(),
+                description: "Always fails.".into(),
+                input: json!({"type": "object"}),
+            }
+        }
+        fn risk(&self) -> ToolRisk {
+            ToolRisk::Destructive
+        }
+        async fn invoke(
+            &self,
+            _args: Value,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolResult, ToolError> {
+            // A tool that *chooses* to report failure as a value rather
+            // than an Err: the loop backfills it into the transcript.
+            Ok(ToolResult {
+                content: "command failed: exit 42".into(),
+                is_error: true,
+                trace: Some("stderr captured".into()),
+            })
+        }
+    }
+    let token = CancellationToken::new();
+    let result =
+        block_on(ExplodingTool.invoke(json!({}), &token)).unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(result.is_error);
+    assert_eq!(result.trace.as_deref(), Some("stderr captured"));
 }
 
-/// The catalog owns a parsed spec's round-trip shape is the stream's job
-/// (see `event_serde.rs`); here we only pin what `ToolCallSpec` carries —
-/// id, name, args — since that is the vocabulary the stream produces.
+/// A cancelled run folds into the tool's own decision: the token fires and
+/// the tool returns `ToolError::Cancelled` instead of finishing its work.
 #[test]
-fn tool_call_spec_carries_id_name_args() {
-    let spec = ToolCallSpec {
-        id: "call-7".into(),
-        name: "echo".into(),
-        args: json!({"text": "hi"}),
+fn cancelled_run_resolves_invoke_as_cancelled() {
+    let tool: Arc<dyn Tool> = Arc::new(SlowTool);
+    let token = CancellationToken::new();
+    // Cancel before the body's first poll: every poll from the first checks
+    // the token, so a cancelled run never enters the work loop.
+    token.cancel();
+    let err = block_on(tool.invoke(json!({}), &token));
+    let Err(err) = err else {
+        panic!("cancelled invoke must return Err, got Ok");
     };
-    assert_eq!(spec.id, "call-7");
-    assert_eq!(spec.name, "echo");
-    assert_eq!(spec.args, json!({"text": "hi"}));
+    assert_eq!(err, ToolError::Cancelled);
 }

@@ -1,70 +1,105 @@
-//! Events emitted by the agent loop, for transport/UI consumption.
+//! The ordered run event log: the daemon's wire contract, not a callback.
 //!
-//! Per-LLM-round shape: `TurnStart`, streamed text deltas, tool dispatch
-//! start/end, turn end. The serde shape is the **frozen cross-crate event
-//! contract**: `{"type":"turn_start"}`,
-//! `{"type":"assistant_text","delta":…}`, `{"type":"tool_call","id":…,
-//! "name":…,"args":…}` (flattened `ToolCallSpec`), `{"type":"tool_start",…}`,
-//! `{"type":"tool_result",…}`, `{"type":"turn_end","stop_reason":…}`.
-//! Subscribers parse these strings, so variant renames are breaking changes.
+//! Design provenance: nanoharness's `HarnessEvent` (`core/schema.py:241`) —
+//! every event carries `run_id`, `session_id`, a monotonic `sequence` and a
+//! timestamp, which makes the stream a *causally ordered log* a transport
+//! can replay, persist or fan out. The kinds follow pi's two-layer split
+//! (`packages/agent/src/types.ts:528-551`): provider-level deltas are
+//! re-anchored onto run-level kinds (`TextDelta` rides `RunEvent` the way
+//! `AssistantMessageEvent` rides pi's `message_update`) instead of inventing
+//! a second vocabulary.
+//!
+//! The trap this design exists to avoid: pi's `Agent` awaits every event
+//! listener sequentially in the loop's critical path
+//! (`packages/agent/src/agent.ts:619-621`), so one slow subscriber stalls
+//! token streaming, tool execution and steering. [`EventSink::emit`] is
+//! synchronous *by contract*: implementations push into a bounded channel
+//! with `try_send` and a documented overflow policy — subscriber lag is
+//! observable, never blocking.
 
 use serde::{Deserialize, Serialize};
 
-// A completed tool call extracted from the stream: the type is owned by
-// `harness_core::tool` (the bottom of the vocabulary), the model stream
-// re-exports it, and this event vocabulary re-exports *that* type rather than
-// defining a second one — `AgentEvent::ToolCall` must carry exactly the spec
-// the stream produced.
-pub use crate::tool::ToolCallSpec;
+use crate::message::ToolCall;
+use crate::policy::{ApprovalResult, PolicyOutcome, PolicyStage};
+use crate::run::{RunId, RunStopReason, SessionId};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
-    /// One LLM round-trip begins (before the stream, after maintenance).
-    TurnStart,
-    AssistantText {
-        delta: String,
-    },
-    AssistantReasoning {
-        delta: String,
-    },
-    /// Tool call parsed from the stream (not yet executed).
-    ToolCall(ToolCallSpec),
-    /// Tool dispatch begins.
-    ToolStart {
-        id: String,
-        name: String,
-    },
-    ToolResult {
-        id: String,
-        name: String,
-        result: String,
-    },
-    TurnEnd {
-        stop_reason: TurnStop,
-    },
+/// One entry in a run's ordered event log.
+///
+/// `seq` is monotonic per run and assigned by the emitter (the loop/scheduler
+/// side, never the sink); a replay consumer uses it to detect gaps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunEvent {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub seq: u64,
+    /// Unix epoch milliseconds.
+    pub timestamp_ms: i64,
+    /// Flattened onto the event itself: the discriminator a subscriber
+    /// reads is `ev["type"]` (nanoharness's envelope shape), not a nested
+    /// `ev["kind"]["type"]`.
+    #[serde(flatten)]
+    pub kind: RunEventKind,
 }
 
-/// Loop-level stop reasons (`error`/`max_turns` added on top of the model's
-/// stop set).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnStop {
-    EndTurn,
-    MaxTokens,
-    Aborted,
-    Error,
-    /// `LoopConfig::max_turns` LLM round-trips exhausted.
-    MaxTurns,
-    /// The request could not be made to fit: content the compaction region
-    /// requires keeping is itself over budget, so no compression reaches it
-    /// and **no provider call was made**.
-    ///
-    /// Its own stop reason rather than `Error` because the round did not fail
-    /// at anything — it was refused before it started. A caller counting
-    /// errors would otherwise bill a round that never ran.
-    BudgetBlocked {
-        required_chars: u64,
-        available_chars: u64,
+/// The kinds of thing a run can report. `#[non_exhaustive]`: the compaction
+/// and budget kinds land when harness-context (#5) is wired in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RunEventKind {
+    /// A run started: the task description, as the transport wants to show it.
+    RunStarted { task: String },
+    /// A run ended, for any terminal reason. See [`RunStopReason`].
+    RunFinished { reason: RunStopReason },
+    /// Steering message(s) were drained and will be replayed as user turns
+    /// before the next model call (nanoharness's `STEERING_APPLIED`).
+    SteeringApplied { message: String },
+    /// One model round-trip begins.
+    TurnStarted { turn: u32 },
+    /// One model round-trip ended (stop reason at the model level).
+    TurnFinished { turn: u32 },
+    /// Streaming assistant text fragment (pi's anchoring of provider deltas
+    /// onto run-level events).
+    TextDelta { text: String },
+    /// A parsed tool call from the stream, before any policy decision.
+    ToolCall(ToolCall),
+    /// A tool call passed policy (and approval if required) and started
+    /// executing.
+    ToolStarted { call_id: String, name: String },
+    /// A tool call finished. `is_error` mirrors the value-shaped failure —
+    /// the model-facing text follows as the transcript's `ToolResult`.
+    ToolFinished {
+        call_id: String,
+        name: String,
+        is_error: bool,
     },
+    /// A policy decided (either stage). The transport surfaces denials and
+    /// approvals-to-ask from here; the outcome is the machine-readable bit.
+    PolicyDecided {
+        stage: PolicyStage,
+        outcome: PolicyOutcome,
+        reason: String,
+    },
+    /// The broker asked a human; the run is parked on this call until it
+    /// answers or the run is cancelled.
+    ApprovalRequested { call_id: String },
+    /// The broker's answer landed.
+    ApprovalResolved {
+        call_id: String,
+        result: ApprovalResult,
+    },
+    /// A failure encoded as an event — the loop-level twin of the model
+    /// stream's terminal `Error`.
+    Error { message: String },
+}
+
+/// The observer seam: implementations push into a bounded channel and never
+/// block the loop (see the module docs on pi's stall trap).
+///
+/// Errors cannot come back through here: an overflowed channel drops or
+/// metrics-logs per its documented policy, it does not propagate into the
+/// run. A transport that needs backpressure gets it by being the loop's own
+/// queue, not by being an `EventSink`.
+pub trait EventSink: Send + Sync + 'static {
+    fn emit(&self, event: RunEvent);
 }
