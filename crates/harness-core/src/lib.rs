@@ -23,13 +23,6 @@
 //! `harness-*` may reach over it for these vocabularies, and it may never
 //! gain a dependency on an implementation crate.
 
-pub mod context;
-pub mod event;
-pub mod framing;
-pub mod model;
-pub mod session;
-pub mod tool;
-
 // Crate-root re-exports: the names every host seam uses bare.
 pub use context::{Block, Budget, Context, Task, Turn, TurnRole};
 pub use event::{AgentEvent, TurnStop};
@@ -39,3 +32,10 @@ pub use tool::{
     AbortSignal, Action, MAX_OUTPUT_LINES, Tool, ToolCallSpec, ToolCatalog, ToolError,
     ToolExecutor, ToolResult, ToolSpec, arg_str, spill_dir, truncate_output,
 };
+
+pub mod context;
+pub mod event;
+pub mod framing;
+pub mod model;
+pub mod session;
+pub mod tool;

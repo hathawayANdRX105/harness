@@ -10,6 +10,13 @@
 
 use serde::{Deserialize, Serialize};
 
+// A completed tool call extracted from the stream: the type is owned by
+// `harness_core::tool` (the bottom of the vocabulary), the model stream
+// re-exports it, and this event vocabulary re-exports *that* type rather than
+// defining a second one — `AgentEvent::ToolCall` must carry exactly the spec
+// the stream produced.
+pub use crate::tool::ToolCallSpec;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -61,10 +68,3 @@ pub enum TurnStop {
         available_chars: u64,
     },
 }
-
-// A completed tool call extracted from the stream: the type is owned by
-// `harness_core::tool` (the bottom of the vocabulary), the model stream
-// re-exports it, and this event vocabulary re-exports *that* type rather than
-// defining a second one — `AgentEvent::ToolCall` must carry exactly the spec
-// the stream produced.
-pub use crate::tool::ToolCallSpec;

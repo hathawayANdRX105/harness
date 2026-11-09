@@ -11,7 +11,7 @@
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -188,8 +188,6 @@ pub fn spill_dir() -> std::path::PathBuf {
 /// this process so a second overflow no longer overwrites the first one's
 /// full output.
 pub fn truncate_output(content: &str) -> std::io::Result<String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     let line_count = content.lines().count();
     if line_count <= MAX_OUTPUT_LINES {
         return Ok(content.to_string());
