@@ -43,9 +43,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
+        # rustc-dev alone leaves the lint crates linking against
+        # `-lLLVM-23-rust-1.100.0-nightly` unsatisfied; llvm-tools_preview
+        # provides it — the same component set rust-specs' own CI installs.
         with:
           toolchain: nightly-2026-08-20
-          components: rustfmt, clippy, rustc-dev, rust-src
+          components: rustfmt, clippy, rustc-dev, rust-src, llvm-tools-preview
       - name: Install cargo-dylint
         run: cargo +nightly-2026-08-20 install cargo-dylint --locked
       - name: Clone rust-specs (lint rule library)
