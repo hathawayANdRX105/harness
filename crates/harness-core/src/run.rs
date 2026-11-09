@@ -97,9 +97,9 @@ pub struct RunContext {
 /// the distinction is the same one nanoharness makes between `RUN_COMPLETED`,
 /// `RUN_CANCELLED` and `MAX_STEPS`.
 ///
-/// `BudgetBlocked` is its own variant rather than `Error` because the round
-/// did not fail at anything — it was refused before a provider call was made;
-/// a caller counting errors would otherwise bill a round that never ran.
+/// No budget-blocked variant (yet): a round refused before a provider call
+/// is distinct from an error, but budget vocabulary belongs to
+/// harness-context (#5), which defines the stop reason when it lands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -112,10 +112,4 @@ pub enum RunStopReason {
     MaxTurns,
     /// A failure encoded as a fatal event (see the stream-fn contract).
     Error { message: String },
-    /// The request could not be made to fit: content the compaction region
-    /// requires keeping is itself over budget, so no provider call happened.
-    BudgetBlocked {
-        required_tokens: u32,
-        available_tokens: u32,
-    },
 }
