@@ -515,6 +515,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-scheduler"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "harness-core",
+ "harness-loop",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "harness-session"
 version = "0.1.0"
 dependencies = [
