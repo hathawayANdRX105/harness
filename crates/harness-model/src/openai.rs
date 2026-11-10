@@ -65,9 +65,19 @@ impl OpenAIModel {
     /// (e.g. `https://api.openai.com/v1`); the adapter appends
     /// `/chat/completions` automatically.  `api_key` is the Bearer token.
     pub fn new(info: ModelInfo, base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        // A named User-Agent instead of reqwest's default: some OpenAI-compatible
+        // proxies (newapi among them) blocklist the bare "reqwest/x.y" UA with
+        // "405 Method Not Allowed: Blocked clients".
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("harness-model/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|err| {
+                eprintln!("harness-model: custom client unavailable ({err}); using default");
+                reqwest::Client::new()
+            });
         Self {
             info,
-            client: reqwest::Client::new(),
+            client,
             base_url: base_url.into(),
             api_key: api_key.into(),
             dialect: Dialect::OpenAI,
