@@ -221,8 +221,11 @@ fn parse_response_maps_server_error() -> Result<(), Box<dyn std::error::Error>> 
 /// notification and the stale reply; `parse_response` on it succeeds.
 #[test]
 fn stdio_roundtrip_matches_request_id() -> Result<(), Box<dyn std::error::Error>> {
+    // The stub reads one line (the request) before replying: replying at
+    // spawn time races the child's exit against the parent's write and fails
+    // on CI with EPIPE.
     let transport = StdioTransport::spawn(&stdio_config(
-        "printf '%s\\n' \
+        "read _ && printf '%s\\n' \
         '{\"jsonrpc\":\"2.0\",\"method\":\"notif\"}' \
         '{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}' \
         '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}'",
