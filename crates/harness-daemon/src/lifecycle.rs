@@ -7,8 +7,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use harness_scheduler::Scheduler;
-
 use crate::wire::DaemonHandler;
 
 /// How long the drain waits for in-flight runs before exiting anyway.
@@ -35,7 +33,7 @@ pub async fn wait_for_shutdown_signal() {
 
 /// Cancel every running run, wait (bounded) for them to reach a terminal
 /// status, then remove the socket file.
-pub async fn drain(handler: &DaemonHandler, scheduler: &Scheduler, socket_path: &Path) {
+pub async fn drain(handler: &DaemonHandler, socket_path: &Path) {
     let cancelled = handler.cancel_all_running();
     if cancelled > 0 {
         eprintln!("daemon: cancelled {cancelled} running run(s); draining");
@@ -50,6 +48,5 @@ pub async fn drain(handler: &DaemonHandler, scheduler: &Scheduler, socket_path: 
     }
     // Served runs may outlive the wait only in the timeout case; the statuses
     // stay queryable until the process exits.
-    let _ = scheduler.queued();
     let _ = tokio::fs::remove_file(socket_path).await;
 }

@@ -187,7 +187,7 @@ async fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
     let tcp = tokio::net::TcpListener::bind(&options.http)
         .await
         .map_err(|err| format!("http bind {}: {err}", options.http))?;
-    tokio::spawn(async move {
+    let http_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(tcp, app).await {
             eprintln!("daemon: http server failed: {err}");
         }
@@ -197,7 +197,7 @@ async fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
         socket_path: options.socket.display().to_string(),
         auth_token: None,
     };
-    tokio::spawn(async move {
+    let uds_handle = tokio::spawn(async move {
         if let Err(err) = harness_transport::uds::serve_uds(uds_config, uds_state).await {
             eprintln!("daemon: uds server failed: {err}");
         }
@@ -210,7 +210,12 @@ async fn run(args: impl Iterator<Item = String>) -> Result<(), String> {
 
     lifecycle::wait_for_shutdown_signal().await;
     eprintln!("daemon: shutdown signal received");
-    lifecycle::drain(&handler, &scheduler, &options.socket).await;
+    // Stop accepting new connections before draining in-flight runs.
+    http_handle.abort();
+    uds_handle.abort();
+    let _ = http_handle.await;
+    let _ = uds_handle.await;
+    lifecycle::drain(&handler, &options.socket).await;
     drop(lock);
     Ok(())
 }

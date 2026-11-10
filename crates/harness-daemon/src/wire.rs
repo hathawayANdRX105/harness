@@ -13,10 +13,10 @@
 //!   fires only from daemon-internal decisions — client disconnects cannot
 //!   cancel a run through it.
 //! - The pump subscribes right after `submit` returns; the scheduler registers
-//!   the run synchronously inside `submit`, but on a multi-thread runtime the
-//!   spawned loop task can in principle emit before the pump attaches. The
-//!   window is a retry-bounded best effort; a replay seam in the scheduler
-//!   channel would close it for good.
+//!   the run synchronously inside `submit` (idle) or at activation (queued),
+//!   so a queued run has no channel yet. The pump retries until the run is
+//!   terminal instead of giving up after a fixed cap, so queued runs never
+//!   lose events silently.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,10 +34,8 @@ use harness_transport::{CommandHandler, EventLog, SlashCommand, TransportError};
 
 /// Per-run retention cap of the in-memory event log (trimmed from the head).
 const EVENT_LOG_CAP: usize = 10_000;
-/// Bounded retries waiting for a run's bus channel to appear.
-const SUBSCRIBE_RETRIES: usize = 100;
-/// Delay between bus-channel retries.
-const SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(1);
+/// Delay between bus-channel polls while a queued run has no channel yet.
+const BUS_CHANNEL_POLL: Duration = Duration::from_millis(10);
 
 /// Recover a poisoned `std` mutex instead of panicking into the caller: the
 /// guarded data is plain state, and a panic in one request must not wedge the
@@ -79,8 +77,13 @@ impl InMemoryEventLog {
         }
         bucket.push(event);
     }
-}
 
+    /// Drop a finished run's event bucket so the log stays bounded.
+    pub fn retire(&self, run_id: &RunId) {
+        let mut events = lock(&self.events);
+        events.remove(run_id);
+    }
+}
 impl EventLog for InMemoryEventLog {
     fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent> {
         let events = lock(&self.events);
@@ -126,7 +129,7 @@ pub struct DaemonHandler {
     scheduler: Scheduler,
     runtime: OnceLock<AssembledRuntime>,
     event_tx: OnceLock<tokio::sync::broadcast::Sender<RunEvent>>,
-    runs: Mutex<Vec<RunId>>,
+    runs: Arc<Mutex<Vec<RunId>>>,
     log: Arc<InMemoryEventLog>,
     run_counter: AtomicU64,
 }
@@ -139,7 +142,7 @@ impl DaemonHandler {
             scheduler,
             runtime: OnceLock::new(),
             event_tx: OnceLock::new(),
-            runs: Mutex::new(Vec::new()),
+            runs: Arc::new(Mutex::new(Vec::new())),
             log,
             run_counter: AtomicU64::new(0),
         }
@@ -147,12 +150,16 @@ impl DaemonHandler {
 
     /// Wire the assembled runtime (called once at startup).
     pub fn set_runtime(&self, runtime: AssembledRuntime) {
-        let _ = self.runtime.set(runtime);
+        if self.runtime.set(runtime).is_err() {
+            eprintln!("daemon: runtime already wired; a second set_runtime is a bug, ignored");
+        }
     }
 
     /// Wire the transport broadcast channel (called once at startup).
     pub fn set_event_tx(&self, tx: tokio::sync::broadcast::Sender<RunEvent>) {
-        let _ = self.event_tx.set(tx);
+        if self.event_tx.set(tx).is_err() {
+            eprintln!("daemon: event tx already wired; a second set_event_tx is a bug, ignored");
+        }
     }
 
     /// Cancel every running run; returns how many were cancelled. Used by the
@@ -211,10 +218,14 @@ impl DaemonHandler {
             return;
         };
         let bus = self.scheduler.events().clone();
+        let scheduler = self.scheduler.clone();
         let log = self.log.clone();
+        let runs = self.runs.clone();
         tokio::spawn(async move {
-            let Some(mut sub) = wait_for_channel(&bus, &run_id).await else {
+            let Some(mut sub) = wait_for_channel(&bus, &scheduler, &run_id).await else {
                 eprintln!("daemon: run {run_id} never registered on the bus; events lost");
+                log.retire(&run_id);
+                Self::prune_run(&runs, &run_id);
                 return;
             };
             loop {
@@ -229,7 +240,16 @@ impl DaemonHandler {
                     Err(ReceiveError::Closed) => break,
                 }
             }
+            log.retire(&run_id);
+            Self::prune_run(&runs, &run_id);
         });
+    }
+
+    /// Drop a finished run from the handler's run bookkeeping: its pump has
+    /// ended (the subscription closed), so the run reached a terminal status.
+    fn prune_run(runs: &Mutex<Vec<RunId>>, run_id: &RunId) {
+        let mut rs = lock(runs);
+        rs.retain(|id| id != run_id);
     }
 
     fn cancel(&self, run_id: &str) -> Result<serde_json::Value, TransportError> {
@@ -277,17 +297,23 @@ impl CommandHandler for DaemonHandler {
     }
 }
 
-/// Wait (bounded) for the run's bus channel to appear after a synchronous
-/// `submit` — registration happens inside `submit`, so the first attempt
-/// normally hits.
-async fn wait_for_channel(bus: &EventBus, run_id: &RunId) -> Option<Subscription> {
-    for _ in 0..SUBSCRIBE_RETRIES {
+/// Wait for the run's bus channel to appear, retrying until the run is
+/// terminal: a queued run has no channel until it activates, so a fixed
+/// retry cap would silently lose all of its events.
+async fn wait_for_channel(
+    bus: &EventBus,
+    scheduler: &Scheduler,
+    run_id: &RunId,
+) -> Option<Subscription> {
+    loop {
         if let Some(sub) = bus.subscribe(run_id) {
             return Some(sub);
         }
-        tokio::time::sleep(SUBSCRIBE_RETRY_DELAY).await;
+        if matches!(scheduler.status(run_id), Some(RunStatus::Finished(_))) {
+            return None;
+        }
+        tokio::time::sleep(BUS_CHANNEL_POLL).await;
     }
-    None
 }
 
 /// Human-facing status label for a run.
