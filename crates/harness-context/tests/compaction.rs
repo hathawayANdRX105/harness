@@ -176,7 +176,9 @@ impl Compactor for TestCompactor {
             .map(|cp| cp.applied_stages.clone())
             .unwrap_or_default();
 
-        let mut stage_index = if start_stage.is_empty() {
+        // Starting position in the ladder; the pass only walks forward from
+        // here, so it is computed once and never advanced.
+        let stage_index = if start_stage.is_empty() {
             0
         } else {
             self.stages
@@ -204,7 +206,6 @@ impl Compactor for TestCompactor {
             if !stage.is_active(budget) {
                 // Budget is under control — no need for further stages.
                 applied_stages.push(stage.label.clone());
-                stage_index += 1;
                 continue;
             }
 
@@ -217,7 +218,6 @@ impl Compactor for TestCompactor {
                 // Nothing to compact — all messages are needed for
                 // pairing integrity. Move to next stage.
                 applied_stages.push(stage.label.clone());
-                stage_index += 1;
                 continue;
             }
 
@@ -231,7 +231,6 @@ impl Compactor for TestCompactor {
             messages.insert(0, summary);
 
             applied_stages.push(stage.label.clone());
-            stage_index += 1;
 
             // Re-check budget after compaction.
             let new_used = Self::estimate_tokens(messages);
