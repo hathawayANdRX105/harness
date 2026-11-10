@@ -33,7 +33,7 @@ use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
 use harness_core::{RunEvent, RunId};
 
-use crate::frame::{JsonRpcRequest, JsonRpcResponse, error_code, run_event_to_sse};
+use crate::frame::{JsonRpcRequest, JsonRpcResponse, run_event_to_sse};
 use crate::slash::command_from_jsonrpc;
 use crate::{TransportState, dispatch_command};
 
