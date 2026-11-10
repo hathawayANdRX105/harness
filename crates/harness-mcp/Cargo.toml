@@ -1,0 +1,30 @@
+[package]
+name = "harness-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP (Model Context Protocol) client: self-implemented JSON-RPC 2.0 over stdio or HTTP, mapping remote tools onto harness_core::Tool"
+license = "MIT"
+publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "2"
+# Only sync::CancellationToken — no runtime, no reactor.
+tokio-util = { version = "0.7", default-features = false }
+# tokio runtime types: spawn_blocking bridges the sync transport to the async
+# Tool trait; rt is a non-default feature that is fine for a library expected
+# to be used inside a tokio application.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# Sync HTTP client for the HTTP MCP transport. ureq 2.x matches the ferrite
+# reference; the json feature enables serde_json response reading.
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints]
+workspace = true
