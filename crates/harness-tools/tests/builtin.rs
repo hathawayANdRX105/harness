@@ -357,6 +357,201 @@ fn tool_metadata() {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// Security: path containment (escape rejection)
+// ---------------------------------------------------------------------------
+
+/// Purpose: verify ReadTool rejects an absolute file_path and reads nothing.
+/// Scenario: call read with file_path="/etc/passwd".
+/// Acceptance: invoke returns an error; no content is returned.
+#[tokio::test]
+async fn read_absolute_path_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let tool = ReadTool::new(dir.path().to_path_buf());
+    let err = tool
+        .invoke(
+            json!({"file_path": "/etc/passwd"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err_or_else();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escapes the working directory") || msg.contains("absolute"),
+        "absolute path read must be rejected: {msg}"
+    );
+    Ok(())
+}
+
+/// Purpose: verify ReadTool rejects a `..` file_path.
+/// Scenario: call read with file_path="../outside.txt".
+/// Acceptance: invoke returns an error.
+#[tokio::test]
+async fn read_parent_dir_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let tool = ReadTool::new(dir.path().to_path_buf());
+    let err = tool
+        .invoke(
+            json!({"file_path": "../outside.txt"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err_or_else();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escapes the working directory") || msg.contains("`..`"),
+        "`..` read must be rejected: {msg}"
+    );
+    Ok(())
+}
+
+/// Purpose: verify WriteTool rejects a `..` file_path and creates nothing outside cwd.
+/// Scenario: call write with file_path="../outside.txt".
+/// Acceptance: invoke returns an error; no file is created outside cwd.
+#[tokio::test]
+async fn write_parent_dir_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let tool = WriteTool::new(dir.path().to_path_buf());
+    let outside = dir.path().join("../outside.txt");
+    let err = tool
+        .invoke(
+            json!({"file_path": "../outside.txt", "content": "leak"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err_or_else();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escapes the working directory") || msg.contains("`..`"),
+        "`..` write must be rejected: {msg}"
+    );
+    assert!(
+        !outside.exists(),
+        "write with .. must not create a file outside cwd"
+    );
+    Ok(())
+}
+
+/// Purpose: verify WriteTool rejects a path containing `..` even when it stays inside cwd.
+/// Scenario: call write with file_path="sub/../ok.txt".
+/// Acceptance: invoke returns an error per the no-ParentDir rule.
+#[tokio::test]
+async fn write_sub_dotdot_ok_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let tool = WriteTool::new(dir.path().to_path_buf());
+    let err = tool
+        .invoke(
+            json!({"file_path": "sub/../ok.txt", "content": "data"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err_or_else();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escapes the working directory") || msg.contains("`..`"),
+        "sub/../ok.txt write must be rejected: {msg}"
+    );
+    Ok(())
+}
+
+/// Purpose: verify WriteTool then ReadTool still work on a normal relative path.
+/// Scenario: write a file, then read it back.
+/// Acceptance: write returns success, read returns the same content, no error.
+#[tokio::test]
+async fn write_then_read_happy_path() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let tool_dir = dir.path().to_path_buf();
+    let writer = WriteTool::new(tool_dir.clone());
+    let reader = ReadTool::new(tool_dir);
+
+    let write_result = writer
+        .invoke(
+            json!({"file_path": "normal.txt", "content": "happy path"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("write failed: {e}"));
+    assert!(!write_result.is_error, "write must not report error");
+
+    let read_result = reader
+        .invoke(
+            json!({"file_path": "normal.txt"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read failed: {e}"));
+    assert!(!read_result.is_error, "read must not report error");
+    assert!(
+        read_result.content.contains("happy path"),
+        "read must return written content"
+    );
+    Ok(())
+}
+
+/// Purpose: verify GlobTool rejects an absolute pattern.
+/// Scenario: call glob with pattern="/etc/*".
+/// Acceptance: invoke returns an error.
+#[tokio::test]
+async fn glob_absolute_pattern_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let tool = GlobTool::new(dir.path().to_path_buf());
+    let err = tool
+        .invoke(json!({"pattern": "/etc/*"}), &CancellationToken::new())
+        .await
+        .unwrap_err_or_else();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escapes the working directory") || msg.contains("absolute"),
+        "absolute glob pattern must be rejected: {msg}"
+    );
+    Ok(())
+}
+
+/// Purpose: verify GlobTool rejects a pattern containing `..`.
+/// Scenario: call glob with pattern="../*".
+/// Acceptance: invoke returns an error.
+#[tokio::test]
+async fn glob_dotdot_pattern_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let tool = GlobTool::new(dir.path().to_path_buf());
+    let err = tool
+        .invoke(json!({"pattern": "../*"}), &CancellationToken::new())
+        .await
+        .unwrap_err_or_else();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escapes the working directory") || msg.contains("`..`"),
+        "`..` glob pattern must be rejected: {msg}"
+    );
+    Ok(())
+}
+
+/// Purpose: verify ReadTool rejects a symlink inside cwd that points outside cwd.
+/// Scenario: create a symlink inside cwd pointing to a file outside cwd, then read it.
+/// Acceptance: invoke returns an error; nothing outside cwd is read.
+#[tokio::test]
+#[cfg(unix)]
+async fn read_symlink_escape_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("secret.txt"), "secret")?;
+    symlink(
+        outside.path().join("secret.txt"),
+        dir.path().join("link.txt"),
+    )?;
+    let tool = ReadTool::new(dir.path().to_path_buf());
+    let err = tool
+        .invoke(json!({"file_path": "link.txt"}), &CancellationToken::new())
+        .await
+        .unwrap_err_or_else();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escapes the working directory"),
+        "symlink escape read must be rejected: {msg}"
+    );
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Error type extension for test convenience

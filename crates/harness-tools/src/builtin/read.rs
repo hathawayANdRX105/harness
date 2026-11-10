@@ -10,16 +10,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
 use serde_json::{Value, json};
-use tokio::fs;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::require_string;
+use crate::builtin::path::{MAX_FILE_BYTES, resolve_in_cwd};
 use crate::output::{DEFAULT_MAX_OUTPUT_CHARS, truncate_output};
 
 /// Read a file from disk.
 ///
-/// Takes a `file_path` argument (relative to the session's cwd or absolute)
-/// and an optional `limit` for truncation.
+/// Takes a `file_path` argument (relative to the session's cwd) and an
+/// optional `limit` for truncation.
 pub struct ReadTool {
     cwd: Arc<std::path::PathBuf>,
 }
@@ -73,15 +75,46 @@ impl Tool for ReadTool {
             .and_then(Value::as_u64)
             .map_or(DEFAULT_MAX_OUTPUT_CHARS, |v| v as usize);
 
-        let path = self.cwd.join(&file_path);
-        let content = fs::read_to_string(&path).await.map_err(|e| {
+        // Containment: reject absolute paths, `..`, and symlink escapes
+        // before touching the filesystem.
+        let path = resolve_in_cwd(&self.cwd, &file_path)?;
+
+        // Read with a per-file byte cap so an oversized file cannot consume
+        // unbounded memory. Read up to cap+1 bytes so truncation is
+        // detectable, then report it in the result content.
+        let file = File::open(&path).await.map_err(|e| {
             let reason = if e.kind() == std::io::ErrorKind::NotFound {
-                format!("file not found: {}", file_path)
+                format!("file not found: {file_path}")
             } else {
-                format!("failed to read `{}`: {e}", file_path)
+                format!("failed to read `{file_path}`: {e}")
             };
             ToolError::Exec(reason)
         })?;
+
+        let mut buf = Vec::new();
+        let mut take = file.take(MAX_FILE_BYTES + 1);
+        take.read_to_end(&mut buf)
+            .await
+            .map_err(|e| ToolError::Exec(format!("failed to read `{file_path}`: {e}")))?;
+
+        let hit_byte_cap = buf.len() > MAX_FILE_BYTES as usize;
+        if hit_byte_cap {
+            buf.truncate(MAX_FILE_BYTES as usize);
+        }
+
+        let content = String::from_utf8(buf).map_err(|e| {
+            ToolError::Exec(format!(
+                "failed to read `{file_path}`: file is not valid UTF-8 ({e})"
+            ))
+        })?;
+
+        let content = if hit_byte_cap {
+            format!(
+                "... (file `{file_path}` is larger than {MAX_FILE_BYTES} bytes; showing the first {MAX_FILE_BYTES} bytes)\n{content}"
+            )
+        } else {
+            content
+        };
 
         let char_count = content.chars().count();
         let (truncated, spill) = truncate_output(&content, limit);

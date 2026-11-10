@@ -7,6 +7,7 @@
 //! the edit is deterministic.
 
 use std::path::PathBuf;
+use std::process::id as process_id;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::require_string;
+use crate::builtin::path::resolve_in_cwd;
 
 /// Edit a file by replacing `old_text` with `new_text`.
 ///
@@ -75,7 +77,9 @@ impl Tool for EditTool {
         let old_text = require_string(&args, "old_text")?;
         let new_text = require_string(&args, "new_text")?;
 
-        let path = self.cwd.join(&file_path);
+        // Containment: reject absolute paths, `..`, and symlink escapes
+        // before touching the filesystem.
+        let path = resolve_in_cwd(&self.cwd, &file_path)?;
         let content = fs::read_to_string(&path).await.map_err(|e| {
             let reason = if e.kind() == std::io::ErrorKind::NotFound {
                 format!("file not found: {file_path}")
@@ -98,9 +102,26 @@ impl Tool for EditTool {
             &content[pos + old_text.len()..]
         );
 
-        fs::write(&path, &new_content).await.map_err(|e| {
-            ToolError::Exec(format!("failed to write `{file_path}` after edit: {e}"))
-        })?;
+        // Atomic write: stage in a temp file in the same directory, then
+        // rename over the target (atomic on the same filesystem).
+        let pid = process_id();
+        let file_name = format!("{}.tmp.{pid}", file_path);
+        let mut tmp_path = path.clone();
+        tmp_path.set_file_name(file_name);
+
+        if let Err(e) = fs::write(&tmp_path, &new_content).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(ToolError::Exec(format!(
+                "failed to write `{file_path}` after edit: {e}"
+            )));
+        }
+
+        if let Err(e) = fs::rename(&tmp_path, &path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(ToolError::Exec(format!(
+                "failed to finalize edit of `{file_path}`: {e}"
+            )));
+        }
 
         let char_diff = new_text.chars().count() as isize - old_text.chars().count() as isize;
         let sign = if char_diff >= 0 { "+" } else { "" };
