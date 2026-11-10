@@ -69,6 +69,17 @@ pub(crate) fn classify_toml_error(
     file: &str,
     source_text: &str,
 ) -> ConfigError {
+    classify_toml_error_with_path(err, file, source_text, "")
+}
+
+/// Like [`classify_toml_error`], with the serde field path (`budget.max_turns`)
+/// when the caller could obtain one.
+pub(crate) fn classify_toml_error_with_path(
+    err: &toml::de::Error,
+    file: &str,
+    source_text: &str,
+    field_path: &str,
+) -> ConfigError {
     let line = err
         .span()
         .map(|s| byte_offset_to_line(source_text, s.start))
@@ -93,8 +104,14 @@ pub(crate) fn classify_toml_error(
         };
     }
 
-    // Everything else (type mismatch, syntax error, …) is a type error.
-    let field = extract_field_name_fallback(&msg).unwrap_or("<root>");
+    // Everything else (type mismatch, syntax error, …) is a type error. The
+    // serde field path wins: toml's message names the expected type but not the
+    // key, so without the path the user only sees `<root>`.
+    let field = if field_path.is_empty() {
+        extract_field_name_fallback(&msg).unwrap_or("<root>")
+    } else {
+        field_path
+    };
     ConfigError::TypeError {
         field: field.to_string(),
         detail: msg,

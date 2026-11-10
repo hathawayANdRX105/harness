@@ -420,6 +420,7 @@ name = "harness-config"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_path_to_error",
  "tempfile",
  "thiserror",
  "toml",

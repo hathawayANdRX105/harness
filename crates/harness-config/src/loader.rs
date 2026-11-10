@@ -61,21 +61,36 @@ pub fn load_from_path(path: &Path) -> Result<Config, ConfigError> {
     })?;
 
     // Run schema migrations (versionless → v1, v1 → v2, …).
+    let file_version = table
+        .get("version")
+        .and_then(|v| v.as_integer())
+        .map_or(0, |n| n as u32);
     crate::migration::run_migrations(&mut table)?;
 
-    // Convert table to a Value and serialize to string for re-deserialization.
-    // This round-trip is needed because after migrations we have a raw Table
-    // but need serde's field-defaulting and deny_unknown_fields.
-    let value = toml::Value::Table(table);
-    let raw_str = toml::to_string(&value).map_err(|_| ConfigError::Migration {
-        from_version: 0,
-        target_version: CURRENT_CONFIG_VERSION,
-        detail: "migration produced invalid TOML — internal error".into(),
-    })?;
+    // Deserialize from the original text whenever no migration rewrote the
+    // table: toml's spans then point at the user's real file:line instead of
+    // at a regenerated copy. A migration changes the values, so only the
+    // regenerated text describes what is being deserialized.
+    let source_text = if file_version == CURRENT_CONFIG_VERSION {
+        content
+    } else {
+        toml::to_string(&toml::Value::Table(table)).map_err(|_| ConfigError::Migration {
+            from_version: file_version,
+            target_version: CURRENT_CONFIG_VERSION,
+            detail: "migration produced invalid TOML — internal error".into(),
+        })?
+    };
 
-    let config: Config = toml::from_str(&raw_str).map_err(|e| {
+    // `toml`'s own type errors omit the offending key; the serde path is the
+    // only way to name the field (`budget.max_turns`) in the user's message.
+    let config: Config = serde_path_to_error::deserialize(toml::de::Deserializer::new(
+        &source_text,
+    ))
+    .map_err(|e| {
         let file = path.display().to_string();
-        error::classify_toml_error(&e, &file, &raw_str)
+        let field_path = e.path().to_string();
+        let inner = e.into_inner();
+        error::classify_toml_error_with_path(&inner, &file, &source_text, &field_path)
     })?;
 
     // Apply env overrides on top of the file config.

@@ -8,6 +8,9 @@ publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# Field-path reporting: toml's own type errors omit the key, so the loader
+# needs the serde path to say which field is wrong (budget.max_turns, …).
+serde_path_to_error = "0.1"
 toml = "0.8"
 thiserror = "2"
 
