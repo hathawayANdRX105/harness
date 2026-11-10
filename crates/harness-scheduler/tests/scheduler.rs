@@ -21,7 +21,8 @@ use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, 
 use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
 use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode};
 use harness_scheduler::{
-    EventBus, RunRequest, RunStatus, ScheduleError, Scheduler, bus::ReceiveError,
+    EventBus, RunRequest, RunStatus, ScheduleError, Scheduler,
+    bus::{BUS_CAPACITY, ReceiveError},
 };
 
 /// A model that streams `turns` turns, then repeats the last one forever so a
@@ -551,4 +552,174 @@ where
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("run {run_id} never reached the expected status");
+}
+/// A model that emits `n` text deltas, pacing each one with `pace`, then
+/// ends the turn. Streams long enough to overflow a [`BUS_CAPACITY`]-slot bus
+/// buffer while a subscriber looks away.
+struct PacingModel {
+    info: ModelInfo,
+    n: usize,
+    pace: Duration,
+}
+
+impl PacingModel {
+    fn new(n: usize, pace: Duration) -> Self {
+        Self {
+            info: ModelInfo {
+                handle: "mock".into(),
+                provider: "mock".into(),
+                model: "mock-1".into(),
+                context_window: 8192,
+                supports_tool_use: true,
+                supports_streaming: true,
+            },
+            n,
+            pace,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Model for PacingModel {
+    fn info(&self) -> &ModelInfo {
+        &self.info
+    }
+
+    async fn stream(&self, _req: &ModelRequest) -> ModelStream<'_> {
+        let n = self.n;
+        let pace = self.pace;
+        Box::pin(futures::stream::unfold(0usize, move |i| async move {
+            if i < n {
+                tokio::time::sleep(pace).await;
+                Some((ModelEvent::TextDelta(format!("delta {i}")), i + 1))
+            } else if i == n {
+                tokio::time::sleep(pace).await;
+                Some((ModelEvent::Stop(StopReason::EndTurn), i + 1))
+            } else {
+                None
+            }
+        }))
+    }
+}
+
+/// Lagged subscriber on a saturated bus, plus dropped-event accounting.
+///
+/// Scenario:
+/// 1. Submit run `r-lagged` whose model streams more than [`BUS_CAPACITY`]
+///    text deltas; subscribe after the run is active (it is already
+///    registered on the bus).
+/// 2. Do not read from the subscription while the bus overflows, then read:
+///    the subscriber must observe `ReceiveError::Lagged(n)` with `n >= 1`.
+/// 3. Submit run `r-dropped` whose model emits a few events with no
+///    subscriber: every send fails on the bus, so `dropped_events` grows.
+///
+/// Acceptance:
+/// - the lagged subscriber observes `Lagged(n >= 1)`;
+/// - `r-lagged` still reaches `Finished(Completed)` — the emitter never
+///   blocked on the subscriber;
+/// - `bus.dropped_events()` ends above where it started.
+#[tokio::test]
+async fn lagged_subscriber_observes_lagged_and_run_finishes() {
+    let scheduler = Scheduler::new(4);
+    let bus = scheduler.events();
+    let n_deltas = BUS_CAPACITY + 50;
+
+    let lagged_ctx = ctx("r-lagged");
+    let run_id = lagged_ctx.run_id.clone();
+    let model = Arc::new(PacingModel::new(n_deltas, Duration::from_millis(1)));
+    scheduler
+        .submit(RunRequest {
+            ctx: lagged_ctx,
+            deps: deps(model, vec![], Arc::new(CountingSink::default())),
+        })
+        .unwrap_or_else(|e| panic!("run must start: {e}"));
+
+    let mut sub = subscribe_after_start(&scheduler, bus, &run_id).await;
+
+    // Let the bus overflow past its 256-slot buffer without reading, then
+    // read: the first receive reports the gap as Lagged.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    match tokio::time::timeout(Duration::from_secs(10), sub.recv()).await {
+        Ok(Err(ReceiveError::Lagged(n))) => {
+            assert!(
+                n >= 1,
+                "lagged report must account for at least one event, got {n}"
+            );
+        }
+        Ok(Err(ReceiveError::Closed)) => {
+            panic!("subscription closed before reporting lag");
+        }
+        Ok(Ok(event)) => {
+            panic!("subscription produced an event before lag: {event:?}");
+        }
+        Err(_elapsed) => {
+            panic!("subscription timed out waiting for lag");
+        }
+    }
+
+    wait_for_status(&scheduler, &run_id, |status| {
+        matches!(status, RunStatus::Finished(RunStopReason::Completed))
+    })
+    .await;
+
+    // No subscriber: every send fails and the bus counts it as dropped.
+    let dropped_before = bus.dropped_events();
+    let model2 = Arc::new(PacingModel::new(5, Duration::from_millis(1)));
+    let dropped_ctx = ctx("r-dropped");
+    let run_id2 = dropped_ctx.run_id.clone();
+    scheduler
+        .submit(RunRequest {
+            ctx: dropped_ctx,
+            deps: deps(model2, vec![], Arc::new(CountingSink::default())),
+        })
+        .unwrap_or_else(|e| panic!("second run must start: {e}"));
+    wait_for_status(&scheduler, &run_id2, |status| {
+        matches!(status, RunStatus::Finished(RunStopReason::Completed))
+    })
+    .await;
+    let dropped_after = bus.dropped_events();
+    assert!(
+        dropped_after > dropped_before,
+        "bus should count events dropped for the no-subscriber run: {dropped_before} -> {dropped_after}"
+    );
+}
+
+/// A finished run id can never be resubmitted: ids are single use.
+///
+/// Scenario:
+/// 1. Submit run `r-once` with a model that ends its turn immediately
+///    (`Stop(EndTurn)`), then wait for `Finished(Completed)`.
+/// 2. Submit a new request carrying the same run id.
+///
+/// Acceptance: the second submit fails with exactly
+/// `ScheduleError::DuplicateRun(_)`. Finished ids are retired, not reusable
+/// — this pins behavior the handoff left undocumented.
+#[tokio::test]
+async fn resubmit_after_finished_is_duplicate_run() {
+    let scheduler = Scheduler::new(4);
+    let model = Arc::new(SlowModel::new(
+        vec![vec![ModelEvent::Stop(StopReason::EndTurn)]],
+        Duration::ZERO,
+    ));
+    let make_request = || RunRequest {
+        ctx: ctx("r-once"),
+        deps: deps(model.clone(), vec![], Arc::new(CountingSink::default())),
+    };
+
+    let run_id = match scheduler.submit(make_request()) {
+        Ok(id) => id,
+        Err(err) => panic!("first submit of r-once must start: {err}"),
+    };
+    assert_eq!(run_id, RunId("r-once".into()));
+
+    wait_for_status(&scheduler, &run_id, |status| {
+        matches!(status, RunStatus::Finished(RunStopReason::Completed))
+    })
+    .await;
+
+    match scheduler.submit(make_request()) {
+        Err(ScheduleError::DuplicateRun(_)) => {}
+        Ok(id) => panic!("resubmitting a finished id must fail, got {id:?}"),
+        Err(err) => panic!("resubmitting a finished id must be DuplicateRun, got {err:?}"),
+    }
 }
