@@ -138,12 +138,14 @@ impl TestCompactor {
             }
         }
 
-        // Safe boundary is after the last result, or at 0 if no pairs
-        // exist.
-        if last_result > 0 && last_result + 1 < limit {
+        // With no tool pairs in the prefix, `last_result` stays 0 — the
+        // boundary at which every pair (vacuously) matches is the limit
+        // itself, not zero: returning 0 here would make the compactor treat
+        // plain text transcripts as uncompactable.
+        if last_result > 0 {
             last_result + 1
         } else {
-            0
+            limit
         }
     }
 }
@@ -241,7 +243,11 @@ impl Compactor for TestCompactor {
         }
 
         let after = Self::estimate_tokens(messages);
-        let completed = stage_index >= self.stages.len();
+        // `completed` means the pass ran to its natural end (the budget was
+        // satisfied or every stage was consulted), not "every stage fired":
+        // stopping early because the budget recovered is a completed pass.
+        // Only cancellation makes it partial — see `CompactionResult`.
+        let completed = !cancel.is_cancelled();
 
         CompactionResult {
             before,
@@ -262,11 +268,18 @@ impl Compactor for TestCompactor {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn model_info_32k() -> ModelInfo {
+    model_info_with_window(32_768)
+}
+
+/// A model info with an arbitrary context window. Tests that must actually
+/// cross a compaction threshold shrink the window instead of building a
+/// megabyte-scale transcript.
+fn model_info_with_window(context_window: u32) -> ModelInfo {
     ModelInfo {
         handle: "test-model".into(),
         provider: "test".into(),
         model: "test-model".into(),
-        context_window: 32_768,
+        context_window,
         supports_tool_use: true,
         supports_streaming: true,
     }
@@ -370,7 +383,10 @@ fn budget_blocked_has_expected_fields() {
 async fn compaction_reduces_tokens() {
     let compactor = TestCompactor::new(default_stages());
     let mut messages = make_transcript(100);
-    let info = model_info_32k();
+    // The transcript estimates to ~800 tokens: against a 32k window it sits
+    // far below the first (60%) threshold and no stage fires. A 1k window
+    // makes the budget genuinely exceeded, which is what this case asserts.
+    let info = model_info_with_window(1_024);
     let budget = compactor.read_budget(&messages, &info);
     let cancel = CancellationToken::new();
 
