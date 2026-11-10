@@ -27,6 +27,7 @@
 //! JSON-RPC frame.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use harness_core::{RunEvent, RunId};
@@ -72,6 +73,24 @@ fn test_state() -> Arc<TransportState> {
         Arc::new(MockEventLog),
     ))
 }
+/// Poll `check` every 50 ms until it returns `Ok` or `deadline` passes,
+/// returning the last error string on timeout.  Replaces fixed sleeps
+/// that race against server startup.
+async fn poll_until<T, F, Fut>(mut check: F, deadline: Instant) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    loop {
+        match check().await {
+            Ok(value) => return Ok(value),
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 // ── HTTP+SSE round-trip ────────────────────────────────────────────────────
 
@@ -96,9 +115,9 @@ async fn http_command_roundtrip() -> TestResult {
         let _ = axum::serve(listener, app).await;
     });
 
-    // Give the server a moment to start listening.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
+    // Wait for the server to accept connections (bounded poll instead of a
+    // fixed sleep that can race against startup).
+    let deadline = Instant::now() + Duration::from_secs(5);
     let client = reqwest::Client::new();
     let req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -106,12 +125,25 @@ async fn http_command_roundtrip() -> TestResult {
         "params": {"run_id": "test-run"},
         "id": 1,
     });
-
-    let resp = client
-        .post(format!("http://{addr}/command"))
-        .json(&req)
-        .send()
-        .await?;
+    let url = format!("http://{addr}/command");
+    let resp = poll_until(
+        || {
+            let client = client.clone();
+            let url = url.clone();
+            let req = req.clone();
+            async move {
+                client
+                    .post(&url)
+                    .json(&req)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("HTTP server did not accept connections: {e}"))?;
     assert!(resp.status().is_success(), "HTTP 200 expected");
 
     let body: serde_json::Value = resp.json().await?;
@@ -137,20 +169,33 @@ async fn http_unknown_command_returns_error() -> TestResult {
         let _ = axum::serve(listener, app).await;
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
+    // Wait for the server to accept connections (bounded poll instead of a fixed sleep).
+    let deadline = Instant::now() + Duration::from_secs(5);
     let client = reqwest::Client::new();
     let req = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "unknown",
         "id": 42,
     });
-
-    let resp = client
-        .post(format!("http://{addr}/command"))
-        .json(&req)
-        .send()
-        .await?;
+    let url = format!("http://{addr}/command");
+    let resp = poll_until(
+        || {
+            let client = client.clone();
+            let url = url.clone();
+            let req = req.clone();
+            async move {
+                client
+                    .post(&url)
+                    .json(&req)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("HTTP server did not accept connections: {e}"))?;
     assert!(
         resp.status().is_success(),
         "HTTP 200 even for error responses"
@@ -185,11 +230,22 @@ async fn ws_command_roundtrip() -> TestResult {
         let _ = axum::serve(listener, app).await;
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // Connect via tokio-tungstenite.
+    // Wait for the server to accept connections (bounded poll instead of a fixed sleep).
+    let deadline = Instant::now() + Duration::from_secs(5);
     let url = format!("ws://{addr}/ws");
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await?;
+    let (ws_stream, _) = poll_until(
+        || {
+            let url = url.clone();
+            async move {
+                tokio_tungstenite::connect_async(&url)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("WebSocket server did not accept connections: {e}"))?;
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -253,10 +309,21 @@ async fn uds_command_roundtrip() -> TestResult {
         let _ = harness_transport::uds::serve_uds(config, state).await;
     });
 
-    // Give the server a moment to bind.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let stream = tokio::net::UnixStream::connect(&socket_path).await?;
+    // Wait for the server to bind (bounded poll instead of a fixed sleep).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let stream = poll_until(
+        || {
+            let socket_path = socket_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(&socket_path)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("UDS server did not accept connections: {e}"))?;
 
     let (reader, mut writer) = tokio::io::split(stream);
     use tokio::io::AsyncWriteExt;

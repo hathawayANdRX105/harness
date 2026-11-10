@@ -188,11 +188,18 @@ impl SessionStore for SqliteSessionStore {
         session_id: &SessionId,
         message: &Message,
     ) -> Result<u64, SessionStoreError> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let now = Self::now_ms();
 
+        // Assign the next seq and insert in one transaction: the seq read and
+        // the insert must be atomic so concurrent appends cannot observe a gap
+        // or hand out the same seq twice.
+        let tx = conn
+            .transaction()
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+
         // Assign next seq: max existing + 1, or 1 for first message.
-        let next_seq: u64 = conn
+        let next_seq: u64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
                 params![session_id.0],
@@ -202,13 +209,15 @@ impl SessionStore for SqliteSessionStore {
 
         let message_json = serde_json::to_string(message)?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO messages (session_id, seq, message_json, created_at_ms)
              VALUES (?1, ?2, ?3, ?4)",
             params![session_id.0, next_seq, message_json, now],
         )
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
 
+        tx.commit()
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         Ok(next_seq)
     }
 
@@ -322,27 +331,47 @@ impl SessionStore for SqliteSessionStore {
             return Ok(Vec::new());
         }
 
-        let min_seq = seqs[0];
-        let max_seq = seqs[seqs.len() - 1];
-        let expected: Vec<u64> = (min_seq..=max_seq).collect();
-        let gaps: Vec<u64> = expected.into_iter().filter(|s| !seqs.contains(s)).collect();
+        // Total missing seqs beyond which the ledger is treated as corrupt:
+        // materializing every missing number between widely-spaced seqs can
+        // OOM, so cap the count and surface an internal error instead.
+        const MAX_GAPS: u64 = 10_000;
+
+        let mut gaps = Vec::new();
+        let mut total = 0u64;
+        for pair in seqs.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if end > start + 1 {
+                total += end - start - 1;
+                if total > MAX_GAPS {
+                    return Err(SessionStoreError::Internal(format!(
+                        "event gap count exceeds {MAX_GAPS} for run {}; ledger may be corrupt",
+                        run_id.0
+                    )));
+                }
+                gaps.extend((start + 1)..end);
+            }
+        }
         Ok(gaps)
     }
 
     fn delete_session(&self, id: &SessionId) -> Result<(), SessionStoreError> {
-        let conn = self.conn.lock();
-
-        conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id.0])
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
 
-        conn.execute(
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![id.0])
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        tx.execute(
             "DELETE FROM run_events WHERE session_id = ?1",
             params![id.0],
         )
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-
-        let deleted = conn
+        let deleted = tx
             .execute("DELETE FROM sessions WHERE session_id = ?1", params![id.0])
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+
+        tx.commit()
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
 
         if deleted == 0 {

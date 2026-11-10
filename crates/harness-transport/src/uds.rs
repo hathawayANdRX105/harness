@@ -37,11 +37,20 @@ use crate::slash::command_from_jsonrpc;
 use crate::{TransportState, dispatch_command};
 
 /// Configuration for the UDS transport.
+///
+/// The socket is bound before its permissions are tightened to `0o700`
+/// (`bind` then `chmod` is the only possible ordering: `chmod` needs the
+/// path to exist).  There is therefore a tiny window between `bind` and
+/// `chmod` during which the socket file is reachable with the umask's
+/// default permissions.  For strictly local control-plane use this is
+/// acceptable; enable [`auth_token`](#structfield.auth_token) if the
+/// socket may be visible to other local users.
 pub struct UdsConfig {
     /// Path to the Unix domain socket.
     pub socket_path: String,
     /// Optional bearer token.  When set, every connection must authenticate
     /// with a matching `auth` method call before issuing commands.
+    /// Token comparison is constant-time.
     pub auth_token: Option<String>,
 }
 
@@ -63,8 +72,9 @@ pub async fn serve_uds(
 
     let listener = UnixListener::bind(&config.socket_path)?;
 
-    // Set permissions to owner-only.
-    set_permissions(&config.socket_path)?;
+    // Set permissions to owner-only (async, so the bind→chmod window is
+    // as small as the runtime allows).
+    set_permissions(&config.socket_path).await?;
 
     loop {
         let (stream, _peer_addr) = match listener.accept().await {
@@ -126,7 +136,7 @@ async fn handle_connection(
                         .as_ref()
                         .and_then(|p| p.get("token"))
                         .and_then(|v| v.as_str())
-                        .is_some_and(|t| t == expected)
+                        .is_some_and(|t| constant_time_eq(t, expected))
                 });
 
                 if token_ok {
@@ -172,16 +182,37 @@ async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
     writer.flush().await
 }
 
-/// Set Unix socket permissions to `0o700` (owner-only).
+/// Set Unix socket permissions to `0o700` (owner-only) asynchronously.
+///
+/// Performed after [`UnixListener::bind`] so there is a brief window
+/// (documented on [`UdsConfig`]) where the socket is reachable before
+/// permissions are tightened.
 #[cfg(unix)]
-fn set_permissions(path: &str) -> Result<(), std::io::Error> {
+async fn set_permissions(path: &str) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
     let perm = std::fs::Permissions::from_mode(0o700);
-    std::fs::set_permissions(path, perm)
+    tokio::fs::set_permissions(path, perm).await
 }
 
 #[cfg(not(unix))]
-fn set_permissions(_path: &str) -> Result<(), std::io::Error> {
+async fn set_permissions(_path: &str) -> Result<(), std::io::Error> {
     // No-op on non-Unix platforms.
     Ok(())
+}
+/// Constant-time comparison of two strings.
+///
+/// Returns `false` when the lengths differ (without revealing which is
+/// longer) and otherwise XOR-folds the byte slices so comparison time does
+/// not depend on the position of a mismatch.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }

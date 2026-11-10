@@ -12,16 +12,6 @@
 //!   three channels.  Both converge on the same enum so the
 //!   [`CommandHandler`](crate::CommandHandler) seam sees only one vocabulary.
 //!
-//! ## Test policy deviation
-//!
-//! The core repo convention (testing-ci.md §1) places all tests in `tests/`.
-//! This module contains inline `#[cfg(test)]` unit tests for the pure
-//! string-parsing functions because they have zero crate dependencies and
-//! writing them as integration tests would pull the full harness-transport
-//! dependency tree just to exercise a `&str → SlashCommand` mapping.
-//! The deviation is scoped to exactly this module and each test carries
-//! a justification comment.
-
 use serde::Deserialize;
 
 /// A command parsed from a transport client, either from slash text or
@@ -223,107 +213,5 @@ pub fn slash_to_jsonrpc(cmd: &SlashCommand) -> (String, Option<serde_json::Value
             Some(serde_json::json!({ "run_id": run_id })),
         ),
         SlashCommand::List => ("list".into(), None),
-    }
-}
-
-#[cfg(test)]
-mod unit_tests {
-    // ── Inline test justification ──────────────────────────────────────
-    //
-    // This module is a deliberate deviation from the repo's "all tests in
-    // tests/" convention (testing-ci.md §1).  The functions under test are
-    // pure string-to-enum transformations with zero harness-transport crate
-    // dependencies.  Placing them in tests/ would compile the full crate
-    // (axum, tokio, etc.) just to assert `&str → SlashCommand`.
-    // The deviation is scoped to exactly this module.
-    //
-    // Purpose: verify that every slash command variant round-trips through
-    // parse_slash correctly.  Acceptance: each known command produces the
-    // expected SlashCommand variant with the correct argument values.
-
-    use super::*;
-
-    #[test]
-    fn parse_run_command() {
-        let cmd = parse_slash("/run write unit tests").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            cmd,
-            SlashCommand::Run {
-                task: "write unit tests".into()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_cancel_command() {
-        let cmd = parse_slash("/cancel abc-123").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            cmd,
-            SlashCommand::Cancel {
-                run_id: "abc-123".into()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_steer_command() {
-        let cmd =
-            parse_slash("/steer run-1 use a different approach").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            cmd,
-            SlashCommand::Steer {
-                run_id: "run-1".into(),
-                message: "use a different approach".into()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_status_command() {
-        let cmd = parse_slash("/status run-42").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            cmd,
-            SlashCommand::Status {
-                run_id: "run-42".into()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_list_command() {
-        let cmd = parse_slash("/list").unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(cmd, SlashCommand::List);
-    }
-
-    #[test]
-    fn parse_unknown_command_is_error() {
-        let err = parse_slash("/unknown")
-            .err()
-            .unwrap_or_else(|| panic!("expected an error"));
-        assert_eq!(err, ParseSlashError::Unknown("unknown".into()));
-    }
-
-    #[test]
-    fn parse_empty_input_is_not_a_slash_command() {
-        let err = parse_slash("")
-            .err()
-            .unwrap_or_else(|| panic!("expected an error"));
-        assert_eq!(err, ParseSlashError::NotSlash);
-    }
-
-    #[test]
-    fn parse_plain_text_is_not_a_slash_command() {
-        let err = parse_slash("hello")
-            .err()
-            .unwrap_or_else(|| panic!("expected an error"));
-        assert_eq!(err, ParseSlashError::NotSlash);
-    }
-
-    #[test]
-    fn parse_run_missing_task() {
-        let err = parse_slash("/run")
-            .err()
-            .unwrap_or_else(|| panic!("expected an error"));
-        assert_eq!(err, ParseSlashError::MissingArgs("task"));
     }
 }

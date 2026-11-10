@@ -13,13 +13,15 @@
 //! # SSE parsing
 //!
 //! The SSE parser is hand-written (no `eventsource` dependency). It scans
-//! a `String` buffer for `data:` lines terminated by `\n\n`. This is
+//! a byte buffer for `data:` lines terminated by ASCII `\n\n`, so multi-byte
+//! UTF-8 is never split across chunk boundaries. This is
 //! deliberately minimal — only the fields that OpenAI and DeepSeek actually
 //! send are parsed. A full SSE implementation would need retry/reconnect
 //! fields, event-id tracking, and multi-line data; those are unnecessary
 //! for a request-response LLM API.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -47,12 +49,24 @@ use crate::dialect::Dialect;
 /// every failure (connection error, non-2xx response, JSON parse error,
 /// mid-stream disconnect) maps to a terminal `ModelEvent::Error`. The
 /// stream itself never panics or returns `Err`.
+/// A stalled upstream must surface a terminal `ModelEvent::Error`, never
+/// hang: the stream-fn contract requires every failure to surface as a
+/// terminal error rather than a blocked request.
+///
+/// `CONNECT_TIMEOUT` bounds the TCP/TLS handshake; `REQUEST_TIMEOUT` bounds
+/// the whole request, including a stalled SSE body read. Either expiry
+/// becomes a transport error, retried with backoff, and ends as a terminal
+/// `Error` once retries are exhausted.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Debug, Clone)]
 pub struct OpenAIModel {
     info: ModelInfo,
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    api_key_valid: bool,
     dialect: Dialect,
     retry_policy: RetryPolicy,
 }
@@ -65,11 +79,19 @@ impl OpenAIModel {
     /// (e.g. `https://api.openai.com/v1`); the adapter appends
     /// `/chat/completions` automatically.  `api_key` is the Bearer token.
     pub fn new(info: ModelInfo, base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        // A named User-Agent instead of reqwest's default: some OpenAI-compatible
-        // proxies (newapi among them) blocklist the bare "reqwest/x.y" UA with
-        // "405 Method Not Allowed: Blocked clients".
+        let api_key = api_key.into();
+        // Reject control characters up front: reqwest fails to encode them
+        // into a header value at send time, so validate in `new()` and
+        // surface a clear terminal error at stream time instead.
+        let api_key_valid = is_valid_api_key(&api_key);
+        // Timeouts so a stalled upstream surfaces a terminal `Error` event
+        // instead of hanging (stream-fn contract). The builder-level
+        // User-Agent was dropped: if construction falls back to the default
+        // client, per-request headers in `attempt_send` keep the wire UA
+        // correct regardless.
         let client = reqwest::Client::builder()
-            .user_agent(concat!("harness-model/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .unwrap_or_else(|err| {
                 eprintln!("harness-model: custom client unavailable ({err}); using default");
@@ -79,7 +101,8 @@ impl OpenAIModel {
             info,
             client,
             base_url: base_url.into(),
-            api_key: api_key.into(),
+            api_key,
+            api_key_valid,
             dialect: Dialect::OpenAI,
             retry_policy: RetryPolicy::default(),
         }
@@ -105,6 +128,19 @@ impl Model for OpenAIModel {
     }
 
     async fn stream(&self, req: &ModelRequest) -> ModelStream<'_> {
+        // An API key carrying ASCII control characters can never be encoded
+        // into an `Authorization` header — surface a clear terminal error
+        // instead of a mysterious transport failure downstream.
+        if !self.api_key_valid {
+            let (tx, rx) = mpsc::unbounded_channel::<ModelEvent>();
+            let _ = tx.send(ModelEvent::Error {
+                message: "invalid API key: value is not encodable as an HTTP header value".into(),
+            });
+            return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            }));
+        }
+
         // Clone everything we own so the returned stream is 'static
         let client = self.client.clone();
         let url = format!("{}/chat/completions", self.base_url);
@@ -378,6 +414,13 @@ async fn run_stream(
         }
     }
 }
+/// Whether an API key can be encoded into an HTTP header value: free of
+/// ASCII control characters (0x00-0x1F and 0x7F), which reqwest rejects at
+/// send time. Validated in [`OpenAIModel::new`] so [`stream`](OpenAIModel::stream)
+/// can emit a clear terminal error instead of a cryptic transport failure.
+fn is_valid_api_key(api_key: &str) -> bool {
+    api_key.bytes().all(|byte| !(byte < 0x20 || byte == 0x7F))
+}
 
 /// Send one request and classify the result.
 async fn attempt_send(
@@ -389,6 +432,14 @@ async fn attempt_send(
     let response = match client
         .post(url)
         .header("Authorization", format!("Bearer {api_key}"))
+        // Per-request User-Agent: client construction can fall back to the
+        // default reqwest client (whose blocklisted default UA would
+        // otherwise leak onto the wire), so the UA is set on every request
+        // regardless of the builder outcome.
+        .header(
+            "user-agent",
+            concat!("harness-model/", env!("CARGO_PKG_VERSION")),
+        )
         .header("Content-Type", "application/json")
         .json(body)
         .send()
@@ -403,12 +454,13 @@ async fn attempt_send(
     let status = response.status();
     if status.is_success() {
         AttemptOutcome::Success(response)
-    } else if status.is_server_error() {
-        // 5xx — transient (retriable)
+    } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+        // 5xx, 408 (Request Timeout) and 429 (Too Many Requests) —
+        // transient: back off and retry instead of a terminal error.
         let error_body = response.text().await.unwrap_or_default();
         AttemptOutcome::Transient(format!("HTTP {status}: {error_body}"))
     } else {
-        // 4xx — fatal (auth, rate limit, bad request)
+        // 400/401/403/404 and other 4xx — fatal (auth, bad request).
         let error_body = response.text().await.unwrap_or_default();
         AttemptOutcome::Fatal(format!("HTTP {status}: {error_body}"))
     }
@@ -425,7 +477,7 @@ async fn parse_sse_stream(
     tx: &mpsc::UnboundedSender<ModelEvent>,
 ) {
     let mut byte_stream = response.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer: Vec<u8> = Vec::new();
     let mut tool_registry = ToolCallRegistry::new();
     // Tracks whether a terminal event (Stop or Error) has been emitted.
     // Once true, all subsequent SSE data is ignored — the stream-fn
@@ -444,8 +496,12 @@ async fn parse_sse_stream(
             }
         };
 
-        // Append bytes to the text buffer (lossy is safe — JSON is ASCII/UTF-8)
-        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        // Append raw bytes to the buffer; `\r\n` is normalized to `\n` so
+        // SSE `\n\n` event boundaries survive chunking under either line
+        // ending convention. An incomplete multi-byte UTF-8 tail is retained
+        // until the next chunk completes it — no character is ever split
+        // across the decode boundary.
+        buffer.extend(normalize_crlf(&bytes));
 
         // Extract and emit all complete SSE events from the buffer
         while let Some(sse_data) = extract_sse_data(&mut buffer) {
@@ -496,12 +552,22 @@ async fn parse_sse_stream(
 
 /// Extract the `data:` payload from the next complete SSE event in `buf`.
 ///
+/// Events are delimited by ASCII `\n\n` only, so a multi-byte UTF-8
+/// sequence can never be split across the decode boundary: an incomplete
+/// tail is retained in `buf` until the next chunk completes it. Each
+/// complete event is decoded lossily — lossiness applies to whole events
+/// only, never to partial chunks.
+///
 /// Removes the consumed bytes from `buf`. Returns `None` when no complete
 /// event is available (waiting for more data).
-fn extract_sse_data(buf: &mut String) -> Option<String> {
-    let delim_pos = buf.find("\n\n")?;
-    let event_block: String = buf[..delim_pos].to_string();
+fn extract_sse_data(buf: &mut Vec<u8>) -> Option<String> {
+    let delim_pos = buf.windows(2).position(|window| window == b"\n\n")?;
+    let event_block = buf[..delim_pos].to_vec();
     buf.drain(..delim_pos + 2);
+
+    // Decode only complete events: a partial multi-byte sequence stays in
+    // the tail until the rest of it arrives.
+    let event_block = String::from_utf8_lossy(&event_block);
 
     // Collect all `data:` lines, joining multi-line values with `\n`
     // (the SSE spec allows data to span several lines).
@@ -518,6 +584,23 @@ fn extract_sse_data(buf: &mut String) -> Option<String> {
     }
 
     if data.is_empty() { None } else { Some(data) }
+}
+
+/// Replace CRLF with LF throughout `chunk` so SSE `\n\n` event boundaries
+/// survive chunking regardless of the server's line-ending convention. A
+/// `\r` split across the chunk boundary is left in place: it is harmless
+/// because a lone `\r` never forms a `\n\n` delimiter, and `\r\n\n`
+/// reconstructed across chunks still contains a genuine `\n\n`.
+fn normalize_crlf(chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut rest = chunk;
+    while let Some(pos) = rest.windows(2).position(|window| window == b"\r\n") {
+        out.extend_from_slice(&rest[..pos]);
+        out.push(b'\n');
+        rest = &rest[pos + 2..];
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 // ---------------------------------------------------------------------------

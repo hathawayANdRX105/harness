@@ -13,17 +13,19 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::McpServerConfig;
 use crate::error::McpError;
 use crate::transport::{MCP_TIMEOUT, McpTransport, POLL_INTERVAL};
+use serde_json::Value;
 
 /// Stdio transport: one child process, one reader thread, one mutex.
 pub struct StdioTransport {
     io: Mutex<Io>,
     child: Mutex<Child>,
     next: AtomicU64,
+    timeout: Duration,
 }
 
 struct Io {
@@ -89,10 +91,17 @@ impl StdioTransport {
             }
         });
 
+        // Per-server call timeout, falling back to the transport-wide
+        // default when the config omits it.
+        let timeout = Duration::from_millis(
+            cfg.tool_call_timeout_ms
+                .unwrap_or_else(|| MCP_TIMEOUT.as_millis() as u64),
+        );
         Ok(Self {
             io: Mutex::new(Io { stdin, replies }),
             child: Mutex::new(child),
             next: AtomicU64::new(1),
+            timeout,
         })
     }
 }
@@ -107,11 +116,11 @@ impl McpTransport for StdioTransport {
         write_line(&mut io.stdin, line)
     }
 
-    fn roundtrip(&self, _id: u64, line: &str, signal: &AtomicBool) -> Result<String, McpError> {
+    fn roundtrip(&self, id: u64, line: &str, signal: &AtomicBool) -> Result<String, McpError> {
         let mut io = lock(&self.io);
         write_line(&mut io.stdin, line)?;
 
-        let deadline = Instant::now() + MCP_TIMEOUT;
+        let deadline = Instant::now() + self.timeout;
         loop {
             if signal.load(Ordering::Relaxed) {
                 return Err(McpError::Aborted);
@@ -121,9 +130,14 @@ impl McpTransport for StdioTransport {
             }
             match io.replies.recv_timeout(POLL_INTERVAL) {
                 Ok(reply) => {
-                    // Accept any JSON-RPC 2.0 response — parse_response validates
-                    // the `id` and any error object.
-                    return Ok(reply);
+                    // Return only the reply whose JSON-RPC `id` matches this
+                    // request: notifications (no `id`), stale replies from
+                    // earlier calls, and replies for other calls are
+                    // consumed silently — the transport contract never hands
+                    // them up.
+                    if reply_id(&reply) == Some(id) {
+                        return Ok(reply);
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Loop back to check signal and deadline.
@@ -136,16 +150,50 @@ impl McpTransport for StdioTransport {
     }
 }
 
+/// The JSON-RPC `id` of a reply line, or `None` for notifications and
+/// unparseable noise.
+fn reply_id(line: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("id").and_then(Value::as_u64))
+}
+
 impl Drop for StdioTransport {
     fn drop(&mut self) {
         let mut child = lock(&self.child);
         // The child gets its own process group at spawn, so signal the group
         // to take any helper processes it forked.
-        let rc = kill_process_group(child.id() as i32);
-        if rc != 0 {
-            // killpg failed; fall back to child.kill().
+        let pid = child.id();
+        if pid != 0 {
+            let rc = kill_process_group(pid as i32);
+            if rc != 0 {
+                // killpg failed; fall back to child.kill().
+                let _ = child.kill();
+            }
+        } else {
+            // No pid available; kill() is a no-op on an already-reaped
+            // child, tried anyway for safety.
             let _ = child.kill();
         }
+        // Bounded shutdown: give the child up to 5 s to exit after SIGTERM,
+        // then escalate to SIGKILL and wait for reaping. An unbounded
+        // `child.wait()` can hang the agent loop forever on a child that
+        // ignores termination signals.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return, // reaped cleanly
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+        // Escalate: SIGKILL the process group, then wait so the child is
+        // reaped instead of left as a zombie.
+        let pid = child.id();
+        if pid != 0 {
+            let _ = kill_process_group(pid as i32);
+        }
+        let _ = child.kill();
         let _ = child.wait();
     }
 }

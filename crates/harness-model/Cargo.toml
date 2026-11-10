@@ -8,9 +8,7 @@ publish = false
 
 [dependencies]
 harness-core = { path = "../harness-core" }
-bytes = "1"
 futures = "0.3"
-futures-core = "0.3"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",

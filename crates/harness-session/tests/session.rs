@@ -504,9 +504,11 @@ fn gaps_detected_for_missing_seqs() -> Result<(), SessionStoreError> {
     Ok(())
 }
 
-/// Purpose: gaps at the start (seq starting >1) are detected.
-/// Scenario: events seq 3, 4, 5 → gaps = [1, 2].
-/// Acceptance: gaps = [1, 2].
+/// Purpose: gaps between observed seqs are reported; a first seq above 1 is not
+/// itself a gap (only missing numbers between observed seqs count).
+/// Scenario: events seq 3, 4, 5 → check gaps → only the missing number between
+/// observed seqs is reported.
+/// Acceptance: gaps = [4].
 #[test]
 fn gaps_detected_for_non_starting_seq() -> Result<(), SessionStoreError> {
     let store = test_store();

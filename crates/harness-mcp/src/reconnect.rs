@@ -8,13 +8,13 @@
 //! `Transport("server closed stdout")` on every retry and the wrapper gives
 //! up after `max_attempts`, surfacing the last error.
 
+use crate::error::McpError;
+use crate::transport::McpTransport;
+use rand::Rng;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::sleep;
 use std::time::Duration;
-
-use crate::error::McpError;
-use crate::transport::McpTransport;
 
 /// Exponential-backoff parameters.
 #[derive(Debug, Clone)]
@@ -39,13 +39,14 @@ impl Default for ReconnectPolicy {
 
 /// Backoff delay for a given attempt number (0-based).
 ///
-/// The curve: `min(base * 2^attempt, max)`, so the first retry waits
-/// `base_delay_ms`, the second `2 * base_delay_ms`, etc, capped at
-/// `max_delay_ms`.
+/// Full jitter: uniform in `[0, min(max_delay_ms, base_delay_ms * 2^attempt)]`,
+/// matching `harness-model`'s `RetryPolicy::delay` — spreads reconnect
+/// traffic instead of hammering the server in a thundering herd.
 pub fn backoff_delay(attempt: u32, policy: &ReconnectPolicy) -> Duration {
-    let delay = policy.base_delay_ms.saturating_mul(1u64 << attempt);
-    let capped = delay.min(policy.max_delay_ms);
-    Duration::from_millis(capped)
+    let exponent = policy.base_delay_ms.saturating_mul(1u64 << attempt.min(63));
+    let cap = exponent.min(policy.max_delay_ms);
+    let jitter = rand::thread_rng().gen_range(0..=cap);
+    Duration::from_millis(jitter)
 }
 
 /// Retry wrapper around any [`McpTransport`].

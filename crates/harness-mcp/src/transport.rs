@@ -243,7 +243,7 @@ pub fn list_tools(
 
 /// Coerce a tool name into `[a-zA-Z0-9_-]`, capped at 64 characters (all ASCII
 /// after substitution, so also 64 bytes).
-fn sanitize_tool_name(name: &str) -> String {
+pub fn sanitize_tool_name(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -293,7 +293,7 @@ pub fn call_tool(
 /// Join the text parts of a `tools/call` result.
 ///
 /// Non-text parts are rendered as compact JSON so nothing is silently dropped.
-fn flatten_content(result: &Value) -> String {
+pub fn flatten_content(result: &Value) -> String {
     let Some(items) = result.get("content").and_then(Value::as_array) else {
         return String::new();
     };

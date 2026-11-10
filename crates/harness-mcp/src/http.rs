@@ -63,6 +63,7 @@ impl HttpTransport {
         let body = self
             .client()
             .post(&self.url)
+            .set("content-type", "application/json")
             .send_string(line)
             .map_err(|e| match e {
                 ureq::Error::Status(code, resp)

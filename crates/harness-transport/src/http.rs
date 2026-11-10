@@ -17,8 +17,9 @@
 //! - The POST handler is a pure request-response: no server-sent frames
 //!   arrive on this connection.
 //! - The SSE handler sends an initial `event: connected` frame with the
-//!   current event seq so the client can detect gaps, then pushes every
-//!   [`RunEvent`] as `event: run_event` with JSON data.  Errors from the
+//!   last replayed event's seq (or `after_seq` when nothing was replayed)
+//!   so the client can detect gaps, then pushes every [`RunEvent`] for
+//!   `run_id` as `event: run_event` with JSON data.  Errors from the
 //!   transport itself are sent as `event: error` frames (harness-rs design).
 //! - All errors are typed [`RpcError`](crate::RpcError) frames — never bare
 //!   strings.
@@ -88,18 +89,28 @@ async fn handle_events(
     // Subscribe to the live broadcast channel.
     let rx = state.event_tx.subscribe();
 
-    // Build a stream: first replay, then forward live events.
-    let stream = event_stream(replayed, rx);
+    // Build a stream: first replay, then forward live events for this run.
+    let stream = event_stream(replayed, after_seq, rx, run_id);
 
     Sse::new(stream)
 }
 
-/// Build an SSE event stream that replays historical events then forwards
-/// live events from the broadcast channel.
+// Build an SSE event stream that replays historical events then forwards
+// live events for one `run_id`.
+//
+// The stream emits replayed events first (already filtered to `run_id` by
+// [`EventLog::read_events_since`]), then emits an `event: connected`
+// frame carrying the last replayed seq (or `after_seq` when nothing was
+// replayed) so the client can detect gaps.  Live events are filtered to
+// `run_id` so a client never sees another run's events.
 fn event_stream(
     replayed: Vec<RunEvent>,
+    after_seq: u64,
     rx: tokio::sync::broadcast::Receiver<RunEvent>,
+    run_id: RunId,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
+    let last_seq = replayed.last().map_or(after_seq, |event| event.seq);
+
     // Emit replayed events first, then switch to live broadcast.
     let replay_stream = stream::iter(
         replayed
@@ -107,19 +118,35 @@ fn event_stream(
             .map(|event| Ok::<_, Infallible>(run_event_to_sse(&event))),
     );
 
-    let live_stream = stream::unfold(rx, |mut rx| async move {
+    // Signal the last replayed seq so clients can detect gaps after
+    // reconnecting.
+    let connected_stream = futures_util::stream::once(async move {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("connected")
+                .data(last_seq.to_string()),
+        )
+    });
+
+    // Forward only this run's live events.  `run_id` round-trips through
+    // unfold's state so each future owns it (no borrowed value escapes the
+    // `FnMut` closure across an await point).
+    let run_id_for_live = run_id.clone();
+    let live_stream = stream::unfold((rx, run_id_for_live), |(mut rx, run_id)| async move {
         loop {
             match rx.recv().await {
-                Ok(event) => {
+                Ok(event) if event.run_id == run_id => {
                     let sse = run_event_to_sse(&event);
-                    return Some((Ok(sse), rx));
+                    return Some((Ok(sse), (rx, run_id)));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                 // Lagged means we missed some messages — skip and continue.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // Other runs' events are dropped silently.
+                Ok(_) => continue,
             }
         }
     });
 
-    replay_stream.chain(live_stream)
+    replay_stream.chain(connected_stream).chain(live_stream)
 }

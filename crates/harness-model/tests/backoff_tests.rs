@@ -34,16 +34,29 @@ fn delay_attempt_zero() {
     );
 }
 
-/// The delay at attempt 5 is larger than at attempt 0 (exponential growth).
+/// The delay at each attempt stays within its full-jitter bound
+/// `[0, min(max_backoff_ms, initial_backoff_ms * 2^attempt)]`. Cross-attempt
+/// ordering is deliberately not asserted: full jitter can invert any two
+/// draws, so the old `d5 >= d0` comparison flaked ~1.6% of the time.
 #[test]
-fn delay_grows_with_attempt() {
+fn delay_within_per_attempt_bounds() {
     let p = RetryPolicy::default();
-    let d0 = p.delay(0).as_millis();
-    let d5 = p.delay(5).as_millis();
-    assert!(
-        d5 >= d0,
-        "delay at attempt 5 ({d5}) should be >= delay at 0 ({d0})"
-    );
+    let bounds: &[(u32, u128)] = &[
+        (0, 1_000),
+        (1, 2_000),
+        (2, 4_000),
+        (3, 8_000),
+        (4, 16_000),
+        (5, 30_000),
+        (6, 30_000),
+    ];
+    for &(attempt, cap_ms) in bounds {
+        let ms = p.delay(attempt).as_millis();
+        assert!(
+            ms <= cap_ms,
+            "delay {ms} at attempt {attempt} exceeds full-jitter bound {cap_ms}"
+        );
+    }
 }
 
 /// The delay never exceeds the configured maximum.

@@ -15,23 +15,35 @@
 //! effect. Env vars are restored after each test via `EnvGuard`.
 
 use std::io::Write;
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
+
+/// Serializes env mutation across the file's tests: plain `cargo test` runs
+/// tests as threads of one process sharing the process env (nextest runs them
+/// as separate processes), so a parallel sibling mid-`load_from_path` would
+/// observe another test's override. Every EnvGuard holds this lock for its
+/// whole lifetime.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Helper: set an env var for the duration of a test.
 struct EnvGuard {
     key: String,
     previous: Option<String>,
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn set(key: &str, value: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var(key).ok();
         // `set_var` is unsafe in edition 2024; this test owns every
-        // variable it touches and nextest gives each test its own process.
+        // variable it touches and holds ENV_LOCK so siblings cannot
+        // observe the mutation.
         unsafe { std::env::set_var(key, value) };
         Self {
             key: key.into(),
             previous,
+            _lock: lock,
         }
     }
 }
