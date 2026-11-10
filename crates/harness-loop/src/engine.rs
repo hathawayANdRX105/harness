@@ -150,6 +150,14 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
             }
         }
 
+        // -- 2b. Seed the transcript with the task on the first turn --
+        // The task description is the run's user message; without this the
+        // first upstream request carries an empty `messages` array, which
+        // every provider rejects.
+        if turn == 0 && transcript.is_empty() && !ctx.task.description.is_empty() {
+            transcript.push(Message::user_text(ctx.task.description.clone()));
+        }
+
         // -- 3. Max-turns check --
         if turn >= ctx.limits.max_turns {
             return finish(RunStopReason::MaxTurns, &ctx, &*deps.event_sink, &seq);
