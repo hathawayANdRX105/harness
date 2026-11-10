@@ -266,11 +266,11 @@ fn replay_single_system_message() -> Result<(), SessionStoreError> {
 /// accumulated prompt (pi's null semantics).
 /// Scenario:
 ///   1. System { "rules": Some("be concise") }
-///   2. System { "rules": None }
-///   3. User { "hello" }
-///      → replay: System { "rules": None } (key is present as None)
+///   2. User { "first turn" }
+///   3. System { "rules": None }
+///      → replay: one accumulated System { "rules": None } + the user turn
 ///      Acceptance: the "rules" section is present with None value — the consumer
-///      sees it as removed.
+///      sees it as removed — and the system messages fold into a single one.
 #[test]
 fn replay_section_removal() -> Result<(), SessionStoreError> {
     let store = test_store();
@@ -283,8 +283,13 @@ fn replay_section_removal() -> Result<(), SessionStoreError> {
     store.append_message(&sid, &system_msg("rules", None))?;
 
     let transcript = store.replay_ledger(&sid)?;
-    // Expected: System { rules: None } + User + User
-    assert_eq!(transcript.len(), 3, "all three messages survive replay");
+    // Expected: System { rules: None } + User — the two System messages fold
+    // into one accumulated ledger; the user turn is preserved verbatim.
+    assert_eq!(
+        transcript.len(),
+        2,
+        "System messages fold into one; the user turn survives"
+    );
 
     // The accumulated system has "rules" → None (removed).
     let sections = match &transcript[0] {
