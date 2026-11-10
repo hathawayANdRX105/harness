@@ -22,10 +22,14 @@
 //! | `ignores_events_after_terminal_stop` | Adapter emits a delta after `Stop` | Trailing delta is ignored |
 //! | `model_stream_error_is_terminal` | Model stream emits `Error` | Stop is `Error`; next turn never runs |
 //! | `event_sequence_is_monotonic` | A normal tool run | `seq` is a gap-free 0-based counter |
+//! | `parallel_dispatch_executes_both_tools` | Two tool calls in one turn, `Parallel` mode | Both tools run once; results backfill; gap-free `seq` |
+//! | `hook_seams_before_after_finish_and_prepare` | `prepare_request`/`before_tool_call`/`after_tool_call`/`finish_turn` wired | Each seam fires with the expected arguments; run completes |
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
+use harness_core::message::{Message, ToolResultMessage};
 
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream};
 use harness_core::policy::{
@@ -33,7 +37,7 @@ use harness_core::policy::{
     ToolPolicy,
 };
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
-use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
+use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
 use harness_core::{RunControl, StopReason};
 use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, run};
 
@@ -1129,4 +1133,452 @@ async fn cancel_mid_stream_ends_promptly() {
         .unwrap_or_else(|e| panic!("run did not end within 5s of cancel: {e}"))
         .unwrap_or_else(|e| panic!("run task panicked: {e}"));
     assert_eq!(reason, RunStopReason::Cancelled, "mid-stream cancel wins");
+}
+// ---------------------------------------------------------------------------
+// Counting tool and request-capturing model for the parallel dispatch and
+// hook-seam tests below.
+// ---------------------------------------------------------------------------
+
+/// A tool that counts how many times it was invoked.
+struct CountingTool {
+    name: String,
+    invocations: Arc<AtomicU64>,
+}
+
+impl CountingTool {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            invocations: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for CountingTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name.clone(),
+            description: "counts invocations".into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::ReadOnly
+    }
+
+    async fn invoke(
+        &self,
+        _args: serde_json::Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        self.invocations.fetch_add(1, Ordering::Relaxed);
+        Ok(ToolResult {
+            content: "ok".into(),
+            is_error: false,
+            trace: None,
+        })
+    }
+}
+
+/// Wraps a model and records the `messages` of every request it is asked to
+/// stream: the observable effect of the `prepare_request` hook.
+type CapturedRequests = Arc<Mutex<Vec<Vec<Message>>>>;
+
+struct CapturingModel {
+    inner: Arc<dyn Model>,
+    captured: CapturedRequests,
+}
+
+impl CapturingModel {
+    fn wrap(inner: Arc<dyn Model>) -> (Arc<Self>, CapturedRequests) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                inner,
+                captured: captured.clone(),
+            }),
+            captured,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl Model for CapturingModel {
+    fn info(&self) -> &ModelInfo {
+        self.inner.info()
+    }
+
+    async fn stream(&self, req: &ModelRequest) -> ModelStream<'_> {
+        self.captured
+            .lock()
+            .unwrap_or_else(|e| panic!("capturing model lock poisoned: {e}"))
+            .push(req.messages.clone());
+        self.inner.stream(req).await
+    }
+}
+
+/// Records one hook observation into the shared string log.
+fn record_hook_entry(log: &Arc<Mutex<Vec<String>>>, entry: String) {
+    log.lock()
+        .unwrap_or_else(|e| panic!("hook log lock poisoned: {e}"))
+        .push(entry);
+}
+
+/// Records the turn index `finish_turn` ran for.
+fn record_turn_index(log: &Arc<Mutex<Vec<u32>>>, turn: u32) {
+    log.lock()
+        .unwrap_or_else(|e| panic!("hook log lock poisoned: {e}"))
+        .push(turn);
+}
+
+// ---------------------------------------------------------------------------
+// Parallel dispatch and hook-seam tests
+// ---------------------------------------------------------------------------
+
+/// Parallel dispatch: two tool calls in one turn both execute, their results
+/// backfill into the transcript, and the run's `seq` stays gap-free.
+///
+/// Scenario:
+/// 1. Turn 0: the model requests `tool_a` and `tool_b` in one turn
+///    (ToolCallStart/Args/End x 2), then `Stop(ToolUse)`.
+/// 2. Dispatch runs with `ToolExecutionMode::Parallel` (the `join_all`
+///    branch of `dispatch_batch`).
+/// 3. Turn 1: the model answers with one `TextDelta` and `Stop(EndTurn)`.
+///
+/// Acceptance:
+/// - both tools are invoked exactly once (invocation counters == 1 each);
+/// - a `ToolFinished` event is emitted for both call ids (results backfilled);
+/// - the run terminates on the model's next turn with `Completed`;
+/// - every `RunEvent.seq` is gap-free 0-based, and per-call `seq`s are unique.
+#[tokio::test]
+async fn parallel_dispatch_executes_both_tools() {
+    let tool_a = Arc::new(CountingTool::new("tool_a"));
+    let tool_b = Arc::new(CountingTool::new("tool_b"));
+
+    let model = Arc::new(MockModel::new(
+        make_model_info(),
+        vec![
+            vec![
+                ModelEvent::ToolCallStart {
+                    id: "call_a".into(),
+                    name: "tool_a".into(),
+                },
+                ModelEvent::ToolCallArgs {
+                    id: "call_a".into(),
+                    partial_json: "{}".into(),
+                },
+                ModelEvent::ToolCallEnd {
+                    id: "call_a".into(),
+                },
+                ModelEvent::ToolCallStart {
+                    id: "call_b".into(),
+                    name: "tool_b".into(),
+                },
+                ModelEvent::ToolCallArgs {
+                    id: "call_b".into(),
+                    partial_json: "{}".into(),
+                },
+                ModelEvent::ToolCallEnd {
+                    id: "call_b".into(),
+                },
+                ModelEvent::Stop(StopReason::ToolUse),
+            ],
+            vec![
+                ModelEvent::TextDelta("both tools answered.".into()),
+                ModelEvent::Stop(StopReason::EndTurn),
+            ],
+        ],
+    ));
+
+    let sink = Arc::new(TestSink::default());
+
+    let deps = Arc::new(LoopDeps {
+        model,
+        tools: vec![tool_a.clone(), tool_b.clone()],
+        event_sink: sink.clone(),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        tool_mode: ToolExecutionMode::Parallel,
+    });
+
+    let control = RunControl::new();
+    let reason = run(make_ctx(10), deps, control).await;
+    assert_eq!(
+        reason,
+        RunStopReason::Completed,
+        "loop should complete after the model's EndTurn turn"
+    );
+
+    assert_eq!(
+        tool_a.invocations.load(Ordering::Relaxed),
+        1,
+        "tool_a should execute exactly once"
+    );
+    assert_eq!(
+        tool_b.invocations.load(Ordering::Relaxed),
+        1,
+        "tool_b should execute exactly once"
+    );
+
+    let events = sink.events();
+    let finished: Vec<(String, String)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            RunEventKind::ToolFinished {
+                call_id,
+                name,
+                is_error: _,
+            } => Some((call_id.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        finished
+            .iter()
+            .any(|(id, name)| id == "call_a" && name == "tool_a"),
+        "tool_a's result should be backfilled as a ToolFinished event"
+    );
+    assert!(
+        finished
+            .iter()
+            .any(|(id, name)| id == "call_b" && name == "tool_b"),
+        "tool_b's result should be backfilled as a ToolFinished event"
+    );
+
+    // seq is gap-free 0-based across the whole run; per-call seqs are unique.
+    assert!(!events.is_empty(), "should have emitted events");
+    let mut started: Vec<(String, u64)> = Vec::new();
+    for (idx, event) in events.iter().enumerate() {
+        assert_eq!(
+            event.seq, idx as u64,
+            "seq must be a gap-free monotonic counter"
+        );
+        if let RunEventKind::ToolStarted { call_id, name: _ } = &event.kind {
+            started.push((call_id.clone(), event.seq));
+        }
+    }
+    assert_eq!(started.len(), 2, "both tool calls should start");
+    let mut seqs: Vec<u64> = started.iter().map(|(_, seq)| *seq).collect();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(seqs.len(), 2, "per-call seq values must be unique");
+}
+
+/// Hook seams: `prepare_request` reshapes the transcript; `before_tool_call`
+/// and `after_tool_call` fire per call; `finish_turn` fires once per tool
+/// turn.
+///
+/// Scenario:
+/// 1. Turn 0: the model requests `tool_a` and `tool_b` in one turn, then
+///    `Stop(ToolUse)`.
+/// 2. Turn 1: the model answers with `Stop(EndTurn)`.
+/// Hooks: `prepare_request` appends a marker user message to the transcript;
+/// `before_tool_call` / `after_tool_call` record `"before:<name>"` /
+/// `"after:<name>"`; `finish_turn` records the turn index.
+///
+/// Acceptance:
+/// - the run completes after turn 1;
+/// - both tools are invoked exactly once;
+/// - every captured model request ends with the hook's marker message
+///   (`prepare_request` really reshaped what the model received);
+/// - before/after each contain both names exactly once, and per tool the
+///   `"before"` entry precedes the `"after"` entry;
+/// - `finish_turn` ran exactly once, for turn 0;
+/// - all `seq` values are gap-free 0-based.
+#[tokio::test]
+async fn hook_seams_before_after_finish_and_prepare() {
+    let tool_a = Arc::new(CountingTool::new("tool_a"));
+    let tool_b = Arc::new(CountingTool::new("tool_b"));
+
+    let model = Arc::new(MockModel::new(
+        make_model_info(),
+        vec![
+            vec![
+                ModelEvent::ToolCallStart {
+                    id: "call_1".into(),
+                    name: "tool_a".into(),
+                },
+                ModelEvent::ToolCallArgs {
+                    id: "call_1".into(),
+                    partial_json: "{}".into(),
+                },
+                ModelEvent::ToolCallEnd {
+                    id: "call_1".into(),
+                },
+                ModelEvent::ToolCallStart {
+                    id: "call_2".into(),
+                    name: "tool_b".into(),
+                },
+                ModelEvent::ToolCallArgs {
+                    id: "call_2".into(),
+                    partial_json: "{}".into(),
+                },
+                ModelEvent::ToolCallEnd {
+                    id: "call_2".into(),
+                },
+                ModelEvent::Stop(StopReason::ToolUse),
+            ],
+            vec![ModelEvent::Stop(StopReason::EndTurn)],
+        ],
+    ));
+
+    let sink = Arc::new(TestSink::default());
+    let before_after: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let finish_turns: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let (capturing, captured) = CapturingModel::wrap(model);
+
+    let hooks = LoopHooks {
+        prepare_request: Some(Arc::new(append_prepare_marker)),
+        before_tool_call: Some(Arc::new({
+            let log = before_after.clone();
+            move |req: &ToolRequest| {
+                record_hook_entry(&log, format!("before:{}", req.name));
+                Ok(())
+            }
+        })),
+        after_tool_call: Some(Arc::new({
+            let log = before_after.clone();
+            move |req: &ToolRequest, result: &ToolResultMessage| {
+                record_hook_entry(&log, format!("after:{}:{}", req.name, result.is_error));
+            }
+        })),
+        finish_turn: Some(Arc::new({
+            let log = finish_turns.clone();
+            move |turn: u32, _transcript: &[Message]| {
+                record_turn_index(&log, turn);
+            }
+        })),
+        ..LoopHooks::default()
+    };
+
+    let deps = Arc::new(LoopDeps {
+        model: capturing,
+        tools: vec![tool_a.clone(), tool_b.clone()],
+        event_sink: sink.clone(),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks,
+        tool_mode: ToolExecutionMode::Parallel,
+    });
+
+    let control = RunControl::new();
+    let reason = run(make_ctx(10), deps, control).await;
+    assert_eq!(reason, RunStopReason::Completed, "loop should complete");
+
+    assert_eq!(
+        tool_a.invocations.load(Ordering::Relaxed),
+        1,
+        "tool_a should execute exactly once"
+    );
+    assert_eq!(
+        tool_b.invocations.load(Ordering::Relaxed),
+        1,
+        "tool_b should execute exactly once"
+    );
+
+    // prepare_request ran once per turn and appended its marker each time.
+    let captured_messages = captured
+        .lock()
+        .unwrap_or_else(|e| panic!("capture lock poisoned: {e}"))
+        .clone();
+    assert_eq!(
+        captured_messages.len(),
+        2,
+        "prepare_request should run once per model turn"
+    );
+    for messages in &captured_messages {
+        let Some(last) = messages.last() else {
+            panic!("model request must carry at least one message");
+        };
+        assert_eq!(
+            last,
+            &Message::user_text("prepared by hook"),
+            "prepare_request's marker must be the last message the model receives",
+        );
+    }
+
+    // before_tool_call / after_tool_call: one entry per tool each, and per
+    // tool the "before" entry precedes the "after" entry (they run inside one
+    // dispatch_one future, even when the batch dispatches in parallel).
+    let log = before_after
+        .lock()
+        .unwrap_or_else(|e| panic!("hook log lock poisoned: {e}"))
+        .clone();
+    let before: Vec<&str> = log
+        .iter()
+        .filter(|s| s.starts_with("before:"))
+        .map(|s| s.as_str())
+        .collect();
+    let after: Vec<&str> = log
+        .iter()
+        .filter(|s| s.starts_with("after:"))
+        .map(|s| s.as_str())
+        .collect();
+    assert_eq!(
+        before.len(),
+        2,
+        "before_tool_call should fire once per call"
+    );
+    assert_eq!(after.len(), 2, "after_tool_call should fire once per call");
+    assert!(
+        before.contains(&"before:tool_a"),
+        "before hook should see tool_a"
+    );
+    assert!(
+        before.contains(&"before:tool_b"),
+        "before hook should see tool_b"
+    );
+    assert!(
+        after.contains(&"after:tool_a:false"),
+        "after hook should see tool_a's result"
+    );
+    assert!(
+        after.contains(&"after:tool_b:false"),
+        "after hook should see tool_b's result"
+    );
+    for name in ["tool_a", "tool_b"] {
+        let before_idx = log
+            .iter()
+            .position(|s| s == &format!("before:{name}"))
+            .unwrap_or_else(|| panic!("missing before:{name} in hook log"));
+        let after_idx = log
+            .iter()
+            .position(|s| s == &format!("after:{name}:false"))
+            .unwrap_or_else(|| panic!("missing after:{name}:false in hook log"));
+        assert!(
+            before_idx < after_idx,
+            "before:{name} must precede after:{name}"
+        );
+    }
+
+    // finish_turn runs once per tool-bearing turn: exactly once, turn 0.
+    assert_eq!(
+        *finish_turns
+            .lock()
+            .unwrap_or_else(|e| panic!("hook log lock poisoned: {e}")),
+        vec![0u32],
+        "finish_turn should run exactly once, for turn 0"
+    );
+
+    let events = sink.events();
+    assert!(!events.is_empty(), "should have emitted events");
+    for (idx, event) in events.iter().enumerate() {
+        assert_eq!(
+            event.seq, idx as u64,
+            "seq must be a gap-free monotonic counter"
+        );
+    }
+}
+
+/// `prepare_request` hook: appends a marker user message to the transcript.
+fn append_prepare_marker(mut transcript: Vec<Message>) -> Vec<Message> {
+    transcript.push(Message::user_text("prepared by hook"));
+    transcript
 }
