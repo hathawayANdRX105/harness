@@ -1075,3 +1075,58 @@ fn event_tag(kind: &RunEventKind) -> &str {
         _ => "unknown",
     }
 }
+
+/// Purpose: cancelling while the model stream is open ends the run promptly.
+/// Scenario: a model whose stream emits one delta then parks until cancelled;
+/// the test cancels mid-stream and waits for the run to finish.
+/// Acceptance: the stop reason is `Cancelled`, and no event arrives after the
+/// cancellation — the loop does not keep burning the stream into a void.
+#[tokio::test]
+async fn cancel_mid_stream_ends_promptly() {
+    use std::time::Duration;
+
+    struct ParkedStreamModel {
+        info: ModelInfo,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ParkedStreamModel {
+        fn info(&self) -> &ModelInfo {
+            &self.info
+        }
+
+        async fn stream(&self, _req: &ModelRequest) -> ModelStream<'_> {
+            Box::pin(futures::stream::unfold((), |()| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Some((ModelEvent::TextDelta("tick".into()), ()))
+            }))
+        }
+    }
+
+    let sink = Arc::new(TestSink::default());
+    let deps = Arc::new(LoopDeps {
+        model: Arc::new(ParkedStreamModel {
+            info: make_model_info(),
+        }),
+        tools: vec![],
+        event_sink: sink.clone(),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        tool_mode: ToolExecutionMode::Sequential,
+    });
+
+    let control = RunControl::new();
+    let cancel_token = control.cancel_token();
+    let handle = tokio::spawn(async move { run(make_ctx(10), deps, control).await });
+
+    // Let the stream open, then cancel mid-stream.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    cancel_token.cancel();
+
+    let reason = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap_or_else(|e| panic!("run did not end within 5s of cancel: {e}"))
+        .unwrap_or_else(|e| panic!("run task panicked: {e}"));
+    assert_eq!(reason, RunStopReason::Cancelled, "mid-stream cancel wins");
+}

@@ -187,10 +187,13 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
         );
 
         let stream = deps.model.stream(&request).await;
-        let model_turn = pump_stream(stream, &seq, &*deps.event_sink, &ctx).await;
+        let model_turn = pump_stream(stream, &seq, &*deps.event_sink, &ctx, &control).await;
 
         // Handle terminal cases from the stream first.
         let (tool_calls, assistant_content) = match model_turn {
+            StreamTurn::Cancelled => {
+                return finish(RunStopReason::Cancelled, &ctx, &*deps.event_sink, &seq);
+            }
             StreamTurn::Ok { content, calls } => {
                 emit_event(
                     &*deps.event_sink,
@@ -301,6 +304,8 @@ enum StreamTurn {
         content: Vec<Content>,
         calls: Vec<ToolCall>,
     },
+    /// The run was cancelled while the stream was open — no turn content.
+    Cancelled,
     /// Stream ended with `ModelEvent::Error`.
     Error {
         message: String,
@@ -321,6 +326,7 @@ async fn pump_stream(
     seq: &AtomicU64,
     sink: &dyn EventSink,
     ctx: &RunContext,
+    control: &RunControl,
 ) -> StreamTurn {
     pin_mut!(stream);
 
@@ -329,8 +335,19 @@ async fn pump_stream(
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     // Accumulator for in-progress tool call args: (id, name, args_json_fragments)
     let mut partial: Option<(String, String, String)> = None;
+    let cancel = control.cancel_token();
 
-    while let Some(event) = stream.next().await {
+    loop {
+        // The stream race is the drop protocol's teeth: cancelling mid-stream
+        // stops the model request immediately instead of burning tokens into
+        // a void until the stream happens to return.
+        let event = tokio::select! {
+            _ = cancel.cancelled() => return StreamTurn::Cancelled,
+            next = stream.next() => match next {
+                Some(event) => event,
+                None => break,
+            },
+        };
         match event {
             ModelEvent::TextDelta(t) => {
                 text.push_str(&t);
