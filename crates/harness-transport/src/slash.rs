@@ -63,6 +63,20 @@ impl std::fmt::Display for ParseSlashError {
 
 impl std::error::Error for ParseSlashError {}
 
+impl ParseSlashError {
+    /// The JSON-RPC error code this parse failure maps to.
+    ///
+    /// An unrecognised *method* is `METHOD_NOT_FOUND` (-32601), not a malformed
+    /// request: the client used a name the server does not implement. Missing
+    /// or ill-typed params are `INVALID_PARAMS` (-32602).
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::Unknown(_) => crate::frame::error_code::METHOD_NOT_FOUND,
+            Self::MissingArgs(_) | Self::NotSlash => crate::frame::error_code::INVALID_PARAMS,
+        }
+    }
+}
+
 /// Parse a `/cmd [args]` text line into a [`SlashCommand`].
 ///
 /// The input is trimmed before parsing.  The command name is everything

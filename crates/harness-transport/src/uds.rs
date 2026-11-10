@@ -149,11 +149,9 @@ async fn handle_connection(
         // Dispatch the command.
         let response = match command_from_jsonrpc(&request.method, request.params) {
             Ok(cmd) => dispatch_command(&*state.handler, cmd, request.id),
-            Err(parse_err) => JsonRpcResponse::error(
-                request.id,
-                error_code::INVALID_REQUEST,
-                parse_err.to_string(),
-            ),
+            Err(parse_err) => {
+                JsonRpcResponse::error(request.id, parse_err.code(), parse_err.to_string())
+            }
         };
 
         if write_response(&mut writer, &response).await.is_err() {

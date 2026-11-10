@@ -69,9 +69,7 @@ async fn handle_command(
 ) -> Json<JsonRpcResponse> {
     let response = match command_from_jsonrpc(&req.method, req.params) {
         Ok(cmd) => dispatch_command(&*state.handler, cmd, req.id),
-        Err(parse_err) => {
-            JsonRpcResponse::error(req.id, error_code::INVALID_REQUEST, parse_err.to_string())
-        }
+        Err(parse_err) => JsonRpcResponse::error(req.id, parse_err.code(), parse_err.to_string()),
     };
     Json(response)
 }

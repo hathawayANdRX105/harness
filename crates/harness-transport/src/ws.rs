@@ -100,11 +100,9 @@ async fn read_loop(
         let response = match serde_json::from_str::<JsonRpcRequest>(&msg) {
             Ok(req) => match command_from_jsonrpc(&req.method, req.params) {
                 Ok(cmd) => dispatch_command(&*state.handler, cmd, req.id),
-                Err(parse_err) => JsonRpcResponse::error(
-                    req.id,
-                    error_code::INVALID_REQUEST,
-                    parse_err.to_string(),
-                ),
+                Err(parse_err) => {
+                    JsonRpcResponse::error(req.id, parse_err.code(), parse_err.to_string())
+                }
             },
             Err(_) => {
                 // Could not parse as a request — send a parse error back.
