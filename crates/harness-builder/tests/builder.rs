@@ -20,6 +20,8 @@
 //! | `model_is_never_defaulted` | no model injected | build fails with `MissingModel` |
 //! | `default_model_must_match_injected_model` | handle mismatch | build fails with `ModelMismatch` |
 //! | `declared_skills_are_discovered` | a real `SKILL.md` under a temp root | the named skill is assembled |
+//! | `declared_skills_register_the_skill_tool` | spec declares a skill | `skill` tool registered, skills metadata unchanged |
+//! | `skill_tool_must_not_shadow_a_declared_tool` | external tool named `skill` plus a declared skill | build fails with `DuplicateTool` |
 //! | `hooks_compose_prompt_and_instruction` | prompt + instruction + deny hooks | one composed prepare hook and one deny hook |
 //! | `spec_validation_is_standalone` | invalid builtin / duplicate hook seam / bad threshold | `validate()` rejects each without config |
 
@@ -717,6 +719,88 @@ fn declared_skills_are_discovered() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         runtime.skills[0].description, "A greeting skill.",
         "the description comes from SKILL.md"
+    );
+    Ok(())
+}
+/// Purpose: a spec that declares skills also registers the `skill` tool.
+/// Scenario: a temp root holds demo/SKILL.md; the spec declares the demo
+/// skill and builds with a mock model, policy, and sink.
+/// Acceptance: `runtime.tools` contains exactly one tool named `skill`, and
+/// `runtime.skills` still carries exactly the declared skill metadata.
+#[test]
+fn declared_skills_register_the_skill_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+    let skill_dir = dir.path().join("demo");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(skill_dir.join("SKILL.md"), "# Demo\n\nA demo skill.\n")?;
+
+    let mut spec = HarnessSpec::new("skill-activation");
+    spec.skills.push(SkillSpec {
+        name: "demo".into(),
+        path: dir.path().to_string_lossy().into_owned(),
+        manifest: UnitManifest::default(),
+    });
+    spec.models.push(mock_model_spec());
+    spec.default_model = Some("mock".into());
+
+    let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new()))).build()?;
+
+    let skill_tools: Vec<_> = runtime
+        .tools
+        .iter()
+        .filter(|tool| tool.name() == "skill")
+        .collect();
+    assert_eq!(
+        skill_tools.len(),
+        1,
+        "exactly one `skill` tool is registered: {:?}",
+        runtime
+            .tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        runtime.skills.len(),
+        1,
+        "the skills metadata list is unchanged"
+    );
+    assert_eq!(runtime.skills[0].name, "demo", "the declared skill is kept");
+    Ok(())
+}
+
+/// Purpose: the auto-registered `skill` tool must not shadow a declared tool.
+/// Scenario: the spec declares an external tool named `skill` (host-injected)
+/// and declares a skill; the name is taken.
+/// Acceptance: `build` fails with `BuildError::DuplicateTool { name: "skill" }`.
+#[test]
+fn skill_tool_must_not_shadow_a_declared_tool() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+    let skill_dir = dir.path().join("demo");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(skill_dir.join("SKILL.md"), "# Demo\n\nA demo skill.\n")?;
+
+    let mut spec = HarnessSpec::new("skill-collision");
+    spec.tools.push(external_tool("skill", &[], &[], &[]));
+    spec.skills.push(SkillSpec {
+        name: "demo".into(),
+        path: dir.path().to_string_lossy().into_owned(),
+        manifest: UnitManifest::default(),
+    });
+    spec.models.push(mock_model_spec());
+    spec.default_model = Some("mock".into());
+
+    let error = HarnessBuilder::new(spec)
+        .with_model(Arc::new(MockModel::new(Vec::new())))
+        .with_policy(Arc::new(AllowAllPolicy))
+        .with_event_sink(Arc::new(TestSink::default()))
+        .with_tool(Arc::new(FixedTool::new("skill")))
+        .build()
+        .err()
+        .ok_or_else(|| "build must fail on the `skill` tool collision".to_string())?;
+    assert!(
+        matches!(error, BuildError::DuplicateTool { ref name } if name == "skill"),
+        "expected DuplicateTool for `skill`, got {error:?}"
     );
     Ok(())
 }
