@@ -1,0 +1,29 @@
+[package]
+name = "harness-builder"
+version = "0.1.0"
+edition = "2024"
+description = "Harness builder: a declarative HarnessSpec is validated, its provides/requires/conflicts are resolved into an install order, and an assembled runtime (model, tools, prompt ledger, hooks, MCP pool, budget) is produced by explicit injection — no coding defaults"
+license = "MIT"
+publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-config = { path = "../harness-config" }
+harness-model = { path = "../harness-model" }
+harness-mcp = { path = "../harness-mcp" }
+harness-tools = { path = "../harness-tools" }
+harness-loop = { path = "../harness-loop" }
+harness-context = { path = "../harness-context" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+async-trait = "0.1"
+futures = "0.3"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-util = { version = "0.7", default-features = false }
+
+[lints]
+workspace = true
