@@ -470,6 +470,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-loop"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "harness-core",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "harness-mcp"
 version = "0.1.0"
 dependencies = [
