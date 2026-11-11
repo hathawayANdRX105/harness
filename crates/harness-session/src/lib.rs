@@ -1,13 +1,15 @@
 //! Session persistence for the harness: the `SessionStore` port trait and its
-//! SQLite default implementation.
+//! Turso (libsql) default implementation.
 //!
 //! # Crate structure
 //!
 //! - [`store`] — the [`SessionStore`] trait, [`SessionStoreError`], and the
 //!   canonical [`replay_messages`] function that applies `None`-section
 //!   removal to reconstruct a full transcript.
-//! - [`sqlite`] — [`SqliteSessionStore`], the default SQLite-backed
-//!   implementation using `rusqlite` with `bundled`.
+//! - [`turso`] — [`TursoSessionStore`], the default Turso-backed
+//!   implementation (ferrite's proven connection model, idempotent ledger).
+//! - [`graph`] — [`GraphIndex`], the in-memory petgraph read model derived
+//!   from the `run_events` ledger (never persisted).
 //!
 //! # Two persistent objects
 //!
@@ -21,13 +23,13 @@
 //!
 //! ```text
 //! SessionStore::replay_ledger(id)
-//!   → load all messages ordered by seq
-//!   → replay_messages() applies system-section accumulation
-//!   → returns full transcript ready for the model
+//!   -> load all messages ordered by seq
+//!   -> replay_messages() applies system-section accumulation
+//!   -> returns full transcript ready for the model
 //!
 //! SessionStore::events_for_run(id) + check_event_gaps(id)
-//!   → load events ordered by seq
-//!   → find missing seqs → consumer re-emits them
+//!   -> load events ordered by seq
+//!   -> find missing seqs -> consumer re-emits them
 //! ```
 //!
 //! # Design provenance
@@ -38,8 +40,10 @@
 //! is immutable and carried by core types; the store holds only the data that
 //! a crashed daemon re-reads.
 
-pub mod sqlite;
+pub mod graph;
 pub mod store;
+pub mod turso;
 
-pub use sqlite::SqliteSessionStore;
+pub use graph::{GraphIndex, GraphUnit};
 pub use store::{MessageEntry, SessionStore, SessionStoreError, replay_messages};
+pub use turso::TursoSessionStore;

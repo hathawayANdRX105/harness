@@ -33,18 +33,26 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
 use harness_core::{RunEvent, RunId};
+use serde::Deserialize;
+use tokio_stream::wrappers::BroadcastStream;
 
-use crate::frame::{JsonRpcRequest, JsonRpcResponse, run_event_to_sse};
+use crate::frame::{JsonRpcRequest, JsonRpcResponse};
 use crate::slash::command_from_jsonrpc;
 use crate::{TransportState, dispatch_command};
 
+// ── Query parameters ──────────────────────────────────────────────────────
+
 /// Query parameters for the SSE events endpoint.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 pub struct EventQuery {
+    /// Run whose events to stream.
     pub run_id: String,
+    /// Replay events with seq strictly greater than this (default 0).
     #[serde(default)]
     pub after_seq: u64,
 }
+
+// ── Routes ────────────────────────────────────────────────────────────────
 
 /// Build an [`axum::Router`] with the HTTP+SSE transport routes.
 ///
@@ -63,16 +71,24 @@ pub fn http_routes(state: Arc<TransportState>) -> Router {
         .with_state(state)
 }
 
+// ── Handlers ──────────────────────────────────────────────────────────────
+
 /// POST /command — dispatch a JSON-RPC request.
 async fn handle_command(
     State(state): State<Arc<TransportState>>,
     Json(req): Json<JsonRpcRequest>,
 ) -> Json<JsonRpcResponse> {
-    let response = match command_from_jsonrpc(&req.method, req.params) {
-        Ok(cmd) => dispatch_command(&*state.handler, cmd, req.id),
-        Err(parse_err) => JsonRpcResponse::error(req.id, parse_err.code(), parse_err.to_string()),
+    let cmd = match command_from_jsonrpc(&req.method, req.params.clone()) {
+        Ok(cmd) => cmd,
+        Err(parse_err) => {
+            return Json(JsonRpcResponse::error(
+                req.id,
+                parse_err.code(),
+                parse_err.to_string(),
+            ));
+        }
     };
-    Json(response)
+    Json(dispatch_command(&*state.handler, cmd, req.id))
 }
 
 /// GET /events — SSE stream of [`RunEvent`]s.
@@ -83,8 +99,8 @@ async fn handle_events(
     let run_id = RunId(query.run_id.clone());
     let after_seq = query.after_seq;
 
-    // Replay persisted events since after_seq.
-    let replayed: Vec<RunEvent> = state.event_log.read_events_since(&run_id, after_seq);
+    // Replay persisted events since after_seq (async through the EventLog seam).
+    let replayed = state.event_log.read_events_since(&run_id, after_seq).await;
 
     // Subscribe to the live broadcast channel.
     let rx = state.event_tx.subscribe();
@@ -95,58 +111,43 @@ async fn handle_events(
     Sse::new(stream)
 }
 
-// Build an SSE event stream that replays historical events then forwards
-// live events for one `run_id`.
-//
-// The stream emits replayed events first (already filtered to `run_id` by
-// [`EventLog::read_events_since`]), then emits an `event: connected`
-// frame carrying the last replayed seq (or `after_seq` when nothing was
-// replayed) so the client can detect gaps.  Live events are filtered to
-// `run_id` so a client never sees another run's events.
+// ── Stream construction ───────────────────────────────────────────────────
+
+/// Build an SSE event stream that replays historical events then forwards
+/// live events for one `run_id`.
+///
+/// The stream emits replayed events first (already filtered to `run_id` by
+/// [`EventLog::read_events_since`]), then emits an `event: connected`
+/// frame carrying the last replayed seq (or `after_seq` when nothing was
+/// replayed) so the client can detect gaps.  Live events are filtered to
+/// `run_id` so a client never sees another run's events.
 fn event_stream(
     replayed: Vec<RunEvent>,
     after_seq: u64,
     rx: tokio::sync::broadcast::Receiver<RunEvent>,
     run_id: RunId,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    let last_seq = replayed.last().map_or(after_seq, |event| event.seq);
-
-    // Emit replayed events first, then switch to live broadcast.
-    let replay_stream = stream::iter(
-        replayed
-            .into_iter()
-            .map(|event| Ok::<_, Infallible>(run_event_to_sse(&event))),
-    );
-
-    // Signal the last replayed seq so clients can detect gaps after
-    // reconnecting.
-    let connected_stream = futures_util::stream::once(async move {
-        Ok::<_, Infallible>(
-            Event::default()
-                .event("connected")
-                .data(last_seq.to_string()),
-        )
-    });
-
-    // Forward only this run's live events.  `run_id` round-trips through
-    // unfold's state so each future owns it (no borrowed value escapes the
-    // `FnMut` closure across an await point).
-    let run_id_for_live = run_id.clone();
-    let live_stream = stream::unfold((rx, run_id_for_live), |(mut rx, run_id)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) if event.run_id == run_id => {
-                    let sse = run_event_to_sse(&event);
-                    return Some((Ok(sse), (rx, run_id)));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                // Lagged means we missed some messages — skip and continue.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                // Other runs' events are dropped silently.
-                Ok(_) => continue,
+    let replay_seq = replayed.last().map(|e| e.seq).unwrap_or(after_seq);
+    let live_run_id = run_id.clone();
+    let replay = stream::iter(replayed.into_iter().map(move |event| {
+        Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".into())))
+    }));
+    let connected = stream::iter([Ok(Event::default()
+        .event("connected")
+        .data(replay_seq.to_string()))]);
+    let live = BroadcastStream::new(rx).filter_map(move |event| {
+        let value = live_run_id.clone();
+        async move {
+            let event = event.ok()?;
+            if event.run_id == value {
+                Some(Ok(Event::default().data(
+                    serde_json::to_string(&event).unwrap_or_else(|_| "{}".into()),
+                )))
+            } else {
+                None
             }
         }
     });
 
-    replay_stream.chain(connected_stream).chain(live_stream)
+    replay.chain(connected).chain(live)
 }

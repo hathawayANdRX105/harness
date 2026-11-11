@@ -12,6 +12,8 @@
 //!   missing-field error.
 //! - A config with version > CURRENT_CONFIG_VERSION fails with a migration
 //!   error.
+//! - `session.auth_token_var` carries its code-level default (`None`) and
+//!   round-trips through the loader.
 //!
 //! Acceptance: every test writes a real TOML file to a temp directory and
 //! calls [`harness_config::load_from_path`] against it.
@@ -58,6 +60,10 @@ fn minimal_config_loads() -> Result<(), Box<dyn std::error::Error>> {
         config.session.directory, "~/.local/share/harness/sessions",
         "session directory code default"
     );
+    assert!(
+        config.session.auth_token_var.is_none(),
+        "auth_token_var defaults to None"
+    );
     assert_eq!(config.budget.max_turns, 50, "budget.max_turns code default");
     assert!(config.mcp.servers.is_empty(), "no MCP servers by default");
     assert!(config.registry.hooks.is_empty(), "no hooks by default");
@@ -88,6 +94,7 @@ fn full_config_loads_correctly() -> Result<(), Box<dyn std::error::Error>> {
             "\n",
             "[session]\n",
             "directory = \"/var/harness/sessions\"\n",
+            "auth_token_var = \"HARNESS_DAEMON_TOKEN\"\n",
             "\n",
             "[budget]\n",
             "max_input_tokens = 100000\n",
@@ -122,6 +129,11 @@ fn full_config_loads_correctly() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     assert_eq!(config.session.directory, "/var/harness/sessions");
+    assert_eq!(
+        config.session.auth_token_var.as_deref(),
+        Some("HARNESS_DAEMON_TOKEN"),
+        "auth_token_var round-trips from TOML"
+    );
     assert_eq!(config.budget.max_input_tokens, 100_000);
     assert_eq!(config.budget.max_output_tokens, 4_000);
     assert_eq!(config.budget.max_turns, 25);
@@ -137,6 +149,52 @@ fn full_config_loads_correctly() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(config.registry.hooks.len(), 2);
     assert_eq!(config.registry.skills.len(), 1);
+    Ok(())
+}
+
+/// Purpose: `session.auth_token_var` carries its code-level default when the
+/// file omits the `[session]` section.
+/// Scenario: minimal config file with no `[session]` section.
+/// Acceptance: `config.session.auth_token_var` is `None`.
+#[test]
+fn session_auth_token_var_defaults_to_none() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let path = write_toml(
+        &dir,
+        "version = 1\n\n[upstream]\nbase_url = \"http://localhost:1/v1\"\n",
+    )?;
+    let config = harness_config::load_from_path(&path)?;
+    assert!(
+        config.session.auth_token_var.is_none(),
+        "auth_token_var defaults to None"
+    );
+    Ok(())
+}
+
+/// Purpose: `session.auth_token_var` round-trips through the loader.
+/// Scenario: TOML file sets `[session] auth_token_var`.
+/// Acceptance: the loaded config carries the configured variable name.
+#[test]
+fn session_auth_token_var_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let path = write_toml(
+        &dir,
+        concat!(
+            "version = 1\n",
+            "\n",
+            "[upstream]\n",
+            "base_url = \"http://localhost:1/v1\"\n",
+            "\n",
+            "[session]\n",
+            "auth_token_var = \"HARNESS_DAEMON_TOKEN\"\n",
+        ),
+    )?;
+    let config = harness_config::load_from_path(&path)?;
+    assert_eq!(
+        config.session.auth_token_var.as_deref(),
+        Some("HARNESS_DAEMON_TOKEN"),
+        "auth_token_var round-trips from TOML"
+    );
     Ok(())
 }
 

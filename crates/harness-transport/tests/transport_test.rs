@@ -29,11 +29,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use harness_core::{RunEvent, RunId};
+use harness_core::{RunEvent, RunEventKind, RunId, SessionId};
 use harness_transport::{
     CommandHandler, EventLog, TransportError, TransportState, slash::SlashCommand,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::Message;
 
 /// Every test's error type: any boxed error the transport stack can produce.
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -56,12 +59,40 @@ impl CommandHandler for MockHandler {
     }
 }
 
+/// A recording event log: remembers every `(run_id, after_seq)` replay query
+/// and returns its canned events filtered by `after_seq`.
+struct ReplayEventLog {
+    calls: std::sync::Mutex<Vec<(RunId, u64)>>,
+    events: Vec<RunEvent>,
+}
+
+#[async_trait]
+impl EventLog for ReplayEventLog {
+    async fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent> {
+        held(&self.calls).push((run_id.clone(), after_seq));
+        self.events
+            .iter()
+            .filter(|event| event.seq > after_seq)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Recover a poisoned mutex instead of failing the test: the guarded data is
+/// plain state collected for assertions.
+fn held<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A mock event log that returns empty — reconnection replay is tested by
 /// the scheduler/session crate (#11).
 struct MockEventLog;
 
+#[async_trait]
 impl EventLog for MockEventLog {
-    fn read_events_since(&self, _run_id: &RunId, _after_seq: u64) -> Vec<RunEvent> {
+    async fn read_events_since(&self, _run_id: &RunId, _after_seq: u64) -> Vec<RunEvent> {
         Vec::new()
     }
 }
@@ -73,6 +104,7 @@ fn test_state() -> Arc<TransportState> {
         Arc::new(MockEventLog),
     ))
 }
+
 /// Poll `check` every 50 ms until it returns `Ok` or `deadline` passes,
 /// returning the last error string on timeout.  Replaces fixed sleeps
 /// that race against server startup.
@@ -215,7 +247,7 @@ async fn http_unknown_command_returns_error() -> TestResult {
 /// through the handler and returns the expected response.
 ///
 /// Scenario: start a WebSocket transport on port 0, connect via
-/// tokio-tungstenite, send a text JSON-RPC request, read the response.
+// tokio-tungstenite, send a text JSON-RPC request, read the response.
 ///
 /// Acceptance: the response is a JSON-RPC success with `{"status": "running"}`
 /// and the correct request id.
@@ -255,7 +287,7 @@ async fn ws_command_roundtrip() -> TestResult {
         "params": {"run_id": "test-run"},
         "id": 1,
     });
-    let msg = tokio_tungstenite::tungstenite::Message::Text(req.to_string().into());
+    let msg = Message::Text(req.to_string().into());
     write.send(msg).await?;
 
     // Read the response.
@@ -266,7 +298,7 @@ async fn ws_command_roundtrip() -> TestResult {
         .map_err(|e| format!("WS response should be ok: {e}"))?;
 
     let text = match resp_msg {
-        tokio_tungstenite::tungstenite::Message::Text(t) => t,
+        Message::Text(t) => t,
         other => panic!("expected Text frame, got {other:?}"),
     };
 
@@ -275,6 +307,127 @@ async fn ws_command_roundtrip() -> TestResult {
     assert_eq!(body["id"], 1);
     assert_eq!(body["result"]["status"], "running");
     Ok(())
+}
+
+// ── WebSocket session binding ─────────────────────────────────────────────
+
+/// Purpose: `subscribe` accepts an optional `session_id` and replays the
+/// run's persisted events from `after_seq` through the EventLog seam.
+/// Scenario: a server whose log holds two past events (seq 4 and 5); a
+/// client subscribes with `{run_id, session_id, after_seq: 3}`; a probe
+/// event is pushed on the broadcast channel to trigger the historical
+/// replay before live forwarding.
+/// Acceptance: the subscribe reply echoes `session_id`; the client receives
+/// the two replayed events and then the live probe; the seam recorded the
+/// requested `(run_id, after_seq)`.
+#[tokio::test]
+async fn ws_subscribe_with_session_id_replays_events() -> TestResult {
+    let run_id = RunId("test-run".into());
+    let session_id = SessionId("session-1".into());
+    let log = Arc::new(ReplayEventLog {
+        calls: std::sync::Mutex::new(Vec::new()),
+        events: vec![run_event(4, "replayed-one"), run_event(5, "replayed-two")],
+    });
+    let state = Arc::new(TransportState::new(Arc::new(MockHandler), log.clone()));
+    let app = harness_transport::ws::ws_routes(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let url = format!("ws://{addr}/ws");
+    let (ws_stream, _) = poll_until(
+        || {
+            let url = url.clone();
+            async move {
+                tokio_tungstenite::connect_async(&url)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .map_err(|e| format!("WebSocket server did not accept connections: {e}"))?;
+    let (mut write, mut read) = ws_stream.split();
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "subscribe",
+        "params": {
+            "run_id": run_id.0,
+            "session_id": session_id.0,
+            "after_seq": 3,
+        },
+        "id": 7,
+    });
+    write.send(Message::Text(req.to_string().into())).await?;
+    let resp_msg = read
+        .next()
+        .await
+        .ok_or("subscribe response should arrive")?
+        .map_err(|e| format!("subscribe response: {e}"))?;
+    let text = match resp_msg {
+        Message::Text(t) => t,
+        other => return Err(format!("expected Text frame, got {other:?}").into()),
+    };
+    let body: serde_json::Value = serde_json::from_str(text.as_str())?;
+    assert_eq!(body["id"], 7, "response id echoes the request");
+    assert_eq!(
+        body["result"]["subscribed"], run_id.0,
+        "subscribe reply names the run"
+    );
+    assert_eq!(
+        body["result"]["session_id"], session_id.0,
+        "subscribe reply echoes the session"
+    );
+
+    // Nudge the broadcast channel: the push loop replays history on the
+    // first live event it receives, before forwarding that event.
+    state.event_tx.send(run_event(9, "live"))?;
+
+    let mut texts = Vec::new();
+    for _ in 0..3 {
+        let frame = read
+            .next()
+            .await
+            .ok_or("expected replay or live frame")?
+            .map_err(|e| format!("frame read: {e}"))?;
+        let Message::Text(t) = frame else {
+            return Err(format!("expected Text frame, got {frame:?}").into());
+        };
+        let ev: serde_json::Value = serde_json::from_str(t.as_str())?;
+        texts.push(
+            ev["text"]
+                .as_str()
+                .ok_or("event frame carries no text")?
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        texts,
+        vec!["replayed-one", "replayed-two", "live"],
+        "replayed events precede the live event"
+    );
+
+    let calls = held(&log.calls);
+    assert_eq!(calls.len(), 1, "exactly one replay query");
+    assert_eq!(calls[0].0, run_id, "replay query names the run");
+    assert_eq!(calls[0].1, 3, "replay starts after the requested seq");
+    Ok(())
+}
+
+fn run_event(seq: u64, text: &str) -> RunEvent {
+    RunEvent {
+        run_id: RunId("test-run".into()),
+        session_id: SessionId("session-1".into()),
+        seq,
+        timestamp_ms: 1_700_000_000_000 + seq as i64,
+        kind: RunEventKind::TextDelta {
+            text: text.to_string(),
+        },
+    }
 }
 
 // ── UDS round-trip ─────────────────────────────────────────────────────────
@@ -326,10 +479,7 @@ async fn uds_command_roundtrip() -> TestResult {
     .map_err(|e| format!("UDS server did not accept connections: {e}"))?;
 
     let (reader, mut writer) = tokio::io::split(stream);
-    use tokio::io::AsyncWriteExt;
-
     let mut reader = tokio::io::BufReader::new(reader);
-    use tokio::io::AsyncBufReadExt;
 
     let req = serde_json::json!({
         "jsonrpc": "2.0",

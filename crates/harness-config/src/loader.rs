@@ -117,6 +117,7 @@ fn defaults_only() -> Config {
         models: ModelsConfig { aliases: vec![] },
         session: SessionConfig {
             directory: default_session_dir(),
+            auth_token_var: None,
         },
         budget: BudgetConfig {
             max_input_tokens: default_max_input_tokens(),
@@ -190,23 +191,14 @@ type ListOverride = (&'static str, fn(&mut Config, Vec<String>));
 
 /// Only present env vars are applied; unset or empty vars are ignored.
 fn apply_env_overrides(mut config: Config) -> Result<Config, ConfigError> {
-    // Plain string overrides: applied verbatim when set and non-empty.
-    const STRING_OVERRIDES: &[StringOverride] = &[
+    let overrides: &[StringOverride] = &[
         ("HARNESS_UPSTREAM_BASE_URL", |c, v| c.upstream.base_url = v),
         ("HARNESS_UPSTREAM_API_KEY_VAR", |c, v| {
             c.upstream.api_key_var = v
         }),
         ("HARNESS_SESSION_DIRECTORY", |c, v| c.session.directory = v),
     ];
-    for (name, apply) in STRING_OVERRIDES {
-        if let Some(val) = non_empty_env(name) {
-            apply(&mut config, val);
-        }
-    }
-
-    // Integer overrides: a non-numeric value is a TypeError naming the field
-    // and the env var (issue #3's typed-error contract).
-    const U32_OVERRIDES: &[U32Override] = &[
+    let int_overrides: &[U32Override] = &[
         (
             "HARNESS_BUDGET_MAX_INPUT_TOKENS",
             "budget.max_input_tokens",
@@ -221,39 +213,39 @@ fn apply_env_overrides(mut config: Config) -> Result<Config, ConfigError> {
             c.budget.max_turns = v
         }),
     ];
-    for (name, field, apply) in U32_OVERRIDES {
-        if let Some(val) = non_empty_env(name) {
-            let parsed = val.parse().map_err(|e| ConfigError::TypeError {
-                field: (*field).into(),
-                detail: format!("{name}: {e}"),
-                file: "<env>".into(),
-                line: 0,
-            })?;
-            apply(&mut config, parsed);
-        }
-    }
-
-    // Comma-separated list overrides.
-    const LIST_OVERRIDES: &[ListOverride] = &[
+    let list_overrides: &[ListOverride] = &[
         ("HARNESS_REGISTRY_HOOKS", |c, v| c.registry.hooks = v),
         ("HARNESS_REGISTRY_SKILLS", |c, v| c.registry.skills = v),
     ];
-    for (name, apply) in LIST_OVERRIDES {
-        if let Some(val) = non_empty_env(name) {
-            apply(&mut config, split_list(&val));
+
+    for (name, setter) in overrides {
+        if let Some(value) = non_empty_env(name) {
+            setter(&mut config, value);
         }
     }
-
+    for (name, field, setter) in int_overrides {
+        if let Some(value) = non_empty_env(name) {
+            let parsed: u32 = value.parse().map_err(|e| ConfigError::TypeError {
+                field: field.to_string(),
+                detail: format!("env var {name} cannot parse '{value}' as u32: {e}"),
+                file: String::new(),
+                line: 0,
+            })?;
+            setter(&mut config, parsed);
+        }
+    }
+    for (name, setter) in list_overrides {
+        if let Some(value) = non_empty_env(name) {
+            setter(&mut config, split_list(&value));
+        }
+    }
     Ok(config)
 }
 
 /// The env var's value when set to something non-empty. Empty counts as
 /// unset: a shell export with no value must never clobber the file layer.
 fn non_empty_env(name: &str) -> Option<String> {
-    match std::env::var(name) {
-        Ok(val) if !val.is_empty() => Some(val),
-        _ => None,
-    }
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 fn split_list(val: &str) -> Vec<String> {

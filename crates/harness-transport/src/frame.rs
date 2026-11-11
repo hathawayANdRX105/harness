@@ -101,6 +101,8 @@ pub mod error_code {
 
     /// Transport-specific: the referenced run does not exist or has ended.
     pub const NO_ACTIVE_RUN: i32 = -32000;
+    /// Transport-specific: the slash command is unknown / unsupported.
+    pub const UNKNOWN_COMMAND: i32 = -32001;
 }
 
 // ── SSE helpers ───────────────────────────────────────────────────────────
@@ -110,8 +112,7 @@ pub mod error_code {
 /// The SSE event type is `run_event`; the data field carries the event's
 /// JSON representation as a single line.
 pub fn run_event_to_sse(event: &RunEvent) -> axum::response::sse::Event {
-    let json = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
     axum::response::sse::Event::default()
         .event("run_event")
-        .data(json)
+        .data(serde_json::to_string(event).unwrap_or_else(|_| "{}".into()))
 }

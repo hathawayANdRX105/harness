@@ -10,12 +10,13 @@
 //!
 //! # Reconnection
 //!
-//! On reconnect the client sends a `subscribe` method with `run_id` and
-//! `after_seq`; the server replies with a `{"subscribed": run_id}` success
-//! frame, replays missed events from the [`EventLog`](crate::EventLog)
-//! seam before forwarding live events, and then forwards only events for
-//! that run.  This keeps the client's event log contiguous across
-//! reconnections without the transport needing session state.
+//! On reconnect the client sends a `subscribe` method with `run_id`,
+//! optional `session_id`, and `after_seq`; the server replies with a
+//! `{"subscribed": run_id, "session_id"}` success frame, replays missed
+//! events from the [`EventLog`](crate::EventLog) seam before forwarding live
+//! events, and then forwards only events for that run.  This keeps the
+//! client's event log contiguous across reconnections without the transport
+//! needing session state.
 //!
 //! # Design
 //!
@@ -43,6 +44,8 @@ use crate::frame::{JsonRpcRequest, JsonRpcResponse, error_code};
 use crate::slash::command_from_jsonrpc;
 use crate::{TransportState, dispatch_command};
 
+// ── Router ────────────────────────────────────────────────────────────────
+
 /// Build an [`axum::Router`] with the WebSocket transport route at `/ws`.
 pub fn ws_routes(state: Arc<TransportState>) -> Router {
     Router::new()
@@ -60,6 +63,8 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
+// ── Connection loop ───────────────────────────────────────────────────────
+
 /// Run the bidirectional WebSocket message loop for one connection.
 ///
 /// Splits the socket into a sender and receiver.  The receiver task reads
@@ -67,34 +72,22 @@ pub async fn ws_handler(
 /// the sender.  The sender task subscribes to the broadcast channel and
 /// pushes `RunEvent`s to the client.
 async fn handle_ws(socket: WebSocket, state: Arc<TransportState>) {
-    let (ws_sender, ws_receiver) = socket.split();
-    let sender = Arc::new(tokio::sync::Mutex::new(ws_sender));
-    let subscription = Arc::new(tokio::sync::Mutex::new(None::<SubscribeState>));
+    let (sender, receiver) = socket.split();
+    let sender = Arc::new(tokio::sync::Mutex::new(sender));
+    let subscription: Arc<tokio::sync::Mutex<Option<SubscribeState>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
-    // ── Receiver task: read commands ─────────────────────────────────
-    let rx_sender = sender.clone();
-    let rx_state = state.clone();
-    let rx_subscription = subscription.clone();
-    let rx_handle = tokio::spawn(async move {
-        read_loop(ws_receiver, rx_sender, rx_state, rx_subscription).await;
-    });
+    let read_task = read_loop(
+        receiver,
+        sender.clone(),
+        state.clone(),
+        subscription.clone(),
+    );
+    let write_task = event_push_loop(sender, state, subscription);
 
-    // ── Sender task: push events ─────────────────────────────────────
-    let tx_state = state.clone();
-    let tx_subscription = subscription.clone();
-    let tx_handle = tokio::spawn(async move {
-        event_push_loop(sender, tx_state, tx_subscription).await;
-    });
-
-    // When either task ends (connection closed, broadcast closed) cancel
-    // the other so no task outlives its connection.
-    // AbortHandles survive moving the JoinHandles into select!, so we can
-    // cancel the survivor whichever arm wins.
-    let rx_abort = rx_handle.abort_handle();
-    let tx_abort = tx_handle.abort_handle();
     tokio::select! {
-        _ = rx_handle => tx_abort.abort(),
-        _ = tx_handle => rx_abort.abort(),
+        _ = read_task => {},
+        _ = write_task => {},
     }
 }
 
@@ -107,6 +100,12 @@ async fn handle_ws(socket: WebSocket, state: Arc<TransportState>) {
 struct SubscribeState {
     run_id: RunId,
     after_seq: u64,
+    /// Optional session the client is re-attaching to (#9).  v1 semantics:
+    /// the server echoes it in the subscribe reply; replay stays run-scoped
+    /// via the `EventLog` seam (`run_id` + `after_seq`), so the client names
+    /// the run it re-attaches to.  Resolving the session's latest run
+    /// server-side is intentionally out of scope for v1.
+    session_id: Option<String>,
     replayed: bool,
 }
 
@@ -145,7 +144,7 @@ async fn read_loop(
 }
 
 /// Handle the documented `subscribe` method: record this connection's run
-/// subscription and acknowledge with `{"subscribed": run_id}`.
+/// subscription and acknowledge with `{"subscribed": run_id, "session_id"}`.
 async fn handle_subscribe(
     req: &JsonRpcRequest,
     subscription: &tokio::sync::Mutex<Option<SubscribeState>>,
@@ -169,13 +168,23 @@ async fn handle_subscribe(
         .get("after_seq")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
+    let session_id = params
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
 
-    *subscription.lock().await = Some(SubscribeState {
+    let subscription_state = SubscribeState {
         run_id: RunId(run_id.clone()),
         after_seq,
+        session_id: session_id.clone(),
         replayed: false,
-    });
-    JsonRpcResponse::success(req.id, json!({ "subscribed": run_id }))
+    };
+    let bound_session = subscription_state.session_id.clone();
+    *subscription.lock().await = Some(subscription_state);
+    JsonRpcResponse::success(
+        req.id,
+        json!({ "subscribed": run_id, "session_id": bound_session }),
+    )
 }
 
 /// Dispatch one non-`subscribe` JSON-RPC request into a response.
@@ -231,8 +240,11 @@ async fn event_push_loop(
 }
 
 /// Replay the subscribed run's persisted events once, before any live
-/// event is forwarded.  No-op when the connection is unsubscribed or the
-/// replay already happened.
+/// event is forwarded.  v1 session binding (#9): when the subscription
+/// carries a `session_id`, the server echoes it in the subscribe reply;
+/// replay itself stays run-scoped (`run_id` + `after_seq`) through the
+/// `EventLog` seam, so the client names the run it re-attaches to.  No-op
+/// when the connection is unsubscribed or the replay already happened.
 async fn maybe_replay(
     sender: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
     state: &TransportState,
@@ -247,7 +259,7 @@ async fn maybe_replay(
         (sub.run_id.clone(), sub.after_seq)
     };
 
-    for event in state.event_log.read_events_since(&run_id, after_seq) {
+    for event in state.event_log.read_events_since(&run_id, after_seq).await {
         if !push_event(sender, &event).await {
             return; // socket closed — the outer loop exits on the next recv
         }
