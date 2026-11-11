@@ -159,8 +159,11 @@ pub fn replay_messages(messages: &[MessageEntry]) -> Vec<Message> {
                     sections.insert(key.clone(), value.clone());
                 }
             }
-            other => {
-                transcript.push(other.clone());
+            // A bare `_` keeps future `Message` variants flowing through the
+            // replay (the enum is `#[non_exhaustive]`); the value comes from
+            // `entry.message` because `_` binds nothing to clone.
+            _ => {
+                transcript.push(entry.message.clone());
             }
         }
     }
