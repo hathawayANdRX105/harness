@@ -28,3 +28,46 @@ pub struct BudgetBlocked {
     /// Which compaction stage was reached before giving up.
     pub stage: String,
 }
+
+impl BudgetBlocked {
+    /// Machine-readable message the loop emits when it refuses a round before
+    /// the provider call: `budget blocked: needed={needed} available={available} stage={stage}`.
+    ///
+    /// Core's `RunStopReason` is frozen (`Completed`, `Cancelled`, `MaxTurns`,
+    /// `Error { message }`), so the budget-blocked distinction travels inside
+    /// `RunStopReason::Error { message }`. Callers recover it with
+    /// [`from_error_message`]; a dedicated `RunStopReason::BudgetBlocked`
+    /// variant is proposed as a maintainer-ratified follow-up.
+    pub fn error_message(&self) -> String {
+        format!(
+            "budget blocked: needed={} available={} stage={}",
+            self.needed, self.available, self.stage
+        )
+    }
+
+    /// Parse a message produced by [`error_message`] back into a
+    /// [`BudgetBlocked`], so the budget-blocked distinction survives the
+    /// frozen core enum. Returns `None` for any other string.
+    pub fn from_error_message(message: &str) -> Option<Self> {
+        let mut parts = message
+            .strip_prefix("budget blocked: ")?
+            .split_ascii_whitespace();
+        let needed = parts
+            .next()
+            .and_then(|part| part.strip_prefix("needed="))
+            .and_then(|value| value.parse::<u64>().ok())?;
+        let available = parts
+            .next()
+            .and_then(|part| part.strip_prefix("available="))
+            .and_then(|value| value.parse::<u64>().ok())?;
+        let stage = parts
+            .next()
+            .and_then(|part| part.strip_prefix("stage="))
+            .map(|value| value.to_string())?;
+        (parts.next().is_none()).then_some(Self {
+            needed,
+            available,
+            stage,
+        })
+    }
+}

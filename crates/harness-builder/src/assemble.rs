@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use harness_config::{BudgetConfig, Config, McpServerEntry, ModelsConfig};
-use harness_context::{Budget, CompactionStage};
+use harness_context::{Budget, CompactionStage, Compactor};
 use harness_core::EventSink;
 use harness_core::message::Message;
 use harness_core::model::{Model, ModelInfo};
@@ -42,7 +42,7 @@ use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode};
 use harness_mcp::{Mcp, McpServerConfig, ToolMeta};
 use harness_model::AliasRegistry;
 use harness_tools::{
-    EditTool, GlobTool, GrepTool, ReadTool, SkillMeta, WriteTool, discover_skills,
+    EditTool, GlobTool, GrepTool, ReadTool, SkillMeta, SkillTool, WriteTool, discover_skills,
 };
 
 use crate::BuildError;
@@ -225,13 +225,27 @@ impl McpPool {
     }
 }
 
-/// Compaction configuration for the host: the explicit stage ladder and the
-/// budget it runs against. The loop itself does not consume a compactor yet,
-/// so this travels with the runtime for the scheduler/host to wire.
-#[derive(Debug, Clone, PartialEq)]
+/// Compaction configuration for the host: the explicit stage ladder, the
+/// budget it runs against, and the compactor that executes its stages. The
+/// loop consumes all three through [`AssembledRuntime::loop_deps`].
+#[derive(Clone)]
 pub struct CompactionPlan {
     pub stages: Vec<CompactionStage>,
     pub budget: Budget,
+    /// The compactor that executes the plan's stages. `None` means the plan
+    /// is declarative only: the runtime records it but the loop never
+    /// compacts with it.
+    pub compactor: Option<Arc<dyn Compactor>>,
+}
+
+impl fmt::Debug for CompactionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompactionPlan")
+            .field("stages", &self.stages)
+            .field("budget", &self.budget)
+            .field("compactor", &self.compactor.as_ref().map(|_| "set"))
+            .finish()
+    }
 }
 
 /// One assembled runtime — everything the loop and its host need, produced
@@ -275,6 +289,11 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker.clone(),
             hooks: self.hooks.clone(),
             tool_mode: self.tool_mode,
+            budget: Some(self.budget),
+            compactor: self
+                .compaction
+                .as_ref()
+                .and_then(|plan| plan.compactor.as_ref().map(Arc::clone)),
         }
     }
 
@@ -289,6 +308,8 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker,
             hooks: self.hooks,
             tool_mode: self.tool_mode,
+            budget: Some(self.budget),
+            compactor: self.compaction.and_then(|plan| plan.compactor),
         }
     }
 }
@@ -343,6 +364,7 @@ pub struct HarnessBuilder {
     cwd: Option<PathBuf>,
     config: Option<ConfigBindings>,
     tool_mode: ToolExecutionMode,
+    compactor: Option<Arc<dyn Compactor>>,
 }
 
 impl HarnessBuilder {
@@ -358,6 +380,7 @@ impl HarnessBuilder {
             cwd: None,
             config: None,
             tool_mode: ToolExecutionMode::default(),
+            compactor: None,
         }
     }
 
@@ -373,8 +396,7 @@ impl HarnessBuilder {
         self
     }
 
-    /// Inject an optional approval broker for policy decisions that ask for
-    /// human approval.
+    /// Inject an optional approval broker for tools that require human approval.
     pub fn with_approval_broker(mut self, broker: Arc<dyn ApprovalBroker>) -> Self {
         self.approval_broker = Some(broker);
         self
@@ -424,6 +446,15 @@ impl HarnessBuilder {
         self
     }
 
+    /// Inject the compactor that executes the compaction plan. Without it the
+    /// plan's stages are declarative only: the runtime records the plan but
+    /// the loop never compacts and the turn-boundary budget gate cannot
+    /// relieve pressure.
+    pub fn with_compactor(mut self, compactor: Arc<dyn Compactor>) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
     /// Validate, analyze, and assemble.
     ///
     /// # Errors
@@ -434,7 +465,7 @@ impl HarnessBuilder {
     /// [`BuildError::MissingExternalTool`] for missing explicit injections;
     /// [`BuildError::Mcp`] / [`BuildError::SkillNotFound`] for assembly
     /// failures.
-    pub fn build(self) -> Result<AssembledRuntime, BuildError> {
+    pub fn build(mut self) -> Result<AssembledRuntime, BuildError> {
         self.spec.validate()?;
         let analysis = analyze::analyze(&self.spec)?;
         let model = self.model.ok_or(BuildError::MissingModel)?;
@@ -451,7 +482,7 @@ impl HarnessBuilder {
         let event_sink = self.event_sink.ok_or(BuildError::MissingEventSink)?;
         let config = self.config.unwrap_or_default();
 
-        let tools = assemble_tools(
+        let mut tools = assemble_tools(
             &self.spec,
             &analysis.install_order,
             &self.external_tools,
@@ -459,6 +490,11 @@ impl HarnessBuilder {
             &config,
         )?;
         let skills = assemble_skills(&self.spec.skills)?;
+        // Register the `skill` tool when the spec declares skills, so the
+        // loop can activate any declared skill by name (issue #7). The tool
+        // reads each SKILL.md body on demand; `skills` metadata is unchanged
+        // and additionally exposed on `AssembledRuntime.skills`.
+        register_skill_tool(&mut tools, &skills, self.cwd.clone().unwrap_or_default())?;
         let prompt = assemble_prompt(&self.spec.prompt_sections);
         let hooks = assemble_hooks(&self.spec, &prompt);
         let models: Vec<ModelInfo> = self.spec.models.iter().map(model_info_from_spec).collect();
@@ -466,6 +502,7 @@ impl HarnessBuilder {
         let compaction = (!compaction_stages.is_empty()).then_some(CompactionPlan {
             stages: compaction_stages,
             budget: config.budget,
+            compactor: self.compactor.take(),
         });
 
         Ok(AssembledRuntime {
@@ -742,12 +779,12 @@ fn spawn_mcp_server(config: &McpServerConfig) -> Result<SpawnedServer, BuildErro
             });
         }
     };
-    let mcp = connected.map_err(|source| BuildError::Mcp {
+    let mpc = connected.map_err(|source| BuildError::Mcp {
         server: config.name.clone(),
         source,
     })?;
-    let metas = mcp.list_tools().to_vec();
-    let tools = mcp.into_tools();
+    let metas = mpc.list_tools().to_vec();
+    let tools = mpc.into_tools();
     Ok(SpawnedServer { metas, tools })
 }
 
@@ -778,6 +815,33 @@ fn resolve_skill(spec: &SkillSpec) -> Result<SkillMeta, BuildError> {
             name: spec.name.clone(),
             path: spec.path.clone(),
         })
+}
+/// Register the `skill` tool when the spec declares skills, so the loop can
+/// activate any declared skill by name (issue #7). The tool reads each
+/// `SKILL.md` body from disk on invocation; `skills` is kept as-is and also
+/// exposed on `AssembledRuntime.skills`.
+///
+/// # Errors
+///
+/// Returns [`BuildError::DuplicateTool`] when the spec already declares a
+/// tool named `skill`, which the auto-registered tool would shadow.
+fn register_skill_tool(
+    tools: &mut ToolAssembly,
+    skills: &[SkillMeta],
+    skills_root: PathBuf,
+) -> Result<(), BuildError> {
+    if skills.is_empty() {
+        return Ok(());
+    }
+    if tools.tools.iter().any(|tool| tool.name() == "skill") {
+        return Err(BuildError::DuplicateTool {
+            name: "skill".into(),
+        });
+    }
+    tools
+        .tools
+        .push(Arc::new(SkillTool::new(skills.to_vec(), skills_root)));
+    Ok(())
 }
 
 type PrepareRequestFn = Arc<dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync>;

@@ -261,6 +261,8 @@ async fn two_turns_normal() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -314,6 +316,8 @@ async fn model_ends_early() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -351,6 +355,8 @@ async fn cancellation_mid_loop() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -430,6 +436,8 @@ async fn tool_failure_backfill() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -511,6 +519,8 @@ async fn max_turns_exceeded() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -527,6 +537,13 @@ async fn max_turns_exceeded() {
     let reason = run(ctx, deps, control).await;
 
     assert_eq!(reason, RunStopReason::MaxTurns, "loop should hit max turns");
+
+    let events = sink.events();
+    let turn_started = events
+        .iter()
+        .filter(|e| matches!(e.kind, RunEventKind::TurnStarted { .. }))
+        .count();
+    assert_eq!(turn_started, 1, "exactly one model turn before max turns");
 }
 
 /// Steering messages are drained and injected as user messages.
@@ -550,6 +567,8 @@ async fn steering_injection() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -611,6 +630,8 @@ async fn hook_terminate_batch() {
         policy,
         approval_broker: None,
         hooks,
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -622,11 +643,14 @@ async fn hook_terminate_batch() {
         RunStopReason::Completed,
         "loop should complete via hook"
     );
-}
 
-// ---------------------------------------------------------------------------
-// Approval-path tests
-// ---------------------------------------------------------------------------
+    let events = sink.events();
+    let finished = events
+        .iter()
+        .filter(|e| matches!(e.kind, RunEventKind::RunFinished { .. }))
+        .count();
+    assert_eq!(finished, 1, "exactly one RunFinished event");
+}
 
 /// A policy that requires approval for every tool.
 struct RequireApprovalPolicy;
@@ -725,6 +749,8 @@ async fn approval_denied_backfill() {
         policy,
         approval_broker: Some(broker),
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -802,6 +828,8 @@ async fn approval_precancelled() {
         policy,
         approval_broker: Some(broker),
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -864,6 +892,8 @@ async fn approval_required_no_broker_fails_closed() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -915,6 +945,8 @@ async fn ignores_events_after_terminal_stop() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -974,6 +1006,8 @@ async fn model_stream_error_is_terminal() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -1039,6 +1073,8 @@ async fn event_sequence_is_monotonic() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -1053,30 +1089,6 @@ async fn event_sequence_is_monotonic() {
             event.seq, idx as u64,
             "seq must be a gap-free monotonic counter"
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn event_tag(kind: &RunEventKind) -> &str {
-    match kind {
-        RunEventKind::RunStarted { .. } => "run_started",
-        RunEventKind::RunFinished { .. } => "run_finished",
-        RunEventKind::SteeringApplied { .. } => "steering_applied",
-        RunEventKind::TurnStarted { .. } => "turn_started",
-        RunEventKind::TurnFinished { .. } => "turn_finished",
-        RunEventKind::TextDelta { .. } => "text_delta",
-        RunEventKind::ToolCall(_) => "tool_call",
-        RunEventKind::ToolStarted { .. } => "tool_started",
-        RunEventKind::ToolFinished { .. } => "tool_finished",
-        RunEventKind::PolicyDecided { .. } => "policy_decided",
-        RunEventKind::ApprovalRequested { .. } => "approval_requested",
-        RunEventKind::ApprovalResolved { .. } => "approval_resolved",
-        RunEventKind::Error { .. } => "error",
-        // RunEventKind is #[non_exhaustive]: future variants get a generic tag.
-        _ => "unknown",
     }
 }
 
@@ -1117,6 +1129,8 @@ async fn cancel_mid_stream_ends_promptly() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
     });
 
@@ -1134,6 +1148,29 @@ async fn cancel_mid_stream_ends_promptly() {
         .unwrap_or_else(|e| panic!("run task panicked: {e}"));
     assert_eq!(reason, RunStopReason::Cancelled, "mid-stream cancel wins");
 }
+
+/// Converts a `RunEventKind` into a short stable tag for event-log assertions.
+///
+/// `RunEventKind` is `#[non_exhaustive]`: the `_` arm covers future variants.
+fn event_tag(kind: &RunEventKind) -> &str {
+    match kind {
+        RunEventKind::RunStarted { .. } => "run_started",
+        RunEventKind::RunFinished { .. } => "run_finished",
+        RunEventKind::SteeringApplied { .. } => "steering_applied",
+        RunEventKind::TurnStarted { .. } => "turn_started",
+        RunEventKind::TurnFinished { .. } => "turn_finished",
+        RunEventKind::TextDelta { .. } => "text_delta",
+        RunEventKind::ToolCall(_) => "tool_call",
+        RunEventKind::ToolStarted { .. } => "tool_started",
+        RunEventKind::ToolFinished { .. } => "tool_finished",
+        RunEventKind::PolicyDecided { .. } => "policy_decided",
+        RunEventKind::ApprovalRequested { .. } => "approval_requested",
+        RunEventKind::ApprovalResolved { .. } => "approval_resolved",
+        RunEventKind::Error { .. } => "error",
+        _ => "unknown",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Counting tool and request-capturing model for the parallel dispatch and
 // hook-seam tests below.
@@ -1305,6 +1342,8 @@ async fn parallel_dispatch_executes_both_tools() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Parallel,
     });
 
@@ -1465,6 +1504,8 @@ async fn hook_seams_before_after_finish_and_prepare() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks,
+        budget: None,
+        compactor: None,
         tool_mode: ToolExecutionMode::Parallel,
     });
 

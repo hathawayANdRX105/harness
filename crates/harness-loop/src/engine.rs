@@ -1,4 +1,4 @@
-//! The agent loop: model stream -> tool dispatch -> repeat.
+//! The agent loop: model stream -> tool dispatch -> turn loop.
 //!
 //! Design provenance: pi's `agentLoop` (`packages/agent/src/agent-loop.ts`),
 //! harness-rs's `RunLoop` (`crates/harness-loop/src/lib.rs`), and
@@ -13,8 +13,8 @@
 //!
 //! The `run` function is a bare `async fn` that receives everything it needs
 //! through parameters. There is no `Agent` struct, no `Engine` builder. All
-//! per-call state is in the `transcript` vector and the sequence counter --
-//! neither survives the function's return. This is the opposite of
+//! per-call state is in the `Vec<Message>` transcript and the sequence counter
+//! -- neither survives the function's return. This is the opposite of
 //! NanoHarness's stateful `Engine` class, which bundles context, session and
 //! loop into one object.
 
@@ -28,6 +28,8 @@ use harness_core::model::{Model, ModelEvent, ModelRequest};
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::{Tool, ToolSchema};
 use harness_core::{EventSink, RunControl};
+
+use harness_context::{Budget, BudgetBlocked, Compactor};
 
 use crate::dispatch::{DispatchCtx, dispatch_batch, emit_event};
 use crate::hooks::{LoopHooks, ToolExecutionMode};
@@ -53,6 +55,15 @@ pub struct LoopDeps {
     pub hooks: LoopHooks,
     /// How tools are dispatched within one turn.
     pub tool_mode: ToolExecutionMode,
+    /// Optional context budget: used vs available tokens plus the derived
+    /// ratio. The builder sets it from `[budget]`; its presence, together
+    /// with `compactor`, enables the turn-boundary budget gate that runs
+    /// before the provider call and can refuse a round as `BudgetBlocked`.
+    pub budget: Option<Budget>,
+    /// Optional compactor: assesses the budget and compacts the transcript.
+    /// The builder sets it from the compaction plan; its presence, together
+    /// with `budget`, enables the turn-boundary budget gate.
+    pub compactor: Option<Arc<dyn Compactor>>,
 }
 
 impl std::fmt::Debug for LoopDeps {
@@ -65,6 +76,8 @@ impl std::fmt::Debug for LoopDeps {
                 "approval_broker",
                 &self.approval_broker.as_ref().map(|_| "..."),
             )
+            .field("budget", &self.budget)
+            .field("compactor", &self.compactor.as_ref().map(|_| "set"))
             .field("hooks", &self.hooks)
             .field("tool_mode", &self.tool_mode)
             .finish()
@@ -83,6 +96,8 @@ impl std::fmt::Debug for LoopDeps {
 ///     | No
 ///     v
 ///   MaxTurns? --Yes--> MaxTurns
+///     | No
+///   Budget blocked? --Yes--> Error
 ///     | No
 ///     v
 ///   Drain steer / inject user
@@ -166,6 +181,18 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
         // -- 4. Hook: prepare_request --
         if let Some(ref hook) = deps.hooks.prepare_request {
             transcript = hook(transcript);
+        }
+
+        // -- 4b. Budget gate: refuse the round before the provider call when
+        //    the context budget cannot fit the next turn, even after one
+        //    compaction pass. Emits `RunEventKind::Error` carrying a
+        //    structured `budget blocked: ...` message and returns
+        //    `RunStopReason::Error` with the same string -- BudgetBlocked
+        //    semantics without changing the frozen `RunStopReason` enum. --
+        if let Some(reason) =
+            enforce_budget_gate(&deps, &mut transcript, &ctx, &control, &seq).await
+        {
+            return reason;
         }
 
         // -- 5. Build request and model turn --
@@ -297,6 +324,89 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
     }
 }
 
+/// Turn-boundary budget gate: runs before the provider call so a round is
+/// refused (not failed) when the context cannot fit the next turn.
+///
+/// When both `budget` and `compactor` are configured: refresh the budget
+/// from the current transcript; when a compaction stage is active, run
+/// compaction once -- cancellable via the run's cancel token -- then re-check.
+/// If the budget is still over a stage threshold, emit a
+/// `RunEventKind::Error` carrying [`BudgetBlocked::error_message`] and return
+/// `RunStopReason::Error` carrying the same message. Callers recover the
+/// distinction with [`BudgetBlocked::from_error_message`]; core's
+/// `RunStopReason` is frozen and has no budget-blocked variant.
+///
+/// Returns `None` when the gate passes or is unconfigured (either dep
+/// missing), so the turn proceeds to the provider call.
+async fn enforce_budget_gate(
+    deps: &LoopDeps,
+    transcript: &mut Vec<Message>,
+    ctx: &RunContext,
+    control: &RunControl,
+    seq: &AtomicU64,
+) -> Option<RunStopReason> {
+    let (_, Some(compactor)) = (&deps.budget, &deps.compactor) else {
+        return None;
+    };
+
+    // Cancellation observed at the boundary wins: don't compact a cancelled run.
+    if control.is_cancelled() {
+        return Some(finish(
+            RunStopReason::Cancelled,
+            ctx,
+            &*deps.event_sink,
+            seq,
+        ));
+    }
+
+    let info = deps.model.info();
+    let budget = compactor.read_budget(transcript, info);
+    let stage = compactor.stages().iter().find(|s| s.is_active(&budget))?;
+
+    // Compaction is the only relief available before refusing the round;
+    // run it once, cancellable via the run's cancel token.
+    let _result = compactor
+        .compact(transcript, &budget, None, &control.cancel_token())
+        .await;
+
+    if control.is_cancelled() {
+        return Some(finish(
+            RunStopReason::Cancelled,
+            ctx,
+            &*deps.event_sink,
+            seq,
+        ));
+    }
+
+    let budget = compactor.read_budget(transcript, info);
+    let still_blocked = compactor.stages().iter().any(|s| s.is_active(&budget));
+    if !still_blocked {
+        return None;
+    }
+
+    let blocked = BudgetBlocked {
+        needed: budget.used_tokens,
+        available: budget.available_tokens,
+        stage: stage.label.clone(),
+    };
+    let message = blocked.error_message();
+    emit_event(
+        &*deps.event_sink,
+        &ctx.run_id,
+        &ctx.session_id,
+        seq,
+        RunEventKind::Error {
+            message: message.clone(),
+        },
+    );
+    Some(finish(
+        RunStopReason::Error { message },
+        ctx,
+        &*deps.event_sink,
+        seq,
+    ))
+}
+
 /// The outcome of pumping one model stream.
 enum StreamTurn {
     /// Stream ended cleanly (via `ModelEvent::Stop`).
@@ -348,41 +458,41 @@ async fn pump_stream(
                 None => break,
             },
         };
-        match event {
+        match &event {
             ModelEvent::TextDelta(t) => {
-                text.push_str(&t);
+                text.push_str(t);
                 emit_event(
                     sink,
                     &ctx.run_id,
                     &ctx.session_id,
                     seq,
-                    RunEventKind::TextDelta { text: t },
+                    RunEventKind::TextDelta { text: t.clone() },
                 );
             }
             ModelEvent::ReasoningDelta(r) => {
-                reasoning.push_str(&r);
+                reasoning.push_str(r);
                 // Reasoning deltas have no dedicated RunEventKind yet;
                 // they are preserved in Content::Reasoning blocks.
             }
             ModelEvent::ToolCallStart { id, name } => {
-                partial = Some((id, name, String::new()));
+                partial = Some((id.clone(), name.clone(), String::new()));
             }
             ModelEvent::ToolCallArgs { id, partial_json } => {
-                if let Some((ref cur_id, _, ref mut args)) = partial
-                    && cur_id == &id
+                if let Some((cur_id, _, args)) = partial.as_mut()
+                    && cur_id == id
                 {
-                    args.push_str(&partial_json);
+                    args.push_str(partial_json);
                 }
             }
             ModelEvent::ToolCallEnd { id } => {
-                if let Some((_, name, ref args_str)) = partial
-                    && !tool_calls.iter().any(|tc| tc.id == id)
+                if let Some((_, name, args_str)) = partial.as_mut()
+                    && !tool_calls.iter().any(|tc| tc.id == *id)
                 {
                     let args: serde_json::Value =
                         serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
                     tool_calls.push(ToolCall {
                         id: id.clone(),
-                        name,
+                        name: name.clone(),
                         args,
                     });
                 }
@@ -405,7 +515,7 @@ async fn pump_stream(
                     content.push(Content::Text(text));
                 }
                 return StreamTurn::Error {
-                    message,
+                    message: message.clone(),
                     partial_content: content,
                     partial_calls: tool_calls,
                 };
