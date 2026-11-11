@@ -17,6 +17,12 @@ harness-transport = { path = "../harness-transport" }
 # tokio: the daemon owns the runtime — transport servers, signal watchers and
 # the event pump all live on it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time", "sync", "fs"] }
+# clap: the daemon's CLI surface (--config/--socket/--http) — declarative
+# args with free --help/--version and typed value parsing.
+clap = { version = "4", features = ["derive"] }
+# anyhow: flattens the daemon's startup error chain (config/builder/pidlock/
+# io) into one report; crate-boundary errors stay typed in their own crates.
+anyhow = "1"
 # axum serves the merged HTTP+SSE + WS router the transport crate builds.
 axum = { version = "0.8" }
 serde = { version = "1", features = ["derive"] }
