@@ -35,4 +35,4 @@ pub use args::{optional_string, require_integer, require_string};
 pub use builtin::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use catalog::ToolCatalog;
 pub use output::{DEFAULT_MAX_OUTPUT_CHARS, truncate_output};
-pub use skills::{SkillMeta, discover_skills};
+pub use skills::{SkillMeta, SkillTool, discover_skills};

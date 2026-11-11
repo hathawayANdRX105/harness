@@ -4,10 +4,12 @@
 //! that discover_skills returns the expected metadata. No mock filesystem —
 //! all tests use real tempfile directories.
 
+use harness_core::tool::{Tool, ToolError};
+use harness_tools::skills::{SkillTool, discover_skills};
+use serde_json::json;
 use std::fs;
 use std::path::Path;
-
-use harness_tools::skills::discover_skills;
+use tokio_util::sync::CancellationToken;
 
 /// Purpose: verify that discover_skills finds SKILL.md in subdirectories.
 /// Scenario: create a temp dir with two skill dirs, each containing SKILL.md.
@@ -99,4 +101,93 @@ fn skips_dirs_without_skill_md() {
 fn missing_base_dir() {
     let skills = discover_skills(Path::new("/tmp/nonexistent_harness_test_dir_xyz"));
     assert!(skills.is_empty(), "must be empty for missing dir");
+}
+// ---------------------------------------------------------------------------
+// SkillTool: activate a skill by reading its SKILL.md body.
+// ---------------------------------------------------------------------------
+
+/// Purpose: SkillTool activates a discovered skill and returns its SKILL.md body.
+/// Scenario: create skills/demo/SKILL.md with a marker line, discover it with
+/// discover_skills, construct SkillTool from the discovered metadata, then
+/// invoke `{"name": "demo"}`.
+/// Acceptance: invoke returns Ok with is_error false and content containing
+/// the marker line from SKILL.md.
+#[tokio::test]
+async fn skill_tool_activates_discovered_skill() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+    let base = dir.path();
+    let skill_dir = base.join("demo");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "# Demo\n\nmarker: hello-from-skill\n",
+    )?;
+
+    let skills = discover_skills(base);
+    let skill = skills
+        .iter()
+        .find(|skill| skill.name == "demo")
+        .cloned()
+        .ok_or_else(|| "demo skill was not discovered".to_string())?;
+    let tool = SkillTool::new(vec![skill], base.to_path_buf());
+
+    let cancel = CancellationToken::new();
+    let result = tool.invoke(json!({ "name": "demo" }), &cancel).await?;
+    assert!(
+        !result.is_error,
+        "skill body is a successful result: {:?}",
+        result.content
+    );
+    assert!(
+        result.content.contains("marker: hello-from-skill"),
+        "content carries the SKILL.md body: {}",
+        result.content
+    );
+    Ok(())
+}
+
+/// Purpose: an unknown skill name fails as a value, not as a dispatch error.
+/// Scenario: construct SkillTool with no skills and invoke an unknown name.
+/// Acceptance: invoke returns Ok, is_error is true, and the message names the
+/// unknown skill; the Err channel is unused.
+#[tokio::test]
+async fn skill_tool_unknown_name_is_value_shaped_failure() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::TempDir::new()?;
+    let tool = SkillTool::new(Vec::new(), dir.path().to_path_buf());
+
+    let cancel = CancellationToken::new();
+    let result = tool.invoke(json!({ "name": "nope" }), &cancel).await?;
+    assert!(
+        result.is_error,
+        "unknown skill must be value-shaped: {:?}",
+        result
+    );
+    assert!(
+        result.content.contains("nope"),
+        "message names the unknown skill: {}",
+        result.content
+    );
+    Ok(())
+}
+
+/// Purpose: a missing `name` argument is rejected as invalid arguments.
+/// Scenario: invoke SkillTool with an empty argument object.
+/// Acceptance: invoke returns Err(ToolError::InvalidArgs).
+#[tokio::test]
+async fn skill_tool_missing_name_is_invalid_args() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+    let tool = SkillTool::new(Vec::new(), dir.path().to_path_buf());
+
+    let cancel = CancellationToken::new();
+    let error = tool
+        .invoke(json!({}), &cancel)
+        .await
+        .err()
+        .ok_or_else(|| "missing name must produce an error".to_string())?;
+    assert!(
+        matches!(error, ToolError::InvalidArgs { .. }),
+        "missing name is InvalidArgs: {error:?}"
+    );
+    Ok(())
 }
