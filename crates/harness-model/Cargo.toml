@@ -1,0 +1,32 @@
+[package]
+name = "harness-model"
+version = "0.1.0"
+edition = "2024"
+description = "Harness model adapter: OpenAI-compatible SSE → ModelEvent mapping, model alias resolution, retry/backoff, ModelInfo catalog loading — designed from pi's stream-fn contract and harness-rs's delta vocabulary"
+license = "MIT"
+publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+futures = "0.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "time"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+axum = "0.8"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"

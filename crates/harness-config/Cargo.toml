@@ -1,0 +1,22 @@
+[package]
+name = "harness-config"
+version = "0.1.0"
+edition = "2024"
+description = "Harness config: hierarchical TOML+env layered configuration loader — upstream addresses, model aliases, key variable names, session directories, budget limits, MCP server lists, hook/skill registries"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Field-path reporting: toml's own type errors omit the key, so the loader
+# needs the serde path to say which field is wrong (budget.max_turns, …).
+serde_path_to_error = "0.1"
+toml = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

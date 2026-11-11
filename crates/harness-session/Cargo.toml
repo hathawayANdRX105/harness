@@ -1,0 +1,21 @@
+[package]
+name = "harness-session"
+version = "0.1.0"
+edition = "2024"
+description = "Session persistence: message ledger (replayable with None-section removal) and ordered RunEvent log over SQLite. Design provenance: pi's committed-ledger pattern and NanoHarness's RunContext/RunCheckpoint split."
+license = "MIT"
+publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

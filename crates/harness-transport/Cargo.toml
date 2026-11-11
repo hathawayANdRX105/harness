@@ -1,0 +1,33 @@
+[package]
+name = "harness-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Three-channel transport layer (HTTP+SSE, WebSocket, UDS): JSON-RPC command dispatch, RunEvent push, typed error frames, slash command parsing"
+license = "MIT"
+publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+axum = { version = "0.8", features = ["ws", "json", "macros"] }
+tokio = { version = "1", default-features = false, features = [
+    "net",
+    "rt",
+    "sync",
+    "io-util",
+    "macros",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+futures = "0.3"
+futures-util = "0.3"
+tokio-tungstenite = "0.29"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[lints]
+workspace = true
