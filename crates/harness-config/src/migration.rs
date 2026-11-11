@@ -98,7 +98,7 @@ pub fn run_migrations(table: &mut Table) -> Result<(), ConfigError> {
     }
 
     if current < target {
-        Err(ConfigError::Migration {
+        return Err(ConfigError::Migration {
             from_version: current,
             target_version: target,
             detail: format!(
@@ -106,8 +106,8 @@ pub fn run_migrations(table: &mut Table) -> Result<(), ConfigError> {
                  the chain covers versions 0..{}",
                 migration_chain().len(),
             ),
-        })
-    } else {
-        Ok(())
+        });
     }
+
+    Ok(())
 }

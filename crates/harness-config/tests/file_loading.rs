@@ -200,3 +200,38 @@ fn future_version_fails() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+/// Purpose: the config path honors the XDG base-dir convention.
+/// Scenario: `XDG_CONFIG_HOME` set to a temp dir containing
+/// `harness/config.toml`; `load()` resolves and parses that file.
+/// Acceptance: the loaded config carries the values from the XDG-resolved
+/// file, and the previous `XDG_CONFIG_HOME` value is restored afterwards.
+#[test]
+fn xdg_config_home_resolves_the_config_file() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let harness_dir = dir.path().join("harness");
+    std::fs::create_dir_all(&harness_dir)?;
+    let file = harness_dir.join("config.toml");
+    std::fs::write(
+        &file,
+        "version = 1\n\n[upstream]\nbase_url = \"http://xdg.example.com\"\napi_key_var = \"XDG_TEST_KEY\"\n",
+    )?;
+
+    // `set_var` is unsafe in edition 2024. XDG_CONFIG_HOME is not touched by
+    // any other test file in this crate, so no cross-file env race exists;
+    // the previous value is restored on every exit path below.
+    let previous = std::env::var_os("XDG_CONFIG_HOME");
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+    let result = harness_config::load();
+    match &previous {
+        Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+        None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+    }
+
+    let config = result?;
+    assert_eq!(
+        config.upstream.base_url, "http://xdg.example.com",
+        "the XDG-resolved file must be the one parsed"
+    );
+    Ok(())
+}

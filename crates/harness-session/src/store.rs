@@ -167,11 +167,11 @@ pub fn replay_messages(messages: &[MessageEntry]) -> Vec<Message> {
 
     // Build the front matter: a single System message with accumulated sections.
     if sections.is_empty() {
-        transcript
-    } else {
-        let mut result = Vec::with_capacity(transcript.len() + 1);
-        result.push(Message::System { sections });
-        result.append(&mut transcript);
-        result
+        return transcript;
     }
+
+    let mut result = Vec::with_capacity(transcript.len() + 1);
+    result.push(Message::System { sections });
+    result.append(&mut transcript);
+    result
 }

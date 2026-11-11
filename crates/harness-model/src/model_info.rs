@@ -45,6 +45,9 @@ struct ModelDefinition {
     supports_streaming: bool,
 }
 
+/// serde's `default` attribute takes a callable path, and `bool::default()`
+/// is `false` — both of these flags mean "true" when the catalog file omits
+/// them, so this adapter is the smallest shape that can express that default.
 const fn default_true() -> bool {
     true
 }
@@ -131,5 +134,3 @@ pub enum LoadError {
     #[error("unsupported format: `{0}` — JSON only")]
     UnsupportedFormat(String),
 }
-
-// Tests live in crates/harness-model/tests/ — see the contract tests.

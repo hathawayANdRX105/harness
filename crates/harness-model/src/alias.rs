@@ -67,6 +67,3 @@ impl AliasRegistry {
         self.entries.is_empty()
     }
 }
-
-// Tests live in crates/harness-model/tests/ — see the contract tests.
-// #[cfg(test)] modules inside src/ are not the convention in this repo.

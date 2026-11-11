@@ -89,8 +89,10 @@ pub struct UpstreamConfig {
     pub api_key_var: String,
 }
 
+pub(crate) const DEFAULT_API_KEY_VAR: &str = "HARNESS_API_KEY";
+
 pub(crate) fn default_api_key_var() -> String {
-    "HARNESS_API_KEY".into()
+    DEFAULT_API_KEY_VAR.into()
 }
 
 /// Manual Debug impl: masks `api_key_var` so the env variable name does not
@@ -166,8 +168,12 @@ pub struct SessionConfig {
     pub directory: String,
 }
 
+/// Default session persistence directory (under `$HOME`, expanded at load
+/// time).
+pub(crate) const DEFAULT_SESSION_DIR: &str = "~/.local/share/harness/sessions";
+
 pub(crate) fn default_session_dir() -> String {
-    "~/.local/share/harness/sessions".into()
+    DEFAULT_SESSION_DIR.into()
 }
 
 impl fmt::Debug for SessionConfig {
@@ -207,16 +213,20 @@ pub struct BudgetConfig {
     pub max_turns: u32,
 }
 
+pub(crate) const DEFAULT_MAX_INPUT_TOKENS: u32 = 150_000;
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_000;
+pub(crate) const DEFAULT_MAX_TURNS: u32 = 50;
+
 pub(crate) fn default_max_input_tokens() -> u32 {
-    150_000
+    DEFAULT_MAX_INPUT_TOKENS
 }
 
 pub(crate) fn default_max_output_tokens() -> u32 {
-    8_000
+    DEFAULT_MAX_OUTPUT_TOKENS
 }
 
 pub(crate) fn default_max_turns() -> u32 {
-    50
+    DEFAULT_MAX_TURNS
 }
 
 impl fmt::Debug for BudgetConfig {

@@ -58,5 +58,3 @@ impl RetryPolicy {
         Duration::from_millis(jitter)
     }
 }
-
-// Tests live in crates/harness-model/tests/ — see the contract tests.

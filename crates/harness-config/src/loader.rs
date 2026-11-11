@@ -131,23 +131,28 @@ fn defaults_only() -> Config {
     }
 }
 
-/// Resolve the config file path: `$HARNESS_CONFIG` env var, or
-/// `~/.config/harness/config.toml`.
+/// Resolve the config file path.
+///
+/// Priority: `$HARNESS_CONFIG` (a set-but-empty value counts as unset), then
+/// the XDG config dir — `$XDG_CONFIG_HOME/harness/config.toml`, falling back
+/// to the XDG default `$HOME/.config/harness/config.toml`.
 fn resolve_config_path() -> Result<std::path::PathBuf, ConfigError> {
-    if let Some(path) = std::env::var_os("HARNESS_CONFIG") {
-        if path.is_empty() {
-            // Treat empty string as unset; fall through to default.
-            default_config_path()
-        } else {
-            Ok(std::path::PathBuf::from(path))
+    if let Some(path) = std::env::var_os("HARNESS_CONFIG")
+        && !path.is_empty()
+    {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => {
+            Ok(std::path::PathBuf::from(dir).join("harness/config.toml"))
         }
-    } else {
-        default_config_path()
+        _ => home_config_path(),
     }
 }
 
-/// Build `~/.config/harness/config.toml` from the `HOME` env var.
-fn default_config_path() -> Result<std::path::PathBuf, ConfigError> {
+/// `$HOME/.config/harness/config.toml` — the XDG fallback used when
+/// `XDG_CONFIG_HOME` is unset.
+fn home_config_path() -> Result<std::path::PathBuf, ConfigError> {
     let home = std::env::var("HOME").map_err(|_| ConfigError::MissingField {
         field: "HOME".into(),
         file: "<env>".into(),
@@ -175,70 +180,82 @@ fn default_config_path() -> Result<std::path::PathBuf, ConfigError> {
 /// | `HARNESS_REGISTRY_HOOKS`         | `registry.hooks` (comma-separated) |
 /// | `HARNESS_REGISTRY_SKILLS`        | `registry.skills` (comma-separated) |
 ///
+/// One string env override: the env var name and the field setter.
+type StringOverride = (&'static str, fn(&mut Config, String));
+/// One integer env override: env var name, config field path (for the
+/// TypeError), and the field setter.
+type U32Override = (&'static str, &'static str, fn(&mut Config, u32));
+/// One comma-separated list env override.
+type ListOverride = (&'static str, fn(&mut Config, Vec<String>));
+
 /// Only present env vars are applied; unset or empty vars are ignored.
 fn apply_env_overrides(mut config: Config) -> Result<Config, ConfigError> {
-    // upstream
-    if let Ok(val) = std::env::var("HARNESS_UPSTREAM_BASE_URL")
-        && !val.is_empty()
-    {
-        config.upstream.base_url = val;
-    }
-    if let Ok(val) = std::env::var("HARNESS_UPSTREAM_API_KEY_VAR")
-        && !val.is_empty()
-    {
-        config.upstream.api_key_var = val;
-    }
-
-    // session
-    if let Ok(val) = std::env::var("HARNESS_SESSION_DIRECTORY")
-        && !val.is_empty()
-    {
-        config.session.directory = val;
+    // Plain string overrides: applied verbatim when set and non-empty.
+    const STRING_OVERRIDES: &[StringOverride] = &[
+        ("HARNESS_UPSTREAM_BASE_URL", |c, v| c.upstream.base_url = v),
+        ("HARNESS_UPSTREAM_API_KEY_VAR", |c, v| {
+            c.upstream.api_key_var = v
+        }),
+        ("HARNESS_SESSION_DIRECTORY", |c, v| c.session.directory = v),
+    ];
+    for (name, apply) in STRING_OVERRIDES {
+        if let Some(val) = non_empty_env(name) {
+            apply(&mut config, val);
+        }
     }
 
-    // budget
-    if let Ok(val) = std::env::var("HARNESS_BUDGET_MAX_INPUT_TOKENS")
-        && !val.is_empty()
-    {
-        config.budget.max_input_tokens = val.parse().map_err(|e| ConfigError::TypeError {
-            field: "budget.max_input_tokens".into(),
-            detail: format!("HARNESS_BUDGET_MAX_INPUT_TOKENS: {e}"),
-            file: "<env>".into(),
-            line: 0,
-        })?;
-    }
-    if let Ok(val) = std::env::var("HARNESS_BUDGET_MAX_OUTPUT_TOKENS")
-        && !val.is_empty()
-    {
-        config.budget.max_output_tokens = val.parse().map_err(|e| ConfigError::TypeError {
-            field: "budget.max_output_tokens".into(),
-            detail: format!("HARNESS_BUDGET_MAX_OUTPUT_TOKENS: {e}"),
-            file: "<env>".into(),
-            line: 0,
-        })?;
-    }
-    if let Ok(val) = std::env::var("HARNESS_BUDGET_MAX_TURNS")
-        && !val.is_empty()
-    {
-        config.budget.max_turns = val.parse().map_err(|e| ConfigError::TypeError {
-            field: "budget.max_turns".into(),
-            detail: format!("HARNESS_BUDGET_MAX_TURNS: {e}"),
-            file: "<env>".into(),
-            line: 0,
-        })?;
+    // Integer overrides: a non-numeric value is a TypeError naming the field
+    // and the env var (issue #3's typed-error contract).
+    const U32_OVERRIDES: &[U32Override] = &[
+        (
+            "HARNESS_BUDGET_MAX_INPUT_TOKENS",
+            "budget.max_input_tokens",
+            |c, v| c.budget.max_input_tokens = v,
+        ),
+        (
+            "HARNESS_BUDGET_MAX_OUTPUT_TOKENS",
+            "budget.max_output_tokens",
+            |c, v| c.budget.max_output_tokens = v,
+        ),
+        ("HARNESS_BUDGET_MAX_TURNS", "budget.max_turns", |c, v| {
+            c.budget.max_turns = v
+        }),
+    ];
+    for (name, field, apply) in U32_OVERRIDES {
+        if let Some(val) = non_empty_env(name) {
+            let parsed = val.parse().map_err(|e| ConfigError::TypeError {
+                field: (*field).into(),
+                detail: format!("{name}: {e}"),
+                file: "<env>".into(),
+                line: 0,
+            })?;
+            apply(&mut config, parsed);
+        }
     }
 
-    // registry (comma-separated lists)
-    if let Ok(val) = std::env::var("HARNESS_REGISTRY_HOOKS")
-        && !val.is_empty()
-    {
-        config.registry.hooks = val.split(',').map(|s| s.trim().to_string()).collect();
-    }
-    if let Ok(val) = std::env::var("HARNESS_REGISTRY_SKILLS")
-        && !val.is_empty()
-    {
-        config.registry.skills = val.split(',').map(|s| s.trim().to_string()).collect();
+    // Comma-separated list overrides.
+    const LIST_OVERRIDES: &[ListOverride] = &[
+        ("HARNESS_REGISTRY_HOOKS", |c, v| c.registry.hooks = v),
+        ("HARNESS_REGISTRY_SKILLS", |c, v| c.registry.skills = v),
+    ];
+    for (name, apply) in LIST_OVERRIDES {
+        if let Some(val) = non_empty_env(name) {
+            apply(&mut config, split_list(&val));
+        }
     }
 
     Ok(config)
+}
+
+/// The env var's value when set to something non-empty. Empty counts as
+/// unset: a shell export with no value must never clobber the file layer.
+fn non_empty_env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(val) if !val.is_empty() => Some(val),
+        _ => None,
+    }
+}
+
+fn split_list(val: &str) -> Vec<String> {
+    val.split(',').map(|s| s.trim().to_string()).collect()
 }

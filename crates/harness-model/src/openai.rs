@@ -224,23 +224,19 @@ struct ChatToolDefinition {
 fn build_chat_request(req: &ModelRequest) -> ChatRequest {
     let messages: Vec<ChatMessage> = req.messages.iter().filter_map(map_message).collect();
 
-    let tools = if req.tools.is_empty() {
-        None
-    } else {
-        Some(
-            req.tools
-                .iter()
-                .map(|t| ChatTool {
-                    type_: "function".into(),
-                    function: ChatToolDefinition {
-                        name: t.name.clone(),
-                        description: t.description.clone(),
-                        parameters: t.input.clone(),
-                    },
-                })
-                .collect(),
-        )
-    };
+    let tools = (!req.tools.is_empty()).then(|| {
+        req.tools
+            .iter()
+            .map(|t| ChatTool {
+                type_: "function".into(),
+                function: ChatToolDefinition {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.input.clone(),
+                },
+            })
+            .collect()
+    });
 
     ChatRequest {
         model: req.model.clone(),
@@ -263,11 +259,7 @@ fn map_message(msg: &Message) -> Option<ChatMessage> {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let content = if text.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::String(text))
-            };
+            let content = (!text.is_empty()).then_some(serde_json::Value::String(text));
             Some(ChatMessage {
                 role: "system".into(),
                 content,
@@ -288,11 +280,7 @@ fn map_message(msg: &Message) -> Option<ChatMessage> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let content = if text.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::String(text))
-            };
+            let content = (!text.is_empty()).then_some(serde_json::Value::String(text));
             Some(ChatMessage {
                 role: "user".into(),
                 content,
@@ -328,16 +316,8 @@ fn map_message(msg: &Message) -> Option<ChatMessage> {
             }
 
             let text = text_parts.join("\n\n");
-            let content = if text.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::String(text))
-            };
-            let tool_calls = if tool_calls.is_empty() {
-                None
-            } else {
-                Some(tool_calls)
-            };
+            let content = (!text.is_empty()).then_some(serde_json::Value::String(text));
+            let tool_calls = (!tool_calls.is_empty()).then_some(tool_calls);
 
             Some(ChatMessage {
                 role: "assistant".into(),
@@ -452,17 +432,19 @@ async fn attempt_send(
     };
 
     let status = response.status();
-    if status.is_success() {
-        AttemptOutcome::Success(response)
-    } else if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
-        // 5xx, 408 (Request Timeout) and 429 (Too Many Requests) —
+    match status.as_u16() {
+        200..=299 => AttemptOutcome::Success(response),
+        // 408 Request Timeout, 429 Too Many Requests and any 5xx —
         // transient: back off and retry instead of a terminal error.
-        let error_body = response.text().await.unwrap_or_default();
-        AttemptOutcome::Transient(format!("HTTP {status}: {error_body}"))
-    } else {
+        408 | 429 | 500..=599 => {
+            let error_body = response.text().await.unwrap_or_default();
+            AttemptOutcome::Transient(format!("HTTP {status}: {error_body}"))
+        }
         // 400/401/403/404 and other 4xx — fatal (auth, bad request).
-        let error_body = response.text().await.unwrap_or_default();
-        AttemptOutcome::Fatal(format!("HTTP {status}: {error_body}"))
+        _ => {
+            let error_body = response.text().await.unwrap_or_default();
+            AttemptOutcome::Fatal(format!("HTTP {status}: {error_body}"))
+        }
     }
 }
 
@@ -583,7 +565,7 @@ fn extract_sse_data(buf: &mut Vec<u8>) -> Option<String> {
         }
     }
 
-    if data.is_empty() { None } else { Some(data) }
+    (!data.is_empty()).then_some(data)
 }
 
 /// Replace CRLF with LF throughout `chunk` so SSE `\n\n` event boundaries
@@ -840,5 +822,3 @@ impl ToolCallRegistry {
             .collect()
     }
 }
-
-// Tests live in crates/harness-model/tests/ — see the contract tests.
