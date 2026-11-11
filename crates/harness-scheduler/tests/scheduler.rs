@@ -172,6 +172,8 @@ fn deps(model: Arc<dyn Model>, tools: Vec<Arc<dyn Tool>>, sink: Arc<dyn EventSin
         approval_broker: None,
         hooks: LoopHooks::default(),
         tool_mode: ToolExecutionMode::Sequential,
+        budget: None,
+        compactor: None,
     }
 }
 
@@ -461,6 +463,8 @@ async fn approval_mid_ask_race_ends_the_run() {
                 })),
                 hooks: LoopHooks::default(),
                 tool_mode: ToolExecutionMode::Sequential,
+                budget: None,
+                compactor: None,
             },
         })
         .unwrap_or_else(|e| panic!("{e}"));
