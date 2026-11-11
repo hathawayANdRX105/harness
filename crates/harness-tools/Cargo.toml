@@ -1,0 +1,34 @@
+[package]
+name = "harness-tools"
+version = "0.1.0"
+edition = "2024"
+description = "Builtin tool implementations (read/write/edit/glob/grep) for the harness daemon: Tool trait impls, output truncation/spill, arg extraction helpers, and SKILL.md discovery"
+license = "MIT"
+publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-mcp = { path = "../harness-mcp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "2"
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+tokio = { version = "1", default-features = false, features = [
+    "fs",
+    "io-util",
+    "rt",
+    "macros",
+] }
+regex = "1"
+glob = "0.3"
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+harness-core = { path = "../harness-core" }
+
+[lints]
+workspace = true
