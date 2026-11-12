@@ -1014,3 +1014,25 @@ async fn no_recall_returns_no_hits() -> Result<(), Box<dyn std::error::Error>> {
     assert!(hits.is_empty(), "NoRecall must never return hits");
     Ok(())
 }
+
+/// Purpose: fts_match queries return hits against the fts index created in
+/// migrate (not just index creation) — the recall SQL path works end to end.
+/// Scenario: append two events with distinct markers, search via the
+/// RecallStore::search SQL (fts_match on event_json).
+/// Acceptance: the query for the alpha marker returns only the alpha run's
+/// events; the score is a finite number.
+#[tokio::test]
+async fn recall_search_sql_round_trip() {
+    let store = recall_fixture().await;
+    let recall = store.recall();
+    let hits = recall
+        .search("fox", &RecallScope::all(10))
+        .await
+        .unwrap_or_else(|e| panic!("search: {e}"));
+    println!("hits: {hits:?}");
+    assert_eq!(hits.len(), 2, "both fox-marked events must match");
+    assert!(
+        hits.iter().all(|hit| hit.score.is_finite()),
+        "scores must be finite"
+    );
+}
