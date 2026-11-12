@@ -24,17 +24,18 @@ use harness_core::EventSink;
 use harness_core::model::ModelInfo;
 use harness_model::OpenAIModel;
 use harness_scheduler::Scheduler;
-use harness_transport::uds::UdsConfig;
+use harness_session::{SessionStore, turso::TursoSessionStore};
+use harness_transport::{EventLog, uds::UdsConfig};
 use harness_transport::{TransportState, http, ws};
 
 use pidlock::PidLock;
-use wire::{DaemonHandler, InMemoryEventLog};
+use wire::{DaemonHandler, StoreEventLog};
 
 /// Default UDS socket path for the v1 daemon.
 const DEFAULT_SOCKET: &str = "/tmp/harness-daemon.sock";
 /// Default HTTP+SSE / WS listen address.
 const DEFAULT_HTTP: &str = "127.0.0.1:8718";
-/// Context window assumed for models with no configured metadata; compaction
+/// Context window assumed for models with no metadata; compaction
 /// calibrates against it.
 const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 /// Queue capacity behind the single active run. v1 has no config surface for
@@ -144,6 +145,37 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Expand a leading `~`/`~/` to `$HOME` at the consumption point.  The config
+/// doc promises load-time expansion; until the loader performs it, the daemon
+/// expands here so `session.directory = "~/..."` resolves.  Returns `path`
+/// unchanged when there is no leading `~` or `$HOME` is unset.
+fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        // "~/rest" expands to $HOME/rest; a bare "~" expands to $HOME itself,
+        // falling back to a literal "~" when HOME is unset.
+        Some(rest) => format!("{}/{}", home_dir(), rest),
+        None if path == "~" => home_dir(),
+        None => path.to_string(),
+    }
+}
+
+/// `$HOME`, or a literal "~" when the variable is unset.
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "~".into())
+}
+
+/// Read the UDS bearer token from the env variable named by the config.  The
+/// config stores the variable name only; an unset or empty variable means
+/// token auth is disabled.
+fn uds_auth_token(config: &Config) -> Option<String> {
+    config
+        .session
+        .auth_token_var
+        .as_ref()
+        .and_then(|var| std::env::var(var).ok())
+        .filter(|token| !token.is_empty())
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let lock_path = PathBuf::from(format!("{}.lock", cli.socket.display()));
     let lock = PidLock::acquire(&lock_path)?;
@@ -154,9 +186,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let model = build_model(&config)?;
     let scheduler = Scheduler::new(QUEUE_CAPACITY);
-    let log = Arc::new(InMemoryEventLog::new());
-    let handler = Arc::new(DaemonHandler::new(scheduler.clone(), log.clone()));
-    let state = Arc::new(TransportState::new(handler.clone(), log));
+    let session_dir = expand_tilde(&config.session.directory);
+    // Ensure the session directory exists so `TursoSessionStore::open` can
+    // create the database file; a missing directory is a config error, not a
+    // reason to fall back to an in-memory log.
+    let has_parent = std::path::Path::new(&session_dir)
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if has_parent {
+        std::fs::create_dir_all(&session_dir)
+            .with_context(|| format!("create session directory {session_dir}"))?;
+    }
+    // Turso (libsql) embedded mode persists to a single local database file
+    // beside the session directory — named `.db` (not `.sqlite`) because the
+    // engine is libsql, not plain SQLite.
+    let store_path = PathBuf::from(&session_dir).join("sessions.db");
+    let store: Arc<dyn SessionStore> = Arc::new(
+        TursoSessionStore::open(&store_path)
+            .await
+            .with_context(|| format!("open session store at {session_dir}"))?,
+    );
+    let event_log: Arc<dyn EventLog> = Arc::new(StoreEventLog::new(store.clone()));
+    let handler = Arc::new(DaemonHandler::new(scheduler.clone(), store));
+    let state = Arc::new(TransportState::new(handler.clone(), event_log));
     handler.set_event_tx(state.event_tx.clone());
     // The builder requires an event sink, but the scheduler replaces the run's
     // sink with its bus — the transport channel is fed by the pump in wire.rs.
@@ -175,7 +227,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let uds_state = state;
     let uds_config = UdsConfig {
         socket_path: cli.socket.display().to_string(),
-        auth_token: None,
+        // The token value is read at startup from the env variable named by
+        // the config (session.auth_token_var stores the name, never the
+        // value); an unset or empty variable disables token auth.
+        auth_token: uds_auth_token(&config),
     };
     let uds_handle = tokio::spawn(async move {
         if let Err(err) = harness_transport::uds::serve_uds(uds_config, uds_state).await {

@@ -23,9 +23,12 @@ const EXIT_WAIT: Duration = Duration::from_secs(30);
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// The offline config: the upstream URL is never dialed at startup (the model
-/// adapter is lazy), so the smoke test needs no API backend.
-const SMOKE_CONFIG: &str = r#"
-version = 1
+/// adapter is lazy), so the smoke test needs no API backend. Each test gets
+/// its own `[session]` directory — two daemons otherwise race on the default
+/// `~/.local/share/harness/sessions/sessions.db` file lock.
+fn smoke_config(session_dir: &Path) -> String {
+    format!(
+        r#"version = 1
 
 [upstream]
 base_url = "http://127.0.0.1:9/v1"
@@ -34,7 +37,13 @@ api_key_var = "HARNESS_SMOKE_KEY"
 [[models.aliases]]
 name = "smoke"
 model_id = "smoke-1"
-"#;
+
+[session]
+directory = "{}"
+"#,
+        session_dir.display()
+    )
+}
 
 /// Remove the temp dir best-effort (test temp output, not user data).
 fn cleanup(dir: &Path) {
@@ -80,7 +89,7 @@ fn daemon_round_trips_a_uds_command_and_shuts_down() -> Result<(), Box<dyn std::
     let dir = std::env::temp_dir().join(format!("harness-daemon-smoke-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, SMOKE_CONFIG)?;
+    std::fs::write(&config_path, smoke_config(&dir.join("sessions")))?;
     let socket_path = dir.join("daemon.sock");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_harness-daemon"))
@@ -164,7 +173,7 @@ fn second_instance_is_rejected_by_pid_lock() -> Result<(), Box<dyn std::error::E
     let dir = std::env::temp_dir().join(format!("harness-daemon-pidlock-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, SMOKE_CONFIG)?;
+    std::fs::write(&config_path, smoke_config(&dir.join("sessions")))?;
     let socket_path = dir.join("daemon.sock");
 
     let spawn_daemon = || -> Command {
@@ -235,4 +244,169 @@ fn second_instance_is_rejected_by_pid_lock() -> Result<(), Box<dyn std::error::E
 
     cleanup(&dir);
     Ok(())
+}
+
+/// Purpose: RunEvents survive a daemon restart via the SQLite/Turso session
+/// store (issue #12's runtime bookkeeping).
+/// Scenario: daemon #1 starts with a temp session dir; a run is submitted
+/// over UDS against the dead upstream (it terminates with an error but still
+/// produces events); the daemon is SIGTERMed; daemon #2 restarts on the SAME
+/// session dir and the SAME socket; `list` is queried over UDS.
+/// Acceptance: `list` on daemon #2 contains the historical run with a
+/// `finished:` status — the event log survived the restart; both daemons
+/// exit 0 on SIGTERM; every child is killed on every path.
+#[test]
+fn daemon_persists_run_events_across_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("harness-daemon-restart-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let config_path = dir.join("config.toml");
+    std::fs::write(&config_path, smoke_config(&dir.join("sessions")))?;
+    let socket_path = dir.join("daemon.sock");
+
+    let spawn_daemon = || -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_harness-daemon"));
+        cmd.arg("--config")
+            .arg(&config_path)
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--http")
+            .arg("127.0.0.1:0")
+            .env("HARNESS_SMOKE_KEY", "smoke-key")
+            .stdout(Stdio::null());
+        cmd
+    };
+
+    let mut child1 = spawn_daemon().stderr(Stdio::inherit()).spawn()?;
+    let result = restart_body(&socket_path, &spawn_daemon, &mut child1);
+    let _ = child1.kill();
+    cleanup(&dir);
+    result
+}
+
+/// Submit a failing run, wait for it to reach a terminal status, restart the
+/// daemon, and assert `list` still reports the run from the persisted store.
+fn restart_body(
+    socket_path: &Path,
+    spawn_daemon: &dyn Fn() -> Command,
+    child1: &mut Child,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut uds = wait_socket(socket_path)?;
+    let run_id = submit_run(&mut uds, socket_path)?;
+    drop(uds);
+
+    // The upstream refuses every connection, so the run terminates quickly
+    // (transient retries exhausted -> terminal error events are persisted).
+    let terminal = wait_terminal(socket_path, &run_id)?;
+    assert!(
+        terminal.starts_with("finished:"),
+        "run must reach a terminal status, got {terminal}"
+    );
+
+    // Graceful restart on the same session directory.
+    let sent = unsafe { libc::kill(child1.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(sent, 0, "SIGTERM delivery to daemon #1 failed");
+    let status = wait_bounded_deadline(child1, EXIT_WAIT)?;
+    assert!(status.success(), "daemon #1 must exit 0, got {status}");
+
+    let mut child2 = spawn_daemon().stderr(Stdio::inherit()).spawn()?;
+    let result = assert_history_after_restart(socket_path, &run_id);
+    let _ = child2.kill();
+    result
+}
+
+/// Wait (bounded) for the socket, submit a run, return its id.
+fn wait_socket(socket_path: &Path) -> Result<UnixStream, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + SOCKET_WAIT;
+    loop {
+        match UnixStream::connect(socket_path) {
+            Ok(conn) => return Ok(conn),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Send one NDJSON request and read one NDJSON reply.
+fn round_trip(stream: &mut UnixStream, request: &str) -> Result<String, std::io::Error> {
+    use std::io::Write;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    Ok(line)
+}
+
+/// Submit a run over UDS and return the run id from the reply.
+fn submit_run(
+    stream: &mut UnixStream,
+    socket_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let reply = round_trip(
+        stream,
+        r#"{"jsonrpc":"2.0","method":"run","params":{"task":"smoke persistence run"},"id":1}"#,
+    )
+    .map_err(|err| format!("run submit failed on {socket_path:?}: {err}"))?;
+    let response: serde_json::Value = serde_json::from_str(reply.trim())?;
+    response["result"]["run_id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("no run_id in reply: {reply}").into())
+}
+
+/// Poll `status` (bounded) until the run reaches a terminal status.
+fn wait_terminal(socket_path: &Path, run_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut stream = UnixStream::connect(socket_path)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","method":"status","params":{{"run_id":"{run_id}"}},"id":2}}"#
+        );
+        let reply = round_trip(&mut stream, &request)?;
+        let response: serde_json::Value = serde_json::from_str(reply.trim())?;
+        if let Some(status) = response["result"]["status"].as_str()
+            && status.starts_with("finished:")
+        {
+            return Ok(status.to_string());
+        }
+        if Instant::now() > deadline {
+            return Err(format!("run {run_id} never reached a terminal status").into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// After the restart, `list` must report the historical run from the store.
+fn assert_history_after_restart(
+    socket_path: &Path,
+    run_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + SOCKET_WAIT;
+    loop {
+        match UnixStream::connect(socket_path) {
+            Ok(mut stream) => {
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let reply = round_trip(&mut stream, r#"{"jsonrpc":"2.0","method":"list","id":3}"#)?;
+                let response: serde_json::Value = serde_json::from_str(reply.trim())?;
+                let runs = response["result"]["runs"]
+                    .as_array()
+                    .ok_or("no runs array")?;
+                let hit = runs.iter().any(|run| {
+                    run["run_id"].as_str() == Some(run_id)
+                        && run["status"]
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("finished:"))
+                });
+                assert!(
+                    hit,
+                    "historical run {run_id} must survive the restart, got {runs:?}"
+                );
+                return Ok(());
+            }
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return Err("daemon #2 socket never appeared".into()),
+        }
+    }
 }

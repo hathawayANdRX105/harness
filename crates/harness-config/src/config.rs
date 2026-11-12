@@ -166,6 +166,11 @@ pub struct SessionConfig {
     /// the `HOME` env var. Defaults to `~/.local/share/harness/sessions`.
     #[serde(default = "default_session_dir")]
     pub directory: String,
+    /// Environment variable name holding the UDS bearer token (read by the
+    /// daemon at startup). Stores the variable name only — never the token
+    /// value itself. `None` disables UDS token authentication.
+    #[serde(default)]
+    pub auth_token_var: Option<String>,
 }
 
 /// Default session persistence directory (under `$HOME`, expanded at load
@@ -180,6 +185,10 @@ impl fmt::Debug for SessionConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionConfig")
             .field("directory", &self.directory)
+            .field(
+                "auth_token_var",
+                &self.auth_token_var.as_ref().map(|_| "*masked*"),
+            )
             .finish()
     }
 }
@@ -188,6 +197,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             directory: default_session_dir(),
+            auth_token_var: None,
         }
     }
 }

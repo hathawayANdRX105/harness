@@ -4,7 +4,7 @@
 //! [`DaemonHandler`] maps slash commands onto the scheduler: `run` submits a
 //! run assembled by the builder, `cancel` / `status` / `list` read scheduler
 //! state, `steer` is rejected until the scheduler exposes steering. Events
-//! flow loop → bus → a per-run pump task that appends into the in-memory log
+//! flow loop → bus → a per-run pump task that appends into the session store
 //! and forwards into the transport broadcast channel, so every transport
 //! client sees every event.
 //!
@@ -18,22 +18,21 @@
 //!   terminal instead of giving up after a fixed cap, so queued runs never
 //!   lose events silently.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use harness_builder::AssembledRuntime;
 use harness_core::RunEvent;
+use harness_core::event::RunEventKind;
 use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, SessionId, Task};
 use harness_core::tool::ToolRequest;
 use harness_scheduler::bus::ReceiveError;
 use harness_scheduler::{EventBus, RunRequest, RunStatus, Scheduler, Subscription};
+use harness_session::{SessionStore, SessionStoreError};
 use harness_transport::{CommandHandler, EventLog, SlashCommand, TransportError};
 
-/// Per-run retention cap of the in-memory event log (trimmed from the head).
-const EVENT_LOG_CAP: usize = 10_000;
 /// Delay between bus-channel polls while a queued run has no channel yet.
 const BUS_CHANNEL_POLL: Duration = Duration::from_millis(10);
 
@@ -53,47 +52,33 @@ fn unix_millis() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// In-memory per-run event log backing the transport [`EventLog`] seam.
-///
-/// v1 keeps events in process memory; SQLite-backed replay through the session
-/// crate (#12) is the follow-up. Retention is capped per run and trimmed from
-/// the head so a long-lived daemon stays bounded.
-#[derive(Default)]
-pub struct InMemoryEventLog {
-    events: Mutex<HashMap<RunId, Vec<RunEvent>>>,
+/// Transport [`EventLog`] backed by the persistent [`SessionStore`]: replays
+/// past runs' events from the session store so reconnection survives daemon
+/// restarts. One store backs both the handler's bookkeeping appends and this
+/// seam's reads, so there is a single source of truth for the event log.
+pub struct StoreEventLog {
+    store: Arc<dyn SessionStore>,
 }
 
-impl InMemoryEventLog {
-    /// Create an empty log.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn append(&self, run_id: &RunId, event: RunEvent) {
-        let mut events = lock(&self.events);
-        let bucket = events.entry(run_id.clone()).or_default();
-        if bucket.len() >= EVENT_LOG_CAP {
-            bucket.remove(0);
-        }
-        bucket.push(event);
-    }
-
-    /// Drop a finished run's event bucket so the log stays bounded.
-    pub fn retire(&self, run_id: &RunId) {
-        let mut events = lock(&self.events);
-        events.remove(run_id);
+impl StoreEventLog {
+    /// Wrap a session store as the transport [`EventLog`] seam.
+    pub fn new(store: Arc<dyn SessionStore>) -> Self {
+        Self { store }
     }
 }
-impl EventLog for InMemoryEventLog {
-    fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent> {
-        let events = lock(&self.events);
-        events
-            .get(run_id)
-            .map(|bucket| {
-                bucket
-                    .iter()
+#[async_trait::async_trait]
+impl EventLog for StoreEventLog {
+    /// Return the run's persisted events with `seq` strictly greater than
+    /// `after_seq`, in ascending order.  Read failures yield an empty replay
+    /// window rather than failing the connection.
+    async fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent> {
+        self.store
+            .events_for_run(run_id)
+            .await
+            .map(|events| {
+                events
+                    .into_iter()
                     .filter(|event| event.seq > after_seq)
-                    .cloned()
                     .collect()
             })
             .unwrap_or_default()
@@ -130,20 +115,20 @@ pub struct DaemonHandler {
     runtime: OnceLock<AssembledRuntime>,
     event_tx: OnceLock<tokio::sync::broadcast::Sender<RunEvent>>,
     runs: Arc<Mutex<Vec<RunId>>>,
-    log: Arc<InMemoryEventLog>,
+    store: Arc<dyn SessionStore>,
     run_counter: AtomicU64,
 }
 
 impl DaemonHandler {
     /// Create the handler; the runtime and the event channel are wired right
     /// after construction, before the transports start listening.
-    pub fn new(scheduler: Scheduler, log: Arc<InMemoryEventLog>) -> Self {
+    pub fn new(scheduler: Scheduler, store: Arc<dyn SessionStore>) -> Self {
         Self {
             scheduler,
             runtime: OnceLock::new(),
             event_tx: OnceLock::new(),
             runs: Arc::new(Mutex::new(Vec::new())),
-            log,
+            store,
             run_counter: AtomicU64::new(0),
         }
     }
@@ -192,9 +177,25 @@ impl DaemonHandler {
             .get()
             .ok_or_else(|| TransportError::Internal("runtime not assembled yet".into()))?;
         let run_id = RunId(self.fresh_run_id());
+        let session_id = SessionId("default".into());
+        // Ensure the session row exists before the run starts: the session is
+        // the run's durable anchor across restarts; re-creation is idempotent.
+        // The CommandHandler seam is sync, so drive the async store call on
+        // the current thread without a tokio reactor (block_in_place).
+        match tokio::task::block_in_place(|| {
+            futures::executor::block_on(self.store.create_session(&session_id))
+        }) {
+            Ok(()) => {}
+            Err(SessionStoreError::SessionAlreadyExists(_)) => {}
+            Err(e) => {
+                return Err(TransportError::Internal(format!(
+                    "ensure session failed: {e}"
+                )));
+            }
+        }
         let ctx = RunContext {
             run_id: run_id.clone(),
-            session_id: SessionId("default".into()),
+            session_id,
             task: Task {
                 description: task,
                 source: None,
@@ -219,19 +220,18 @@ impl DaemonHandler {
         };
         let bus = self.scheduler.events().clone();
         let scheduler = self.scheduler.clone();
-        let log = self.log.clone();
+        let store = self.store.clone();
         let runs = self.runs.clone();
         tokio::spawn(async move {
             let Some(mut sub) = wait_for_channel(&bus, &scheduler, &run_id).await else {
                 eprintln!("daemon: run {run_id} never registered on the bus; events lost");
-                log.retire(&run_id);
                 Self::prune_run(&runs, &run_id);
                 return;
             };
             loop {
                 match sub.recv().await {
                     Ok(event) => {
-                        log.append(&run_id, event.clone());
+                        persist_event(&store, &run_id, &event).await;
                         let _ = tx.send(event);
                     }
                     Err(ReceiveError::Lagged(skipped)) => {
@@ -240,7 +240,9 @@ impl DaemonHandler {
                     Err(ReceiveError::Closed) => break,
                 }
             }
-            log.retire(&run_id);
+            // The loop emits `RunFinished` (carrying the stop reason) on every
+            // terminal path and the pump persisted it above, so Close only
+            // drops this run from in-memory bookkeeping.
             Self::prune_run(&runs, &run_id);
         });
     }
@@ -262,23 +264,56 @@ impl DaemonHandler {
 
     fn status(&self, run_id: &str) -> Result<serde_json::Value, TransportError> {
         let run_id = RunId(run_id.to_string());
-        let status = self
-            .scheduler
-            .status(&run_id)
-            .ok_or_else(|| TransportError::NoActiveRun(run_id.0.clone()))?;
-        Ok(serde_json::json!({ "run_id": run_id.0, "status": status_label(&status) }))
+        if let Some(status) = self.scheduler.status(&run_id) {
+            return Ok(serde_json::json!({ "run_id": run_id.0, "status": status_label(&status) }));
+        }
+        // Not known to the scheduler (e.g. after a restart): a finished run's
+        // events survive in the store, so report its last recorded status.
+        let events = match tokio::task::block_in_place(|| {
+            futures::executor::block_on(self.store.events_for_run(&run_id))
+        }) {
+            Ok(events) => events,
+            Err(e) => {
+                return Err(TransportError::Internal(format!(
+                    "load run events failed: {e}"
+                )));
+            }
+        };
+        let event = match events.last() {
+            Some(event) => event.clone(),
+            None => return Err(TransportError::NoActiveRun(run_id.0)),
+        };
+        Ok(serde_json::json!({
+            "run_id": run_id.0,
+            "status": event_status_label(&event.kind),
+        }))
     }
 
     fn list(&self) -> serde_json::Value {
         let runs = lock(&self.runs);
-        let items = runs
+        let mut items: Vec<serde_json::Value> = runs
             .iter()
             .filter_map(|id| {
                 self.scheduler.status(id).map(
                     |status| serde_json::json!({ "run_id": id.0, "status": status_label(&status) }),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
+        // Historical runs: runs whose events survived in the store but are no
+        // longer tracked in memory (after a restart, for example).  Merge
+        // them in so `list` shows past runs across restarts.
+        let historical =
+            tokio::task::block_in_place(|| futures::executor::block_on(self.store.run_ids()))
+                .unwrap_or_default();
+        for id in historical {
+            if runs.iter().any(|active| active == &id) {
+                continue;
+            }
+            items.push(serde_json::json!({
+                "run_id": id.0,
+                "status": historical_status(&self.store, &id),
+            }));
+        }
         serde_json::json!({ "runs": items })
     }
 }
@@ -322,5 +357,44 @@ fn status_label(status: &RunStatus) -> String {
         RunStatus::Running => "running".into(),
         RunStatus::Queued { position } => format!("queued:{position}"),
         RunStatus::Finished(reason) => format!("finished:{reason:?}"),
+    }
+}
+
+/// Persist one event to the session store.  A persistence failure is logged
+/// and swallowed: it must not drop the live broadcast, and event sequence
+/// numbers are owned by the loop, so a retry would risk a duplicate-seq
+/// error against the append-only log.
+async fn persist_event(store: &Arc<dyn SessionStore>, run_id: &RunId, event: &RunEvent) {
+    let store = store.clone();
+    let run_id = run_id.clone();
+    let event = event.clone();
+    match store.append_event(&event).await {
+        Ok(()) => {}
+        Err(e) => eprintln!("daemon: failed to persist event for run {run_id}: {e}"),
+    }
+}
+
+/// Last recorded status of a historical run, derived from its final event.
+/// The loop emits `RunFinished` (carrying the stop reason) on every terminal
+/// path, so a run present in the store but no longer scheduled is reported
+/// as finished; an unreachable run is reported as unknown.
+fn historical_status(store: &Arc<dyn SessionStore>, run_id: &RunId) -> String {
+    let event = match tokio::task::block_in_place(|| {
+        futures::executor::block_on(store.events_for_run(run_id))
+    }) {
+        Ok(events) => match events.last() {
+            Some(event) => event.clone(),
+            None => return "finished:unknown".into(),
+        },
+        Err(_) => return "finished:unknown".into(),
+    };
+    event_status_label(&event.kind)
+}
+
+/// Human-facing label for the last event of a historical run.
+fn event_status_label(kind: &RunEventKind) -> String {
+    match kind {
+        RunEventKind::RunFinished { reason } => format!("finished:{reason:?}"),
+        _ => "finished".into(),
     }
 }

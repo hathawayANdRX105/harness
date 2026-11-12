@@ -17,7 +17,7 @@
 //! | Trait | Purpose | Implemented by |
 //! |---|---|---|
 //! | [`CommandHandler`] | Maps a parsed [`SlashCommand`] to a JSON-RPC response value | Daemon (#13) |
-//! | [`EventLog`] | Reads persisted events by sequence number for replay | Scheduler/session (#11) |
+//! | [`EventLog`] | Reads persisted events by sequence number for replay | Session (#12) |
 //!
 //! # Transport modules
 //!
@@ -46,10 +46,12 @@ pub mod ws;
 
 use std::sync::Arc;
 
+use crate::frame::{JsonRpcResponse, error_code};
+use async_trait::async_trait;
 use harness_core::{EventSink, RunEvent, RunId};
+use serde_json::json;
 use thiserror::Error;
 
-pub use frame::{JsonRpcRequest, JsonRpcResponse, RpcError, error_code, run_event_to_sse};
 pub use slash::{
     ParseSlashError, SlashCommand, command_from_jsonrpc, parse_slash, slash_to_jsonrpc,
 };
@@ -100,7 +102,7 @@ impl TransportState {
 /// An [`EventSink`] that pushes into the transport's broadcast channel.
 ///
 /// The run loop uses this as its event output; the transport layer receives
-/// every emitted event and fans it out to all connected clients.
+/// every event and fans it out to all connected clients.
 #[derive(Clone)]
 pub struct BroadcastSink {
     tx: tokio::sync::broadcast::Sender<RunEvent>,
@@ -137,10 +139,11 @@ pub trait CommandHandler: Send + Sync + 'static {
 /// When a WebSocket or SSE client reconnects with `after_seq`, the
 /// transport calls [`read_events_since`] to replay the missed window
 /// before subscribing to the live broadcast.
+#[async_trait]
 pub trait EventLog: Send + Sync + 'static {
     /// Return all events for `run_id` whose `seq` is strictly greater than
     /// `after_seq`, in ascending order.
-    fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent>;
+    async fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent>;
 }
 
 // ── Error type ────────────────────────────────────────────────────────────
@@ -151,28 +154,26 @@ pub trait EventLog: Send + Sync + 'static {
 /// transport can build a typed error frame without string-matching.
 #[derive(Debug, Error)]
 pub enum TransportError {
-    /// The command name is not recognised.
-    #[error("unknown command: {0}")]
-    UnknownCommand(String),
-    /// A required parameter is missing or malformed.
-    #[error("invalid parameters: {0}")]
-    InvalidParams(String),
-    /// The referenced run does not exist or has already ended.
+    /// The requested run is unknown (not currently scheduled).
     #[error("no active run: {0}")]
     NoActiveRun(String),
-    /// An internal error occurred (serialisation, I/O, …).
-    #[error("internal error: {0}")]
+
+    /// The requested command is unknown or unsupported.
+    #[error("unknown command: {0}")]
+    UnknownCommand(String),
+
+    /// An internal daemon error not covered by the typed variants above.
+    #[error("internal: {0}")]
     Internal(String),
 }
 
 impl TransportError {
-    /// Map this error to a JSON-RPC error code.
+    /// JSON-RPC error code for this error type.
     pub fn code(&self) -> i32 {
         match self {
-            Self::UnknownCommand(_) => error_code::METHOD_NOT_FOUND,
-            Self::InvalidParams(_) => error_code::INVALID_PARAMS,
-            Self::NoActiveRun(_) => error_code::NO_ACTIVE_RUN,
-            Self::Internal(_) => error_code::INTERNAL_ERROR,
+            TransportError::NoActiveRun(_) => error_code::NO_ACTIVE_RUN,
+            TransportError::UnknownCommand(_) => error_code::UNKNOWN_COMMAND,
+            TransportError::Internal(_) => error_code::INTERNAL_ERROR,
         }
     }
 }
@@ -189,8 +190,9 @@ pub fn dispatch_command(
     cmd: SlashCommand,
     request_id: u64,
 ) -> JsonRpcResponse {
-    match handler.handle(cmd) {
-        Ok(result) => JsonRpcResponse::success(request_id, result),
+    let result = handler.handle(cmd);
+    match result {
+        Ok(value) => JsonRpcResponse::success(request_id, json!(value)),
         Err(err) => JsonRpcResponse::error(request_id, err.code(), err.to_string()),
     }
 }

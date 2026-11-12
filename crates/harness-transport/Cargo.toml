@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 harness-core = { path = "../harness-core" }
+async-trait = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 axum = { version = "0.8", features = ["ws", "json", "macros"] }
 tokio = { version = "1", default-features = false, features = [
     "net",

@@ -13,10 +13,17 @@ harness-builder = { path = "../harness-builder" }
 harness-model = { path = "../harness-model" }
 harness-loop = { path = "../harness-loop" }
 harness-scheduler = { path = "../harness-scheduler" }
+harness-session = { path = "../harness-session" }
 harness-transport = { path = "../harness-transport" }
 # tokio: the daemon owns the runtime — transport servers, signal watchers and
 # the event pump all live on it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time", "sync", "fs"] }
+# futures: block_on for driving the async session store from the sync
+# CommandHandler seam.
+futures = "0.3"
+# async-trait: implement the transport EventLog trait (async fn) on the sync
+# CommandHandler seam.
+async-trait = "0.1"
 # clap: the daemon's CLI surface (--config/--socket/--http) — declarative
 # args with free --help/--version and typed value parsing.
 clap = { version = "4", features = ["derive"] }

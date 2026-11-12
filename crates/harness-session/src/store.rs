@@ -19,8 +19,10 @@
 //! # Hard constraint
 //!
 //! Implementations must be `Send + Sync + 'static` so they can be shared
-//! across task boundaries. The SQLite default uses a `Mutex<Connection>`.
+//! across task boundaries. All port methods are `async` — the daemon pump
+//! awaits them directly; no `spawn_blocking` wrappers are needed.
 
+use async_trait::async_trait;
 use harness_core::event::RunEvent;
 use harness_core::message::Message;
 use harness_core::run::{RunId, SessionId};
@@ -43,6 +45,11 @@ pub enum SessionStoreError {
     /// Message or event serialization to/from JSON failed.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// The run already carries an event with this seq (append-only log:
+    /// re-applying an already-persisted event is a no-op, not an error).
+    #[error("run {0} already has an event at seq {1}")]
+    DuplicateSeq(RunId, u64),
 
     /// An internal invariant was violated (e.g. corrupt data).
     #[error("internal error: {0}")]
@@ -75,29 +82,32 @@ pub struct MessageEntry {
 /// Every method returns `Result` with [`SessionStoreError`]. Storage
 /// backends are expected to be reachable; a missing database is a hard
 /// error, not a degraded-path skip.
+#[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
     /// Create a new, empty session.
     ///
     /// Returns [`SessionStoreError::SessionAlreadyExists`] when a session
     /// with `id` already exists.
-    fn create_session(&self, id: &SessionId) -> Result<(), SessionStoreError>;
+    async fn create_session(&self, id: &SessionId) -> Result<(), SessionStoreError>;
 
     /// Return `true` when a session with this id exists.
-    fn session_exists(&self, id: &SessionId) -> Result<bool, SessionStoreError>;
+    async fn session_exists(&self, id: &SessionId) -> Result<bool, SessionStoreError>;
 
     /// Append a message to the session's transcript ledger.
     ///
     /// The store assigns the next monotonic sequence number. Returns the
     /// assigned seq.
-    fn append_message(
+    async fn append_message(
         &self,
         session_id: &SessionId,
         message: &Message,
     ) -> Result<u64, SessionStoreError>;
 
     /// Load every message for a session, ordered by sequence number.
-    fn load_messages(&self, session_id: &SessionId)
-    -> Result<Vec<MessageEntry>, SessionStoreError>;
+    async fn load_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<MessageEntry>, SessionStoreError>;
 
     /// Replay the message ledger to reconstruct the full transcript.
     ///
@@ -110,26 +120,39 @@ pub trait SessionStore: Send + Sync + 'static {
     /// any system messages were recorded) followed by all non-system
     /// messages (User, Assistant, ToolResult) in playback order. This is
     /// the complete transcript ready to be sent to the model.
-    fn replay_ledger(&self, session_id: &SessionId) -> Result<Vec<Message>, SessionStoreError>;
+    async fn replay_ledger(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<Message>, SessionStoreError>;
 
     /// Append an event to a run's event log.
     ///
     /// The event's `seq` is assigned by the emitter (the loop or scheduler),
     /// not by the store. The store asserts that the seq is new per run.
-    fn append_event(&self, event: &RunEvent) -> Result<(), SessionStoreError>;
+    /// Re-applying an event whose `idempotency_key` (run_id + seq) is already
+    /// present is a no-op: the stored row is returned and nothing is written.
+    async fn append_event(&self, event: &RunEvent) -> Result<(), SessionStoreError>;
 
     /// Load every event for a run, ordered by sequence number.
-    fn events_for_run(&self, run_id: &RunId) -> Result<Vec<RunEvent>, SessionStoreError>;
+    async fn events_for_run(&self, run_id: &RunId) -> Result<Vec<RunEvent>, SessionStoreError>;
 
     /// Find gaps in a run's event sequence.
     ///
     /// Returns the missing sequence numbers (contiguous gaps in `1..=max`).
     /// Returns an empty vec when the sequence is contiguous or when there
     /// are no events for the run.
-    fn check_event_gaps(&self, run_id: &RunId) -> Result<Vec<u64>, SessionStoreError>;
+    async fn check_event_gaps(&self, run_id: &RunId) -> Result<Vec<u64>, SessionStoreError>;
+
+    /// Return the ids of every run that has at least one persisted event,
+    /// latest run first (by the most recent event's row id).
+    ///
+    /// There is no separate runs table: runs are derivable from the event
+    /// log (`DISTINCT run_id` over `run_events`), which is what makes the
+    /// daemon's restart hydration possible without a second schema object.
+    async fn run_ids(&self) -> Result<Vec<RunId>, SessionStoreError>;
 
     /// Delete a session and all its data (messages and events).
-    fn delete_session(&self, id: &SessionId) -> Result<(), SessionStoreError>;
+    async fn delete_session(&self, id: &SessionId) -> Result<(), SessionStoreError>;
 }
 
 /// Default replay implementation: accumulate system sections by replay order,
