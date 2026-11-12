@@ -18,8 +18,8 @@ use futures::future::join_all;
 use harness_core::event::{RunEvent, RunEventKind};
 use harness_core::message::{ToolCall, ToolResultMessage};
 use harness_core::policy::{
-    ApprovalBroker, ApprovalResult, ExecutionStatus, PolicyOutcome, PolicyStage, ToolExecution,
-    ToolPolicy,
+    ApprovalBroker, ApprovalResult, ExecutionStatus, PolicyDecision, PolicyOutcome, PolicyStage,
+    ToolExecution, ToolPolicy,
 };
 use harness_core::run::{RunContext, RunId, RunStopReason, SessionId};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult};
@@ -49,11 +49,12 @@ pub(crate) struct DispatchOutcome {
     pub terminal: Option<RunStopReason>,
 }
 
-/// Run one tool through the full pipeline: policy -> approval -> execute -> after-policy.
+/// Run one tool through the full pipeline: before-hook, before-stage policy,
+/// approval (if required), execution, after-stage policy, result message.
 ///
 /// Every failure is captured as a `ToolResultMessage` with `is_error: true`;
-/// the function only returns a terminal condition for cancellation (approval
-/// or tool-level) -- errors from execution do not abort the run.
+/// the function only surfaces a terminal condition for cancellation (approval
+/// or tool-level) -- execution errors do not abort the run.
 async fn dispatch_one(call: &ToolCall, tcx: &DispatchCtx<'_>) -> DispatchOutcome {
     let request = ToolRequest {
         call_id: call.id.clone(),
@@ -65,168 +66,26 @@ async fn dispatch_one(call: &ToolCall, tcx: &DispatchCtx<'_>) -> DispatchOutcome
     };
 
     // --- Hook: before_tool_call ---
-    if let Some(ref hook) = tcx.hooks.before_tool_call
+    if let Some(hook) = &tcx.hooks.before_tool_call
         && let Err(reason) = hook(&request)
     {
-        return DispatchOutcome {
-            result_msg: ToolResultMessage {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                content: reason,
-                is_error: true,
-            },
-            terminal: None,
-        };
+        return error_result(call, reason);
     }
 
     // --- Before-stage policy ---
-    let before_decision = tcx.policy.decide(PolicyStage::BeforeTool, &request, None);
-    emit_event(
-        tcx.sink,
-        &tcx.ctx.run_id,
-        &tcx.ctx.session_id,
-        tcx.seq,
-        RunEventKind::PolicyDecided {
-            stage: PolicyStage::BeforeTool,
-            outcome: before_decision.outcome,
-            reason: before_decision.reason.clone(),
-        },
-    );
+    let before_decision = before_policy(tcx, &request);
 
     // --- Approval (if policy requires it) ---
-    match before_decision.outcome {
-        PolicyOutcome::Allow => {}
-        PolicyOutcome::RequireApproval => {
-            let Some(broker) = tcx.approval_broker else {
-                return DispatchOutcome {
-                    result_msg: ToolResultMessage {
-                        tool_call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        content: format!(
-                            "tool `{}` requires approval but no broker is configured",
-                            call.name
-                        ),
-                        is_error: true,
-                    },
-                    terminal: None,
-                };
-            };
-
-            emit_event(
-                tcx.sink,
-                &tcx.ctx.run_id,
-                &tcx.ctx.session_id,
-                tcx.seq,
-                RunEventKind::ApprovalRequested {
-                    call_id: call.id.clone(),
-                },
-            );
-
-            let result = broker
-                .request(&request, &before_decision, &tcx.control.cancel_token())
-                .await;
-
-            emit_event(
-                tcx.sink,
-                &tcx.ctx.run_id,
-                &tcx.ctx.session_id,
-                tcx.seq,
-                RunEventKind::ApprovalResolved {
-                    call_id: call.id.clone(),
-                    result: result.clone(),
-                },
-            );
-
-            match result {
-                ApprovalResult::Denied { reason } => {
-                    return DispatchOutcome {
-                        result_msg: ToolResultMessage {
-                            tool_call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            content: reason,
-                            is_error: true,
-                        },
-                        terminal: None,
-                    };
-                }
-                ApprovalResult::Cancelled => {
-                    return DispatchOutcome {
-                        result_msg: ToolResultMessage {
-                            tool_call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            content: String::new(),
-                            is_error: true,
-                        },
-                        terminal: Some(RunStopReason::Cancelled),
-                    };
-                }
-                _ => {} // Approved or future variants -- continue to execution.
-            }
-        }
-        PolicyOutcome::Deny => {
-            return DispatchOutcome {
-                result_msg: ToolResultMessage {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    content: before_decision.reason.clone(),
-                    is_error: true,
-                },
-                terminal: None,
-            };
-        }
+    match approval_stage(tcx, call, &request, &before_decision).await {
+        Ok(()) => {}
+        Err(outcome) => return outcome,
     }
 
     // --- Execute ---
-    let Some(tool) = tcx.tools.iter().find(|t| t.name() == call.name) else {
-        return DispatchOutcome {
-            result_msg: ToolResultMessage {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name.clone(),
-                content: format!("tool `{}` is not registered", call.name),
-                is_error: true,
-            },
-            terminal: None,
-        };
+    let tool_result = match execute_stage(tcx, call).await {
+        Ok(tool_result) => tool_result,
+        Err(outcome) => return outcome,
     };
-
-    emit_event(
-        tcx.sink,
-        &tcx.ctx.run_id,
-        &tcx.ctx.session_id,
-        tcx.seq,
-        RunEventKind::ToolStarted {
-            call_id: call.id.clone(),
-            name: call.name.clone(),
-        },
-    );
-
-    let tool_result = tool
-        .invoke(call.args.clone(), &tcx.control.cancel_token())
-        .await;
-
-    let (tool_result, terminal) = match tool_result {
-        Ok(r) => (r, None),
-        Err(ToolError::Cancelled) => {
-            return DispatchOutcome {
-                result_msg: ToolResultMessage {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    content: "tool call was cancelled".into(),
-                    is_error: true,
-                },
-                terminal: Some(RunStopReason::Cancelled),
-            };
-        }
-        Err(e) => (
-            ToolResult {
-                content: e.to_string(),
-                is_error: true,
-                trace: None,
-            },
-            None,
-        ),
-    };
-
     let is_error = tool_result.is_error;
 
     emit_event(
@@ -241,7 +100,142 @@ async fn dispatch_one(call: &ToolCall, tcx: &DispatchCtx<'_>) -> DispatchOutcome
         },
     );
 
-    // --- After-stage policy ---
+    // --- After-stage policy + result message ---
+    let result_msg = after_stage(tcx, call, &request, &before_decision, tool_result);
+
+    DispatchOutcome {
+        result_msg,
+        terminal: None,
+    }
+}
+
+/// Before-stage policy: decide `BeforeTool` and emit the `PolicyDecided` event.
+fn before_policy(tcx: &DispatchCtx<'_>, request: &ToolRequest) -> PolicyDecision {
+    let before_decision = tcx.policy.decide(PolicyStage::BeforeTool, request, None);
+    emit_event(
+        tcx.sink,
+        &tcx.ctx.run_id,
+        &tcx.ctx.session_id,
+        tcx.seq,
+        RunEventKind::PolicyDecided {
+            stage: PolicyStage::BeforeTool,
+            outcome: before_decision.outcome,
+            reason: before_decision.reason.clone(),
+        },
+    );
+    before_decision
+}
+
+/// Approval gate: when the before-stage policy requires approval, ask the
+/// broker and translate the answer into a continue/stop signal.
+///
+/// No broker configured => fail closed with an error result. Denial => error
+/// result. Broker cancellation => terminal `Cancelled`.
+async fn approval_stage(
+    tcx: &DispatchCtx<'_>,
+    call: &ToolCall,
+    request: &ToolRequest,
+    before: &PolicyDecision,
+) -> Result<(), DispatchOutcome> {
+    match before.outcome {
+        PolicyOutcome::Allow => Ok(()),
+        PolicyOutcome::Deny => Err(error_result(call, before.reason.clone())),
+        PolicyOutcome::RequireApproval => {
+            let Some(broker) = tcx.approval_broker.as_ref() else {
+                return Err(error_result(
+                    call,
+                    format!(
+                        "tool `{}` requires approval but no broker is configured",
+                        call.name
+                    ),
+                ));
+            };
+
+            emit_event(
+                tcx.sink,
+                &tcx.ctx.run_id,
+                &tcx.ctx.session_id,
+                tcx.seq,
+                RunEventKind::ApprovalRequested {
+                    call_id: call.id.clone(),
+                },
+            );
+
+            let result = broker
+                .request(request, before, &tcx.control.cancel_token())
+                .await;
+
+            emit_event(
+                tcx.sink,
+                &tcx.ctx.run_id,
+                &tcx.ctx.session_id,
+                tcx.seq,
+                RunEventKind::ApprovalResolved {
+                    call_id: call.id.clone(),
+                    result: result.clone(),
+                },
+            );
+
+            match result {
+                ApprovalResult::Denied { reason } => Err(error_result(call, reason)),
+                ApprovalResult::Cancelled => Err(cancelled_result(call)),
+                // Approved or future variants -- continue to execution.
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// Execute one tool: resolve registration, emit `ToolStarted`, invoke, and
+/// map outcomes. Cancellation is terminal; other failures become error results.
+async fn execute_stage(
+    tcx: &DispatchCtx<'_>,
+    call: &ToolCall,
+) -> Result<ToolResult, DispatchOutcome> {
+    let Some(tool) = tcx.tools.iter().find(|t| t.name() == call.name) else {
+        return Err(error_result(
+            call,
+            format!("tool `{}` is not registered", call.name),
+        ));
+    };
+
+    emit_event(
+        tcx.sink,
+        &tcx.ctx.run_id,
+        &tcx.ctx.session_id,
+        tcx.seq,
+        RunEventKind::ToolStarted {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+        },
+    );
+
+    match tool
+        .invoke(call.args.clone(), &tcx.control.cancel_token())
+        .await
+    {
+        Ok(r) => Ok(r),
+        Err(ToolError::Cancelled) => Err(cancelled_result(call)),
+        Err(e) => Ok(ToolResult {
+            content: e.to_string(),
+            is_error: true,
+            trace: None,
+        }),
+    }
+}
+
+/// After-stage policy decision, output suffix, and result message: decide
+/// `AfterTool`, apply the winning `output_suffix`, run the `after_tool_call`
+/// hook, and build the `ToolResultMessage`.
+fn after_stage(
+    tcx: &DispatchCtx<'_>,
+    call: &ToolCall,
+    request: &ToolRequest,
+    before: &PolicyDecision,
+    tool_result: ToolResult,
+) -> ToolResultMessage {
+    let is_error = tool_result.is_error;
+
     let execution = ToolExecution {
         status: if is_error {
             ExecutionStatus::Error
@@ -252,7 +246,7 @@ async fn dispatch_one(call: &ToolCall, tcx: &DispatchCtx<'_>) -> DispatchOutcome
     };
     let after_decision = tcx
         .policy
-        .decide(PolicyStage::AfterTool, &request, Some(&execution));
+        .decide(PolicyStage::AfterTool, request, Some(&execution));
     emit_event(
         tcx.sink,
         &tcx.ctx.run_id,
@@ -265,12 +259,13 @@ async fn dispatch_one(call: &ToolCall, tcx: &DispatchCtx<'_>) -> DispatchOutcome
         },
     );
 
-    // Apply output_suffix from either decision.
+    // Apply `output_suffix` from either decision: the after-stage decision
+    // wins when both stages set one.
     let mut content = tool_result.content;
     let suffix = after_decision
         .output_suffix
         .as_deref()
-        .or(before_decision.output_suffix.as_deref());
+        .or(before.output_suffix.as_deref());
     if let Some(s) = suffix {
         if !content.is_empty() {
             content.push('\n');
@@ -285,14 +280,37 @@ async fn dispatch_one(call: &ToolCall, tcx: &DispatchCtx<'_>) -> DispatchOutcome
         is_error,
     };
 
-    // --- Hook: after_tool_call ---
-    if let Some(ref hook) = tcx.hooks.after_tool_call {
-        hook(&request, &result_msg);
+    // Hook: after_tool_call observes the finished call.
+    if let Some(hook) = &tcx.hooks.after_tool_call {
+        hook(request, &result_msg);
     }
 
+    result_msg
+}
+
+/// Error result message for one tool call: `is_error: true`, never terminal.
+fn error_result(call: &ToolCall, reason: String) -> DispatchOutcome {
     DispatchOutcome {
-        result_msg,
-        terminal,
+        result_msg: ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: reason,
+            is_error: true,
+        },
+        terminal: None,
+    }
+}
+
+/// Terminal cancelled result message for one tool call.
+fn cancelled_result(call: &ToolCall) -> DispatchOutcome {
+    DispatchOutcome {
+        result_msg: ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: String::new(),
+            is_error: true,
+        },
+        terminal: Some(RunStopReason::Cancelled),
     }
 }
 
