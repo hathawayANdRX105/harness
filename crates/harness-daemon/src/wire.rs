@@ -1,23 +1,12 @@
 //! The daemon's transport seams: the real [`CommandHandler`] and the v1
 //! [`EventLog`].
-//!
-//! [`DaemonHandler`] maps slash commands onto the scheduler: `run` submits a
-//! run assembled by the builder, `cancel` / `status` / `list` read scheduler
-//! state, `steer` is rejected until the scheduler exposes steering. Events
-//! flow loop → bus → a per-run pump task that appends into the session store
-//! and forwards into the transport broadcast channel, so every transport
-//! client sees every event.
-//!
-//! v1 notes (both reported to the maintainer, not silent):
-//! - The pump holds the run's only bus subscription, so the bus drop protocol
-//!   fires only from daemon-internal decisions — client disconnects cannot
-//!   cancel a run through it.
-//! - The pump subscribes right after `submit` returns; the scheduler registers
-//!   the run synchronously inside `submit` (idle) or at activation (queued),
-//!   so a queued run has no channel yet. The pump retries until the run is
-//!   terminal instead of giving up after a fixed cap, so queued runs never
-//!   lose events silently.
-
+/// DaemonHandler maps slash commands onto the scheduler: `run` submits a
+/// run assembled by the builder, `cancel` / `status` / `list` read scheduler
+/// state, `steer` is rejected until the scheduler exposes steering. Events
+/// flow loop → bus → a per-run pump task that appends into the session store
+/// and forwards into the transport broadcast channel, so every transport
+/// client sees every event.
+use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,11 +19,15 @@ use harness_core::run::{RunContext, RunId, SessionId, Task};
 use harness_core::tool::ToolRequest;
 use harness_scheduler::bus::ReceiveError;
 use harness_scheduler::{EventBus, RunRequest, RunStatus, Scheduler, Subscription};
-use harness_session::{SessionStore, SessionStoreError};
+use harness_session::{RecallHit, RecallScope, RecallStore, SessionStore, SessionStoreError};
 use harness_transport::{CommandHandler, EventLog, SlashCommand, TransportError};
 
 /// Delay between bus-channel polls while a queued run has no channel yet.
 const BUS_CHANNEL_POLL: Duration = Duration::from_millis(10);
+
+/// Maximum hits the `search` command returns: bounds the response and the
+/// FTS scan.
+const DEFAULT_SEARCH_LIMIT: u32 = 20;
 
 /// Recover a poisoned `std` mutex instead of panicking into the caller: the
 /// guarded data is plain state, and a panic in one request must not wedge the
@@ -66,6 +59,7 @@ impl StoreEventLog {
         Self { store }
     }
 }
+
 #[async_trait::async_trait]
 impl EventLog for StoreEventLog {
     /// Return the run's persisted events with `seq` strictly greater than
@@ -116,19 +110,30 @@ pub struct DaemonHandler {
     event_tx: OnceLock<tokio::sync::broadcast::Sender<RunEvent>>,
     runs: Arc<Mutex<Vec<RunId>>>,
     store: Arc<dyn SessionStore>,
+    recall: Arc<dyn RecallStore>,
     run_counter: AtomicU64,
 }
 
 impl DaemonHandler {
     /// Create the handler; the runtime and the event channel are wired right
     /// after construction, before the transports start listening.
-    pub fn new(scheduler: Scheduler, store: Arc<dyn SessionStore>) -> Self {
+    ///
+    /// `recall` is the search capability: a `TursoSessionStore`-backed
+    /// [`RecallStore`] for hosts that opted into recall, [`NoRecall`]
+    /// otherwise. The handler never constructs it — the host (main.rs) knows
+    /// which store it opened.
+    pub fn new(
+        scheduler: Scheduler,
+        store: Arc<dyn SessionStore>,
+        recall: Arc<dyn RecallStore>,
+    ) -> Self {
         Self {
             scheduler,
             runtime: OnceLock::new(),
             event_tx: OnceLock::new(),
             runs: Arc::new(Mutex::new(Vec::new())),
             store,
+            recall,
             run_counter: AtomicU64::new(0),
         }
     }
@@ -316,6 +321,43 @@ impl DaemonHandler {
         }
         serde_json::json!({ "runs": items })
     }
+
+    /// Search persisted run events through the [`RecallStore`] seam.
+    ///
+    /// # WHY
+    ///
+    /// Tantivy's default `fts_score` ranks lower = more relevant (the score
+    /// semantics are documented on [`RecallHit::score`]), so the response
+    /// hits are ordered by score ascending: the most relevant hit is first,
+    /// independent of the backend's own ordering. The search limit comes
+    /// from [`DEFAULT_SEARCH_LIMIT`] so a broad query cannot blow up the
+    /// response.
+    fn search(&self, query: &str) -> Result<serde_json::Value, TransportError> {
+        let hits = tokio::task::block_in_place(|| {
+            futures::executor::block_on(
+                self.recall
+                    .search(query, &RecallScope::all(DEFAULT_SEARCH_LIMIT)),
+            )
+        })
+        .map_err(|e| TransportError::Internal(format!("search failed: {e}")))?;
+        // WHY: lower fts_score = more relevant, so ascending order puts the
+        // best hit first regardless of how the backend ranked the rows.
+        let mut ordered: Vec<RecallHit> = hits;
+        ordered.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(CmpOrdering::Equal));
+        let hits: Vec<serde_json::Value> = ordered
+            .into_iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "run_id": hit.run_id.0,
+                    "session_id": hit.session_id.0,
+                    "seq": hit.seq,
+                    "score": hit.score,
+                    "snippet": hit.snippet,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "query": query, "hits": hits }))
+    }
 }
 
 impl CommandHandler for DaemonHandler {
@@ -325,6 +367,7 @@ impl CommandHandler for DaemonHandler {
             SlashCommand::Cancel { run_id } => self.cancel(&run_id),
             SlashCommand::Status { run_id } => self.status(&run_id),
             SlashCommand::List => Ok(self.list()),
+            SlashCommand::Search { query } => self.search(&query),
             SlashCommand::Steer { run_id, .. } => Err(TransportError::Internal(format!(
                 "steering run {run_id} is not wired yet: the scheduler does not expose steering in v1"
             ))),
@@ -396,5 +439,137 @@ fn event_status_label(kind: &RunEventKind) -> String {
     match kind {
         RunEventKind::RunFinished { reason } => format!("finished:{reason:?}"),
         _ => "finished".into(),
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::fs;
+    use std::process::id;
+
+    use harness_core::event::RunEventKind;
+    use harness_session::turso::TursoSessionStore;
+
+    use super::*;
+
+    static SEARCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Open a temp store with one session and two runs' events, each carrying
+    /// a unique marker text in its payload.  A unique temp dir per call keeps
+    /// parallel tests from contending on one turso file lock.
+    async fn search_fixture() -> std::sync::Arc<TursoSessionStore> {
+        let seq = SEARCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("harness-search-{}-{seq}", id()));
+        let _ = fs::create_dir_all(&dir);
+        let store = TursoSessionStore::open(dir.join("search.db"))
+            .await
+            .unwrap_or_else(|e| panic!("open store: {e}"));
+        let session = SessionId("search-session".into());
+        store
+            .create_session(&session)
+            .await
+            .unwrap_or_else(|e| panic!("create session: {e}"));
+        for (run, marker) in [
+            ("search-alpha", "daemon-search-marker-alpha"),
+            ("search-beta", "daemon-search-marker-beta"),
+        ] {
+            let run_id = RunId(run.into());
+            for seq in 0..2u64 {
+                let event = RunEvent {
+                    run_id: run_id.clone(),
+                    session_id: session.clone(),
+                    seq,
+                    timestamp_ms: 0,
+                    kind: RunEventKind::TextDelta {
+                        text: format!("{marker} event {seq}"),
+                    },
+                };
+                store
+                    .append_event(&event)
+                    .await
+                    .unwrap_or_else(|e| panic!("append event: {e}"));
+            }
+        }
+        std::sync::Arc::new(store)
+    }
+
+    /// Purpose: `DaemonHandler::handle(Search)` queries the recall seam and
+    /// returns JSON hits.
+    /// Scenario: a store holds marker events; the handler is built with
+    /// `store.recall()` and handles `SlashCommand::Search` for a present term
+    /// and an absent term.
+    /// Acceptance: the present term returns exactly the marker events, every
+    /// hit carries run_id/session_id/seq/score/snippet, hits are ordered by
+    /// score ascending, and the absent term returns an empty hit list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_search_returns_marker_events_as_json_hits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = search_fixture().await;
+        let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
+        let scheduler = Scheduler::new(4);
+        let handler = DaemonHandler::new(scheduler, store, recall);
+
+        let value = match CommandHandler::handle(
+            &handler,
+            SlashCommand::Search {
+                query: "daemon-search-marker-alpha".into(),
+            },
+        ) {
+            Ok(value) => value,
+            Err(err) => return Err(format!("search failed: {err}").into()),
+        };
+        assert_eq!(
+            value.get("query").and_then(|v| v.as_str()),
+            Some("daemon-search-marker-alpha"),
+            "the response must echo the query"
+        );
+        let hits = value
+            .get("hits")
+            .and_then(|v| v.as_array())
+            .ok_or("search response is missing a hits array")?;
+        assert_eq!(hits.len(), 2, "both alpha-marked events must match");
+        assert!(
+            hits.iter()
+                .all(|hit| { hit.get("run_id").and_then(|v| v.as_str()) == Some("search-alpha") }),
+            "every alpha hit must come from the alpha run"
+        );
+        let mut scores: Vec<f64> = Vec::new();
+        for hit in hits {
+            assert!(
+                hit.get("session_id").is_some()
+                    && hit.get("seq").is_some()
+                    && hit.get("score").is_some()
+                    && hit.get("snippet").is_some(),
+                "every hit must carry session_id, seq, score and snippet"
+            );
+            scores.push(
+                hit.get("score")
+                    .and_then(|v| v.as_f64())
+                    .ok_or("hit score is missing")?,
+            );
+        }
+        assert!(
+            scores.windows(2).all(|pair| pair[0] <= pair[1]),
+            "hits must be ordered by score ascending (lower = more relevant)"
+        );
+
+        let empty = match CommandHandler::handle(
+            &handler,
+            SlashCommand::Search {
+                query: "__no_such_marker_term__".into(),
+            },
+        ) {
+            Ok(value) => value,
+            Err(err) => return Err(format!("search failed: {err}").into()),
+        };
+        let empty_hits = empty
+            .get("hits")
+            .and_then(|v| v.as_array())
+            .ok_or("search response is missing a hits array")?;
+        assert!(empty_hits.is_empty(), "an absent term must return no hits");
+        Ok(())
     }
 }

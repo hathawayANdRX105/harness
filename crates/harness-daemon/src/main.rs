@@ -24,7 +24,7 @@ use harness_core::EventSink;
 use harness_core::model::ModelInfo;
 use harness_model::OpenAIModel;
 use harness_scheduler::Scheduler;
-use harness_session::{SessionStore, turso::TursoSessionStore};
+use harness_session::{RecallStore, SessionStore, turso::TursoSessionStore};
 use harness_transport::{EventLog, uds::UdsConfig};
 use harness_transport::{TransportState, http, ws};
 
@@ -201,13 +201,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // beside the session directory — named `.db` (not `.sqlite`) because the
     // engine is libsql, not plain SQLite.
     let store_path = PathBuf::from(&session_dir).join("sessions.db");
-    let store: Arc<dyn SessionStore> = Arc::new(
-        TursoSessionStore::open(&store_path)
-            .await
-            .with_context(|| format!("open session store at {session_dir}"))?,
-    );
+    // Build the recall seam from the concrete store so it shares the store's
+    // connection and FTS gate, then hand both trait objects to the handler.
+    let store_inner = TursoSessionStore::open(&store_path)
+        .await
+        .with_context(|| format!("open session store at {session_dir}"))?;
+    let recall: Arc<dyn RecallStore> = Arc::new(store_inner.recall());
+    let store: Arc<dyn SessionStore> = Arc::new(store_inner);
     let event_log: Arc<dyn EventLog> = Arc::new(StoreEventLog::new(store.clone()));
-    let handler = Arc::new(DaemonHandler::new(scheduler.clone(), store));
+    let handler = Arc::new(DaemonHandler::new(scheduler.clone(), store, recall));
     let state = Arc::new(TransportState::new(handler.clone(), event_log));
     handler.set_event_tx(state.event_tx.clone());
     // The builder requires an event sink, but the scheduler replaces the run's

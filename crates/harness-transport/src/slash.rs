@@ -4,6 +4,7 @@
 //! Commands are designed to be human-memorable: `/run <task>` starts a run,
 //! `/cancel <run_id>` cancels, `/steer <run_id> <msg>` queues an instruction,
 //! `/status <run_id>` queries state, `/list` lists recent runs.
+//! `/search <query>` searches persisted run events.
 //!
 //! The same [`SlashCommand`] enum is produced by two paths:
 //!
@@ -11,7 +12,6 @@
 //! - [`command_from_jsonrpc`] — JSON-RPC `method` + `params` form for all
 //!   three channels.  Both converge on the same enum so the
 //!   [`CommandHandler`](crate::CommandHandler) seam sees only one vocabulary.
-//!
 use serde::Deserialize;
 
 /// A command parsed from a transport client, either from slash text or
@@ -28,6 +28,8 @@ pub enum SlashCommand {
     Status { run_id: String },
     /// List recent runs.
     List,
+    /// Search persisted run events for `query`.
+    Search { query: String },
 }
 
 /// Errors that can occur when parsing a slash command.
@@ -155,6 +157,12 @@ pub struct StatusParams {
     pub run_id: String,
 }
 
+/// Parameter shape for the `search` JSON-RPC method.
+#[derive(Deserialize)]
+pub struct SearchParams {
+    pub query: String,
+}
+
 /// Convert a JSON-RPC method name and optional params value into a
 /// [`SlashCommand`].  All three transport channels use this when they
 /// receive a JSON-RPC request.
@@ -190,6 +198,12 @@ pub fn command_from_jsonrpc(
                 serde_json::from_value(p).map_err(|_| ParseSlashError::MissingArgs("run_id"))?;
             Ok(SlashCommand::Status { run_id: sp.run_id })
         }
+        "search" => {
+            let p = params.ok_or(ParseSlashError::MissingArgs("query"))?;
+            let sp: SearchParams =
+                serde_json::from_value(p).map_err(|_| ParseSlashError::MissingArgs("query"))?;
+            Ok(SlashCommand::Search { query: sp.query })
+        }
         "list" => Ok(SlashCommand::List),
         other => Err(ParseSlashError::Unknown(other.to_string())),
     }
@@ -212,6 +226,60 @@ pub fn slash_to_jsonrpc(cmd: &SlashCommand) -> (String, Option<serde_json::Value
             "status".into(),
             Some(serde_json::json!({ "run_id": run_id })),
         ),
+        SlashCommand::Search { query } => {
+            ("search".into(), Some(serde_json::json!({ "query": query })))
+        }
         SlashCommand::List => ("list".into(), None),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Purpose: the `search` JSON-RPC method parses into [`SlashCommand::Search`]
+    /// and serialises back out unchanged.
+    /// Scenario: `command_from_jsonrpc("search", {"query": "fox"})`, then
+    /// `slash_to_jsonrpc` on the parsed command.
+    /// Acceptance: the parsed command carries `query == "fox"` and the round
+    /// trip yields method `search` with params `{"query": "fox"}`.
+    #[test]
+    fn search_command_parses_and_round_trips() {
+        let cmd = match command_from_jsonrpc("search", Some(serde_json::json!({ "query": "fox" })))
+        {
+            Ok(cmd) => cmd,
+            Err(err) => panic!("search params must parse: {err}"),
+        };
+        assert!(
+            matches!(cmd, SlashCommand::Search { ref query } if query == "fox"),
+            "parsed search command must carry the query"
+        );
+        let (method, params) = slash_to_jsonrpc(&cmd);
+        assert_eq!(method, "search");
+        assert_eq!(
+            params,
+            Some(serde_json::json!({ "query": "fox" })),
+            "round-tripped params must match the input"
+        );
+    }
+
+    /// Purpose: `search` without `query` is a typed invalid-params error.
+    /// Scenario: `command_from_jsonrpc("search", None)`.
+    /// Acceptance: the error is `ParseSlashError::MissingArgs("query")` and its
+    /// JSON-RPC code is `INVALID_PARAMS` (-32602).
+    #[test]
+    fn search_command_missing_query_is_invalid_params() {
+        let err = match command_from_jsonrpc("search", None) {
+            Err(err) => err,
+            Ok(cmd) => panic!("expected search without query to fail: {cmd:?}"),
+        };
+        assert_eq!(err, ParseSlashError::MissingArgs("query"));
+        assert_eq!(
+            err.code(),
+            crate::frame::error_code::INVALID_PARAMS,
+            "missing query must map to INVALID_PARAMS"
+        );
     }
 }
