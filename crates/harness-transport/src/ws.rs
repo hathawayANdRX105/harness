@@ -125,13 +125,30 @@ async fn read_loop(
         };
 
         let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&msg) else {
-            // Could not parse as a request — send a parse error back.  We
-            // have no id, so use 0 (the client must correlate by ordering).
+            // The frame is not parseable JSON-RPC — we cannot know its id,
+            // so the error frame carries `id: null` per the JSON-RPC 2.0
+            // spec, never `0` (which could collide with a real request id).
             let response =
-                JsonRpcResponse::error(0, error_code::PARSE_ERROR, "invalid JSON-RPC request");
+                JsonRpcResponse::error(None, error_code::PARSE_ERROR, "invalid JSON-RPC request");
             let _ = send_response(&sender, response).await;
             continue;
         };
+
+        // A valid Request object carries an id that is a number or a
+        // string; anything else is Invalid Request and the reply id is null.
+        let id_is_known = req
+            .id
+            .as_ref()
+            .is_some_and(|id| id.is_number() || id.is_string());
+        if !id_is_known {
+            let response = JsonRpcResponse::error(
+                None,
+                error_code::INVALID_REQUEST,
+                "request id must be a number or string",
+            );
+            let _ = send_response(&sender, response).await;
+            continue;
+        }
 
         let response = match req.method.as_str() {
             "subscribe" => handle_subscribe(&req, &subscription).await,
@@ -142,7 +159,6 @@ async fn read_loop(
         }
     }
 }
-
 /// Handle the documented `subscribe` method: record this connection's run
 /// subscription and acknowledge with `{"subscribed": run_id, "session_id"}`.
 async fn handle_subscribe(
@@ -151,14 +167,14 @@ async fn handle_subscribe(
 ) -> JsonRpcResponse {
     let Some(params) = req.params.as_ref().and_then(|params| params.as_object()) else {
         return JsonRpcResponse::error(
-            req.id,
+            req.id.clone(),
             error_code::INVALID_PARAMS,
             "subscribe params must be an object",
         );
     };
     let Some(run_id) = params.get("run_id").and_then(|value| value.as_str()) else {
         return JsonRpcResponse::error(
-            req.id,
+            req.id.clone(),
             error_code::INVALID_PARAMS,
             "subscribe requires a string run_id",
         );
@@ -182,7 +198,7 @@ async fn handle_subscribe(
     let bound_session = subscription_state.session_id.clone();
     *subscription.lock().await = Some(subscription_state);
     JsonRpcResponse::success(
-        req.id,
+        req.id.clone(),
         json!({ "subscribed": run_id, "session_id": bound_session }),
     )
 }
@@ -190,8 +206,10 @@ async fn handle_subscribe(
 /// Dispatch one non-`subscribe` JSON-RPC request into a response.
 fn dispatch_jsonrpc(req: &JsonRpcRequest, state: &TransportState) -> JsonRpcResponse {
     match command_from_jsonrpc(&req.method, req.params.clone()) {
-        Ok(cmd) => dispatch_command(&*state.handler, cmd, req.id),
-        Err(parse_err) => JsonRpcResponse::error(req.id, parse_err.code(), parse_err.to_string()),
+        Ok(cmd) => dispatch_command(&*state.handler, cmd, req.id.clone()),
+        Err(parse_err) => {
+            JsonRpcResponse::error(req.id.clone(), parse_err.code(), parse_err.to_string())
+        }
     }
 }
 

@@ -121,7 +121,10 @@ async fn handle_connection(
         let request: JsonRpcRequest = match serde_json::from_str(line.trim()) {
             Ok(req) => req,
             Err(_) => {
-                let err = JsonRpcResponse::error(0, error_code::PARSE_ERROR, "invalid JSON");
+                // The line is not parseable JSON — we cannot know its id,
+                // so the error frame carries `id: null` per the JSON-RPC
+                // 2.0 spec, never `0`.
+                let err = JsonRpcResponse::error(None, error_code::PARSE_ERROR, "invalid JSON");
                 let _ = write_response(&mut writer, &err).await;
                 break;
             }
