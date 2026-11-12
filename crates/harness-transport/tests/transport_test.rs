@@ -308,6 +308,72 @@ async fn ws_command_roundtrip() -> TestResult {
     assert_eq!(body["result"]["status"], "running");
     Ok(())
 }
+// ── WebSocket unknown-id handling ───────────────────────────────────────
+
+/// Purpose: an unparseable WebSocket frame must yield `id: null`, not `id: 0`.
+///
+/// Scenario: connect a WebSocket client, send a text frame that is not
+/// valid JSON-RPC, then read the server's response frame.
+///
+/// Acceptance: the response is a JSON-RPC error frame with
+/// `code = -32700` (PARSE_ERROR) and `id: null` — a client can never
+/// mistake it for a reply to a legitimate request carrying `id: 0`.
+#[tokio::test]
+async fn ws_unparseable_frame_yields_null_id() -> TestResult {
+    let state = test_state();
+    let app = harness_transport::ws::ws_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // Wait for the server to accept connections (bounded poll instead of a fixed sleep).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let url = format!("ws://{addr}/ws");
+    let (ws_stream, _) = poll_until(
+        || {
+            let url = url.clone();
+            async move {
+                tokio_tungstenite::connect_async(&url)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("WebSocket server did not accept connections: {e}"))?;
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // Garbage that is not JSON-RPC at all: the server cannot know the id.
+    write
+        .send(Message::Text("this is not JSON-RPC".into()))
+        .await?;
+
+    let resp_msg = read
+        .next()
+        .await
+        .ok_or("WS error response should arrive")?
+        .map_err(|e| format!("WS response should be ok: {e}"))?;
+
+    let text = match resp_msg {
+        Message::Text(t) => t,
+        other => return Err(format!("expected Text frame, got {other:?}").into()),
+    };
+
+    let body: serde_json::Value = serde_json::from_str(text.as_str())?;
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert!(
+        body["id"].is_null(),
+        "unknown request id must be null in the response, never 0"
+    );
+    let err = body.get("error").ok_or("error object present")?;
+    assert_eq!(err["code"], -32700, "unparseable frame is a parse error");
+    Ok(())
+}
 
 // ── WebSocket session binding ─────────────────────────────────────────────
 

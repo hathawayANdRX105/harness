@@ -184,11 +184,13 @@ impl TransportError {
 /// JSON-RPC response value.
 ///
 /// This is the shared dispatch step that all three transport channels use:
-/// parse → dispatch → serialise response.
+/// parse → dispatch → serialise response.  `request_id` echoes the request
+/// id in the response; `None` serializes as `id: null` when the request id
+/// was unknown (JSON-RPC 2.0 §7.1).
 pub fn dispatch_command(
     handler: &dyn CommandHandler,
     cmd: SlashCommand,
-    request_id: u64,
+    request_id: Option<serde_json::Value>,
 ) -> JsonRpcResponse {
     let result = handler.handle(cmd);
     match result {

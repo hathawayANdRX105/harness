@@ -2,12 +2,14 @@
 //! command/response/error, plus SSE event helpers for RunEvent push.
 //!
 //! Design: the JSON-RPC 2.0 shape follows <https://www.jsonrpc.org/specification>
-//! using the minimal subset the transport needs — requests always carry an
-//! integer id (no notifications: a method call without a response id would
-//! lose error reporting), and errors carry typed codes so a client can
-//! discriminate without string-matching.  The SSE helper wraps a RunEvent as
-//! an SSE data frame with `event: run_event` — the same wire envelope shape
-//! nanoharness subscribers parse with `ev["type"]`.
+//! using the minimal subset the transport needs — requests carry an integer or
+//! string id (no notifications: a call without a response id would lose error
+//! reporting), responses echo the request id, and when the id cannot be
+//! determined the response carries `id: null` per the JSON-RPC 2.0 spec.
+//! Errors carry typed codes so a client can discriminate without
+//! string-matching.  The SSE helper wraps a RunEvent as an SSE data frame with
+//! `event: run_event` — the same wire envelope shape nanoharness subscribers
+//! parse with `ev["type"]`.
 
 use harness_core::RunEvent;
 use serde::{Deserialize, Serialize};
@@ -16,23 +18,31 @@ use serde::{Deserialize, Serialize};
 
 /// A JSON-RPC 2.0 request from a transport client.
 ///
-/// Every request carries an integer id — the transport does not support
-/// notifications.  The method name corresponds to one of the supported
-/// slash commands (`run`, `cancel`, `steer`, `status`, `list`).
+/// The id is a number or a string and is echoed in the response.  A missing
+/// or non-scalar id deserializes as `None` — responses to such requests
+/// carry `id: null` per the JSON-RPC 2.0 spec.  The transport does not
+/// support notifications.  The method name corresponds to one of the
+/// supported slash commands (`run`, `cancel`, `steer`, `status`, `list`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
-    pub id: u64,
+    #[serde(default)]
+    pub id: Option<serde_json::Value>,
 }
 
 /// A JSON-RPC 2.0 response.  Exactly one of `result` or `error` is present.
+///
+/// The id echoes the request id.  It is always serialized: when the request
+/// id is unknown the response carries `id: null` per the JSON-RPC 2.0 spec,
+/// so a client can never mistake an unknown-id error for a reply to a
+/// legitimate `id: 0` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,8 +50,9 @@ pub struct JsonRpcResponse {
 }
 
 impl JsonRpcResponse {
-    /// Build a success response.
-    pub fn success(id: u64, result: serde_json::Value) -> Self {
+    /// Build a success response.  `id` echoes the request id; `None`
+    /// serializes as `id: null` when the request id was unknown.
+    pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".into(),
             id,
@@ -50,8 +61,9 @@ impl JsonRpcResponse {
         }
     }
 
-    /// Build an error response.
-    pub fn error(id: u64, code: i32, message: impl Into<String>) -> Self {
+    /// Build an error response.  `id` echoes the request id; `None`
+    /// serializes as `id: null` per the JSON-RPC 2.0 spec.
+    pub fn error(id: Option<serde_json::Value>, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0".into(),
             id,
