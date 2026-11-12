@@ -859,3 +859,39 @@ async fn graph_units_isolated_per_run() -> Result<(), SessionStoreError> {
 
     Ok(())
 }
+
+/// Purpose: probe whether the turso engine supports Tantivy `USING fts`
+/// indexes on this crate's pinned turso version (with the experimental
+/// index-method flag enabled).
+/// Scenario: open the store's database path directly through the turso
+/// Builder with experimental_index_method(true), then execute a
+/// `CREATE INDEX ... USING fts` statement.
+/// Acceptance: the statement executes without "no such module" / parse
+/// errors — proving full-text search is available on our turso version
+/// once the experimental flag is turned on in the store builder.
+#[tokio::test]
+async fn turso_fts_index_probe() {
+    let dir = std::env::temp_dir().join(format!("harness-fts-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("temp dir: {e}"));
+    let db_path = dir.join("probe.db");
+
+    let database = turso::Builder::new_local(db_path.to_str().unwrap_or_else(|| panic!("path")))
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap_or_else(|e| panic!("build: {e}"));
+    let conn = database
+        .connect()
+        .unwrap_or_else(|e| panic!("connect: {e}"));
+
+    let result = conn
+        .execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE INDEX t_fts ON t USING fts (body);",
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "USING fts must be supported with experimental_index_method(true)"
+    );
+}
