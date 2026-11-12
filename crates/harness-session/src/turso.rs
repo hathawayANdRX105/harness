@@ -78,9 +78,10 @@ use harness_core::event::RunEvent;
 use harness_core::message::Message;
 use harness_core::run::{RunId, SessionId};
 use tokio::sync::Mutex;
-use turso::{Builder, Connection, Database, params};
 
+use crate::recall::{RecallHit, RecallScope, RecallStore};
 use crate::store::{MessageEntry, SessionStore, SessionStoreError, replay_messages};
+use turso::{Builder, Connection, Database, params};
 
 /// Turso-backed [`SessionStore`].
 ///
@@ -107,6 +108,10 @@ impl TursoSessionStore {
                 .to_str()
                 .ok_or_else(|| SessionStoreError::Storage("invalid database path".into()))?,
         )
+        // Tantivy-backed `CREATE INDEX ... USING fts` powers the recall
+        // search (turso has no SQLite FTS5 module — see the recall module
+        // docs). The flag is experimental but required for the index syntax.
+        .experimental_index_method(true)
         .build()
         .await
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
@@ -161,7 +166,11 @@ impl TursoSessionStore {
                      ON messages(session_id, seq);
 
                  CREATE INDEX IF NOT EXISTS idx_run_events_run_seq
-                     ON run_events(run_id, seq);",
+                     ON run_events(run_id, seq);
+
+                 CREATE INDEX IF NOT EXISTS idx_run_events_fts
+                     ON run_events USING fts (event_json)
+                     WITH (tokenizer = 'ngram');",
             )
             .await
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
@@ -467,5 +476,102 @@ impl SessionStore for TursoSessionStore {
             .await
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recall: Tantivy-backed full-text search over run_events
+// ---------------------------------------------------------------------------
+
+/// [`RecallStore`] over the store's Tantivy `USING fts` index on
+/// `run_events.event_json`.
+///
+/// The index covers the serialized event payload, so searches match any text
+/// the events carry (task descriptions, deltas, tool output) — including
+/// substrings via the `ngram` tokenizer, which also makes CJK queries work.
+/// JSON structural keys are searchable noise; the session scope and the
+/// returned `seq`/run identity are the callers' real filters.
+pub struct TursoFtsRecall {
+    /// Same shared connection the store uses (direct statements only).
+    conn: Arc<Connection>,
+    /// Same serialization gate as the store's direct statements.
+    gate: Arc<Mutex<()>>,
+}
+
+impl TursoSessionStore {
+    /// Build a recall handle sharing this store's connection and gate.
+    ///
+    /// The FTS index itself is created in [`TursoSessionStore::open`]'s
+    /// migration — recall searches hit the engine-maintained index directly.
+    pub fn recall(&self) -> TursoFtsRecall {
+        TursoFtsRecall {
+            conn: self.conn.clone(),
+            gate: self.gate.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RecallStore for TursoFtsRecall {
+    async fn search(
+        &self,
+        query: &str,
+        scope: &RecallScope,
+    ) -> Result<Vec<RecallHit>, SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        let limit = scope.limit.max(1);
+        // The FTS index is on the serialized event payload; matches are
+        // ranked by the engine's BM25 score and highlighted for display.
+        let sql = format!(
+            "SELECT run_id, session_id, seq, \
+                    fts_highlight(event_json, '≫', '≪', '{query}') AS snippet, \
+                    fts_score(event_json, '{query}') AS score \
+             FROM run_events \
+             WHERE fts_match(event_json, '{query}') {} \
+             ORDER BY score DESC \
+             LIMIT {limit}",
+            scope
+                .session_id
+                .as_ref()
+                .map_or(String::new(), |id| format!(
+                    "AND session_id = '{}'",
+                    id.0.replace('\'', "''")
+                )),
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, ())
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let mut hits = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        {
+            let run_id: String = row
+                .get(0)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let session_id: String = row
+                .get(1)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let seq: u64 = row
+                .get(2)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let snippet: String = row
+                .get(3)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let score: f64 = row
+                .get(4)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            hits.push(RecallHit {
+                run_id: RunId(run_id),
+                session_id: SessionId(session_id),
+                seq,
+                snippet,
+                score,
+            });
+        }
+        Ok(hits)
     }
 }

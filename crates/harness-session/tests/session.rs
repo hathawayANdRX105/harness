@@ -18,8 +18,8 @@ use harness_core::message::{Content, Message};
 use harness_core::run::{RunId, RunStopReason, SessionId};
 use harness_session::store::replay_messages;
 use harness_session::{
-    MessageEntry, SessionStoreError, graph::GraphIndex, store::SessionStore,
-    turso::TursoSessionStore,
+    MessageEntry, RecallStore, SessionStoreError, graph::GraphIndex, recall::RecallScope,
+    store::SessionStore, turso::TursoSessionStore,
 };
 
 /// A test store backed by a private temp database file. The `_dir` guard
@@ -894,4 +894,123 @@ async fn turso_fts_index_probe() {
         result.is_ok(),
         "USING fts must be supported with experimental_index_method(true)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Recall (Tantivy fts index on run_events)
+// ---------------------------------------------------------------------------
+
+/// Unique suffix per fixture call: the tests run in parallel threads of one
+/// process, and a turso file is exclusively locked by its opening process —
+/// sharing one db file across parallel fixtures would deadlock `open`.
+static RECALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fixture: a store with two runs' events containing distinct marker text.
+async fn recall_fixture() -> std::sync::Arc<TursoSessionStore> {
+    use harness_session::SessionStore as _;
+    let seq = RECALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("harness-recall-{}-{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("temp dir: {e}"));
+    let store = TursoSessionStore::open(dir.join("recall.db"))
+        .await
+        .unwrap_or_else(|e| panic!("open: {e}"));
+    let session = SessionId("recall-session".into());
+    store
+        .create_session(&session)
+        .await
+        .unwrap_or_else(|e| panic!("create session: {e}"));
+    for (run, marker) in [
+        ("recall-alpha", "the quick brown fox jumps"),
+        ("recall-beta", "lazy dogs sleep deeply"),
+    ] {
+        let run_id = RunId(run.into());
+        for seq in 0..2u64 {
+            let event = RunEvent {
+                run_id: run_id.clone(),
+                session_id: session.clone(),
+                seq,
+                timestamp_ms: 0,
+                kind: harness_core::event::RunEventKind::TextDelta {
+                    text: format!("{marker} event {seq}"),
+                },
+            };
+            store
+                .append_event(&event)
+                .await
+                .unwrap_or_else(|e| panic!("append: {e}"));
+        }
+    }
+    std::sync::Arc::new(store)
+}
+
+/// Purpose: the Tantivy fts index answers keyword queries over persisted
+/// events (issue #5/#7 recall seam, turso `USING fts` path).
+/// Scenario: two runs with distinct marker text; search for a term unique to
+/// one run, and a term absent from both.
+/// Acceptance: the unique term returns only that run's events with a
+/// highlighted snippet and a finite score; the absent term returns no hits.
+#[tokio::test]
+async fn recall_finds_events_by_keyword() -> Result<(), Box<dyn std::error::Error>> {
+    let store = recall_fixture().await;
+    let recall = store.recall();
+
+    let hits = recall.search("fox", &RecallScope::all(10)).await?;
+    assert_eq!(hits.len(), 2, "both fox-marked events must match");
+    assert!(
+        hits.iter().all(|hit| hit.run_id.0 == "recall-alpha"),
+        "fox hits must come from the alpha run"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.snippet.contains("≫")),
+        "snippets must be highlighted"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.score.is_finite()),
+        "scores must be finite"
+    );
+
+    let misses = recall.search("zebra", &RecallScope::all(10)).await?;
+    assert!(misses.is_empty(), "absent terms must not match");
+    Ok(())
+}
+
+/// Purpose: recall respects the session scope and the hit limit.
+/// Scenario: search scoped to a session id that owns none of the events,
+/// then an oversized limit on the whole store.
+/// Acceptance: the scoped search returns no hits; the limited search never
+/// exceeds the cap.
+#[tokio::test]
+async fn recall_scope_and_limit_are_respected() -> Result<(), Box<dyn std::error::Error>> {
+    use harness_session::RecallScope;
+
+    let store = recall_fixture().await;
+    let recall = store.recall();
+
+    let scoped = recall
+        .search(
+            "fox",
+            &RecallScope {
+                session_id: Some(SessionId("other-session".into())),
+                limit: 10,
+            },
+        )
+        .await?;
+    assert!(scoped.is_empty(), "a foreign session must yield no hits");
+
+    let limited = recall.search("the", &RecallScope::all(1)).await?;
+    assert!(limited.len() <= 1, "the limit must cap the hit count");
+    Ok(())
+}
+
+/// Purpose: NoRecall is a safe empty default (issue: recall is opt-in).
+/// Scenario: search through NoRecall.
+/// Acceptance: every query returns an empty hit list without error.
+#[tokio::test]
+async fn no_recall_returns_no_hits() -> Result<(), Box<dyn std::error::Error>> {
+    let recall = harness_session::NoRecall;
+    let hits = recall
+        .search("anything", &harness_session::RecallScope::all(10))
+        .await?;
+    assert!(hits.is_empty(), "NoRecall must never return hits");
+    Ok(())
 }

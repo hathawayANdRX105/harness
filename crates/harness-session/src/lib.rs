@@ -41,9 +41,11 @@
 //! a crashed daemon re-reads.
 
 pub mod graph;
+pub mod recall;
 pub mod store;
 pub mod turso;
 
 pub use graph::{GraphIndex, GraphUnit};
+pub use recall::{NoRecall, RecallHit, RecallScope, RecallStore};
 pub use store::{MessageEntry, SessionStore, SessionStoreError, replay_messages};
-pub use turso::TursoSessionStore;
+pub use turso::{TursoFtsRecall, TursoSessionStore};
