@@ -23,7 +23,7 @@ use std::sync::atomic::AtomicU64;
 
 use futures::{StreamExt, pin_mut};
 use harness_core::event::RunEventKind;
-use harness_core::message::{Content, Message, ToolCall};
+use harness_core::message::{Content, Message, ToolCall, ToolResultMessage};
 use harness_core::model::{Model, ModelEvent, ModelRequest};
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::{Tool, ToolSchema};
@@ -84,6 +84,183 @@ impl std::fmt::Debug for LoopDeps {
     }
 }
 
+/// Turn boundary for one loop iteration: cancellation check, steering drain,
+/// task seed on the first turn, and the max-turns check.
+///
+/// Returns `Ok` when the turn may proceed, or `Err` with the stop reason
+/// when the run ends at this boundary. The caller emits `RunFinished`
+/// exactly once for the returned reason and returns.
+fn turn_boundary(
+    control: &RunControl,
+    deps: &LoopDeps,
+    transcript: &mut Vec<Message>,
+    ctx: &RunContext,
+    seq: &AtomicU64,
+    turn: u32,
+) -> Result<(), RunStopReason> {
+    // Cancellation observed at the boundary wins: no steering is drained and
+    // no new turn starts.
+    if control.is_cancelled() {
+        return Err(RunStopReason::Cancelled);
+    }
+
+    // Drain queued steering into the transcript as one user message, and emit
+    // one `SteeringApplied` event per non-empty drain.
+    let steering = control.drain_steering();
+    if !steering.is_empty() {
+        let msg = steering
+            .iter()
+            .map(|s| s.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        emit_event(
+            deps.event_sink.as_ref(),
+            &ctx.run_id,
+            &ctx.session_id,
+            seq,
+            RunEventKind::SteeringApplied {
+                message: msg.clone(),
+            },
+        );
+        transcript.push(Message::user_text(msg));
+    }
+
+    // Seed the first turn with the task description: every provider rejects
+    // an empty `messages` array on the first upstream request.
+    if turn == 0 && transcript.is_empty() && !ctx.task.description.is_empty() {
+        transcript.push(Message::user_text(ctx.task.description.clone()));
+    }
+
+    // Max-turns: refuse to start another turn once the turn budget is spent.
+    if turn >= ctx.limits.max_turns {
+        return Err(RunStopReason::MaxTurns);
+    }
+
+    Ok(())
+}
+
+/// Build the model request for one turn and pump its stream: emit
+/// `TurnStarted`, call the provider, and return the stream outcome.
+async fn model_turn(
+    ctx: &RunContext,
+    deps: &LoopDeps,
+    control: &RunControl,
+    seq: &AtomicU64,
+    turn: u32,
+    transcript: &[Message],
+) -> StreamTurn {
+    let tools_schemas: Vec<ToolSchema> = deps.tools.iter().map(|t| t.schema()).collect();
+    let request = ModelRequest {
+        model: deps.model.info().model.clone(),
+        messages: transcript.to_vec(),
+        tools: tools_schemas,
+        max_tokens: None,
+        temperature: None,
+    };
+
+    emit_event(
+        deps.event_sink.as_ref(),
+        &ctx.run_id,
+        &ctx.session_id,
+        seq,
+        RunEventKind::TurnStarted { turn },
+    );
+
+    let stream = deps.model.stream(&request).await;
+    pump_stream(stream, seq, deps.event_sink.as_ref(), ctx, control).await
+}
+
+/// Emit `RunStarted` once, at the beginning of a run.
+fn emit_run_started(ctx: &RunContext, event_sink: &dyn EventSink, seq: &AtomicU64) {
+    emit_event(
+        event_sink,
+        &ctx.run_id,
+        &ctx.session_id,
+        seq,
+        RunEventKind::RunStarted {
+            task: ctx.task.description.clone(),
+        },
+    );
+}
+
+/// Emit the `TurnFinished` event that closes one model turn.
+fn emit_turn_finished(ctx: &RunContext, event_sink: &dyn EventSink, seq: &AtomicU64, turn: u32) {
+    emit_event(
+        event_sink,
+        &ctx.run_id,
+        &ctx.session_id,
+        seq,
+        RunEventKind::TurnFinished { turn },
+    );
+}
+
+/// The `ToolResult` messages produced by the most recent tool batch: the
+/// last `n_results` transcript entries, filtered to tool results.
+fn recent_tool_results(transcript: &[Message], n_results: usize) -> Vec<ToolResultMessage> {
+    transcript
+        .iter()
+        .rev()
+        .take(n_results)
+        .filter_map(|msg| match msg {
+            Message::ToolResult(tr) => Some(tr.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Dispatch one tool batch, extend the transcript with the results, and run
+/// the post-batch hooks.
+///
+/// Returns `Ok` with the number of results appended, `Err(Cancelled)` when
+/// the batch hit a cancellation (the results are already in the transcript),
+/// or `Err(Completed)` when the should-terminate hook short-circuited the
+/// run -- the caller finishes the run with the returned reason.
+async fn dispatch_turn(
+    calls: &[ToolCall],
+    turn: u32,
+    ctx: &RunContext,
+    deps: &LoopDeps,
+    control: &RunControl,
+    seq: &AtomicU64,
+    transcript: &mut Vec<Message>,
+) -> Result<usize, RunStopReason> {
+    let dctx = DispatchCtx {
+        turn,
+        ctx,
+        tools: &deps.tools,
+        policy: &*deps.policy,
+        approval_broker: &deps.approval_broker,
+        hooks: &deps.hooks,
+        seq,
+        sink: deps.event_sink.as_ref(),
+        control,
+    };
+    let (result_msgs, terminal_reason) = dispatch_batch(calls, &dctx, deps.tool_mode).await;
+
+    if let Some(reason) = terminal_reason {
+        transcript.extend(result_msgs.into_iter().map(Message::ToolResult));
+        return Err(reason);
+    }
+
+    let n_results = result_msgs.len();
+    transcript.extend(result_msgs.into_iter().map(Message::ToolResult));
+
+    // Hook: finish_turn observes the completed turn.
+    if let Some(hook) = &deps.hooks.finish_turn {
+        hook(turn, transcript);
+    }
+
+    // Hook: should_terminate_tool_batch short-circuits the tool batch.
+    if let Some(hook) = &deps.hooks.should_terminate_tool_batch {
+        let tool_results = recent_tool_results(transcript, n_results);
+        if hook(calls, &tool_results) {
+            return Err(RunStopReason::Completed);
+        }
+    }
+
+    Ok(n_results)
+}
+
 /// The core turn loop.
 ///
 /// The loop state machine:
@@ -125,199 +302,72 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
     let mut transcript: Vec<Message> = Vec::new();
     let seq = AtomicU64::new(0);
 
-    emit_event(
-        &*deps.event_sink,
-        &ctx.run_id,
-        &ctx.session_id,
-        &seq,
-        RunEventKind::RunStarted {
-            task: ctx.task.description.clone(),
-        },
-    );
+    emit_run_started(&ctx, deps.event_sink.as_ref(), &seq);
 
     let mut turn: u32 = 0;
 
     loop {
-        // -- 1. Cancellation check (turn boundary) --
-        if control.is_cancelled() {
-            return finish(RunStopReason::Cancelled, &ctx, &*deps.event_sink, &seq);
+        // Turn boundary: cancellation, steering drain, task seed, max-turns.
+        if let Err(reason) = turn_boundary(&control, &deps, &mut transcript, &ctx, &seq, turn) {
+            return finish(&ctx, reason, deps.event_sink.as_ref(), &seq);
         }
 
-        // -- 2. Steering drain --
-        {
-            let steering = control.drain_steering();
-            if !steering.is_empty() {
-                let msg = steering
-                    .iter()
-                    .map(|s| s.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                emit_event(
-                    &*deps.event_sink,
-                    &ctx.run_id,
-                    &ctx.session_id,
-                    &seq,
-                    RunEventKind::SteeringApplied {
-                        message: msg.clone(),
-                    },
-                );
-                transcript.push(Message::user_text(msg));
-            }
-        }
-
-        // -- 2b. Seed the transcript with the task on the first turn --
-        // The task description is the run's user message; without this the
-        // first upstream request carries an empty `messages` array, which
-        // every provider rejects.
-        if turn == 0 && transcript.is_empty() && !ctx.task.description.is_empty() {
-            transcript.push(Message::user_text(ctx.task.description.clone()));
-        }
-
-        // -- 3. Max-turns check --
-        if turn >= ctx.limits.max_turns {
-            return finish(RunStopReason::MaxTurns, &ctx, &*deps.event_sink, &seq);
-        }
-
-        // -- 4. Hook: prepare_request --
-        if let Some(ref hook) = deps.hooks.prepare_request {
+        // Hook: prepare_request transforms the transcript before the model call.
+        if let Some(hook) = &deps.hooks.prepare_request {
             transcript = hook(transcript);
         }
 
-        // -- 4b. Budget gate: refuse the round before the provider call when
-        //    the context budget cannot fit the next turn, even after one
-        //    compaction pass. Emits `RunEventKind::Error` carrying a
-        //    structured `budget blocked: ...` message and returns
-        //    `RunStopReason::Error` with the same string -- BudgetBlocked
-        //    semantics without changing the frozen `RunStopReason` enum. --
+        // Budget gate: refuse the round before the provider call when the
+        // context cannot fit another turn, even after one compaction pass.
         if let Some(reason) =
             enforce_budget_gate(&deps, &mut transcript, &ctx, &control, &seq).await
         {
             return reason;
         }
 
-        // -- 5. Build request and model turn --
-        let tools_schemas: Vec<ToolSchema> = deps.tools.iter().map(|t| t.schema()).collect();
-        let request = ModelRequest {
-            model: deps.model.info().model.clone(),
-            messages: transcript.clone(),
-            tools: tools_schemas,
-            max_tokens: None,
-            temperature: None,
-        };
-
-        emit_event(
-            &*deps.event_sink,
-            &ctx.run_id,
-            &ctx.session_id,
+        let stream_outcome = model_turn(&ctx, &deps, &control, &seq, turn, &transcript).await;
+        let (tool_calls, assistant_content) = match handle_stream_outcome(
+            &stream_outcome,
+            &ctx,
+            &deps,
+            &control,
             &seq,
-            RunEventKind::TurnStarted { turn },
-        );
-
-        let stream = deps.model.stream(&request).await;
-        let model_turn = pump_stream(stream, &seq, &*deps.event_sink, &ctx, &control).await;
-
-        // Handle terminal cases from the stream first.
-        let (tool_calls, assistant_content) = match model_turn {
-            StreamTurn::Cancelled => {
-                return finish(RunStopReason::Cancelled, &ctx, &*deps.event_sink, &seq);
-            }
-            StreamTurn::Ok { content, calls } => {
-                emit_event(
-                    &*deps.event_sink,
-                    &ctx.run_id,
-                    &ctx.session_id,
-                    &seq,
-                    RunEventKind::TurnFinished { turn },
-                );
-                (calls, content)
-            }
-            StreamTurn::Error {
-                message,
-                partial_content,
-                partial_calls,
-            } => {
-                emit_event(
-                    &*deps.event_sink,
-                    &ctx.run_id,
-                    &ctx.session_id,
-                    &seq,
-                    RunEventKind::TurnFinished { turn },
-                );
-                transcript.push(Message::Assistant {
-                    content: partial_content,
-                });
-                if !partial_calls.is_empty() {
-                    let msgs =
-                        dispatch_and_collect(&partial_calls, turn, &ctx, &deps, &control, &seq)
-                            .await;
-                    transcript.extend(msgs);
-                }
-                return finish(
-                    RunStopReason::Error { message },
-                    &ctx,
-                    &*deps.event_sink,
-                    &seq,
-                );
-            }
+            turn,
+            &mut transcript,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(reason) => return finish(&ctx, reason, deps.event_sink.as_ref(), &seq),
         };
 
-        // Push assistant message.
         transcript.push(Message::Assistant {
             content: assistant_content,
         });
 
-        // -- 6. No tool calls -> completed --
+        // No tool calls: the model answered the user, the run is done.
         if tool_calls.is_empty() {
-            return finish(RunStopReason::Completed, &ctx, &*deps.event_sink, &seq);
+            return finish(
+                &ctx,
+                RunStopReason::Completed,
+                deps.event_sink.as_ref(),
+                &seq,
+            );
         }
 
-        // -- 7. Dispatch tool calls --
-        let dctx = DispatchCtx {
+        let dispatched = dispatch_turn(
+            &tool_calls,
             turn,
-            ctx: &ctx,
-            tools: &deps.tools,
-            policy: &*deps.policy,
-            approval_broker: &deps.approval_broker,
-            hooks: &deps.hooks,
-            seq: &seq,
-            sink: &*deps.event_sink,
-            control: &control,
-        };
-        let (result_msgs, terminal_reason) =
-            dispatch_batch(&tool_calls, &dctx, deps.tool_mode).await;
+            &ctx,
+            &deps,
+            &control,
+            &seq,
+            &mut transcript,
+        )
+        .await;
 
-        // If dispatch returned a terminal reason (cancellation), return it.
-        if let Some(reason) = terminal_reason {
-            transcript.extend(result_msgs.into_iter().map(Message::ToolResult));
-            return finish(reason, &ctx, &*deps.event_sink, &seq);
-        }
-
-        let n_results = result_msgs.len();
-        transcript.extend(result_msgs.into_iter().map(Message::ToolResult));
-
-        // -- 8. Hook: finish_turn --
-        if let Some(ref hook) = deps.hooks.finish_turn {
-            hook(turn, &transcript);
-        }
-
-        // -- 9. Hook: should_terminate_tool_batch --
-        let tool_results: Vec<harness_core::message::ToolResultMessage> = transcript
-            .iter()
-            .rev()
-            .take(n_results)
-            .filter_map(|msg| {
-                if let Message::ToolResult(tr) = msg {
-                    Some(tr.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if let Some(ref hook) = deps.hooks.should_terminate_tool_batch
-            && hook(&tool_calls, &tool_results)
-        {
-            return finish(RunStopReason::Completed, &ctx, &*deps.event_sink, &seq);
+        if let Err(reason) = dispatched {
+            return finish(&ctx, reason, deps.event_sink.as_ref(), &seq);
         }
 
         turn += 1;
@@ -352,9 +402,9 @@ async fn enforce_budget_gate(
     // Cancellation observed at the boundary wins: don't compact a cancelled run.
     if control.is_cancelled() {
         return Some(finish(
-            RunStopReason::Cancelled,
             ctx,
-            &*deps.event_sink,
+            RunStopReason::Cancelled,
+            deps.event_sink.as_ref(),
             seq,
         ));
     }
@@ -371,9 +421,9 @@ async fn enforce_budget_gate(
 
     if control.is_cancelled() {
         return Some(finish(
-            RunStopReason::Cancelled,
             ctx,
-            &*deps.event_sink,
+            RunStopReason::Cancelled,
+            deps.event_sink.as_ref(),
             seq,
         ));
     }
@@ -391,7 +441,7 @@ async fn enforce_budget_gate(
     };
     let message = blocked.error_message();
     emit_event(
-        &*deps.event_sink,
+        deps.event_sink.as_ref(),
         &ctx.run_id,
         &ctx.session_id,
         seq,
@@ -400,11 +450,52 @@ async fn enforce_budget_gate(
         },
     );
     Some(finish(
-        RunStopReason::Error { message },
         ctx,
-        &*deps.event_sink,
+        RunStopReason::Error { message },
+        deps.event_sink.as_ref(),
         seq,
     ))
+}
+
+/// The caller's terminal handling for a pumped stream outcome.
+///
+/// Cancelled / Error return the stop reason (the caller finishes the run);
+/// Ok yields the assistant content plus the tool calls to dispatch. Errors
+/// with partial tool calls still backfill their results before returning so
+/// the transcript never breaks the tool-call/result pairing.
+async fn handle_stream_outcome(
+    outcome: &StreamTurn,
+    ctx: &RunContext,
+    deps: &LoopDeps,
+    control: &RunControl,
+    seq: &AtomicU64,
+    turn: u32,
+    transcript: &mut Vec<Message>,
+) -> Result<(Vec<ToolCall>, Vec<Content>), RunStopReason> {
+    if matches!(outcome, StreamTurn::Ok { .. } | StreamTurn::Error { .. }) {
+        emit_turn_finished(ctx, deps.event_sink.as_ref(), seq, turn);
+    }
+    match outcome {
+        StreamTurn::Cancelled => Err(RunStopReason::Cancelled),
+        StreamTurn::Ok { content, calls } => Ok((calls.clone(), content.clone())),
+        StreamTurn::Error {
+            message,
+            partial_content,
+            partial_calls,
+        } => {
+            transcript.push(Message::Assistant {
+                content: partial_content.clone(),
+            });
+            if !partial_calls.is_empty() {
+                transcript.extend(
+                    dispatch_and_collect(partial_calls, turn, ctx, deps, control, seq).await,
+                );
+            }
+            Err(RunStopReason::Error {
+                message: message.clone(),
+            })
+        }
+    }
 }
 
 /// The outcome of pumping one model stream.
@@ -414,7 +505,7 @@ enum StreamTurn {
         content: Vec<Content>,
         calls: Vec<ToolCall>,
     },
-    /// The run was cancelled while the stream was open — no turn content.
+    /// The run was cancelled while the stream was open -- no turn content.
     Cancelled,
     /// Stream ended with `ModelEvent::Error`.
     Error {
@@ -422,6 +513,100 @@ enum StreamTurn {
         partial_content: Vec<Content>,
         partial_calls: Vec<ToolCall>,
     },
+}
+
+/// Accumulated state while pumping one model stream: the assistant content
+/// blocks and the in-progress tool call argument buffer.
+struct PumpState {
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<ToolCall>,
+    // Accumulator for in-progress tool call args: (id, name, args_json_fragments)
+    partial: Option<(String, String, String)>,
+}
+
+/// One classified stream event: keep pumping, stop at a clean terminal, or fail.
+enum PumpStep {
+    /// Keep polling the stream.
+    Continue,
+    /// `ModelEvent::Stop`: the model finished its turn cleanly.
+    Break,
+    /// `ModelEvent::Error`: stop and return the error message.
+    Error(String),
+}
+
+/// Classify one stream event: update the accumulators, emit non-terminal
+/// events, and report whether pumping should stop.
+///
+/// A `ModelEvent::Stop` ends the turn cleanly; `ModelEvent::Error` ends it
+/// with the partial content accumulated so far. Everything else is absorbed
+/// into `state` and pumping continues.
+fn absorb_event(
+    event: &ModelEvent,
+    state: &mut PumpState,
+    seq: &AtomicU64,
+    sink: &dyn EventSink,
+    ctx: &RunContext,
+) -> PumpStep {
+    match event {
+        ModelEvent::TextDelta(t) => {
+            state.text.push_str(t);
+            emit_event(
+                sink,
+                &ctx.run_id,
+                &ctx.session_id,
+                seq,
+                RunEventKind::TextDelta { text: t.clone() },
+            );
+            PumpStep::Continue
+        }
+        ModelEvent::ReasoningDelta(r) => {
+            state.reasoning.push_str(r);
+            // Reasoning deltas have no dedicated RunEventKind yet; they are
+            // preserved in Content::Reasoning blocks.
+            PumpStep::Continue
+        }
+        ModelEvent::ToolCallStart { id, name } => {
+            state.partial = Some((id.clone(), name.clone(), String::new()));
+            PumpStep::Continue
+        }
+        ModelEvent::ToolCallArgs { id, partial_json } => {
+            if let Some((cur_id, _, args)) = state.partial.as_mut()
+                && cur_id == id
+            {
+                args.push_str(partial_json);
+            }
+            PumpStep::Continue
+        }
+        ModelEvent::ToolCallEnd { id } => {
+            if let Some((_, name, args_str)) = state.partial.as_mut()
+                && !state.tool_calls.iter().any(|tc| tc.id == *id)
+            {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+                state.tool_calls.push(ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args,
+                });
+            }
+            state.partial = None;
+            PumpStep::Continue
+        }
+        ModelEvent::Usage(_usage) => {
+            // Token accounting -- no dedicated RunEventKind in this version.
+            PumpStep::Continue
+        }
+        ModelEvent::Stop(_reason) => {
+            // All StopReason variants (EndTurn, ToolUse, MaxTokens) are
+            // clean terminators -- the model finished its turn.
+            PumpStep::Break
+        }
+        ModelEvent::Error { message } => PumpStep::Error(message.clone()),
+        // ModelEvent is #[non_exhaustive]: future variants are ignored at the
+        // stream level (they are not terminal).
+        _ => PumpStep::Continue,
+    }
 }
 
 /// Pump a model stream: emit events, accumulate content and tool calls.
@@ -440,17 +625,18 @@ async fn pump_stream(
 ) -> StreamTurn {
     pin_mut!(stream);
 
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut tool_calls: Vec<ToolCall> = Vec::new();
-    // Accumulator for in-progress tool call args: (id, name, args_json_fragments)
-    let mut partial: Option<(String, String, String)> = None;
+    let mut state = PumpState {
+        text: String::new(),
+        reasoning: String::new(),
+        tool_calls: Vec::new(),
+        partial: None,
+    };
+    // The stream race is the drop protocol's teeth: cancelling mid-stream
+    // stops the model request immediately instead of burning tokens into a
+    // void until the stream happens to return.
     let cancel = control.cancel_token();
 
     loop {
-        // The stream race is the drop protocol's teeth: cancelling mid-stream
-        // stops the model request immediately instead of burning tokens into
-        // a void until the stream happens to return.
         let event = tokio::select! {
             _ = cancel.cancelled() => return StreamTurn::Cancelled,
             next = stream.next() => match next {
@@ -458,89 +644,41 @@ async fn pump_stream(
                 None => break,
             },
         };
-        match &event {
-            ModelEvent::TextDelta(t) => {
-                text.push_str(t);
-                emit_event(
-                    sink,
-                    &ctx.run_id,
-                    &ctx.session_id,
-                    seq,
-                    RunEventKind::TextDelta { text: t.clone() },
-                );
-            }
-            ModelEvent::ReasoningDelta(r) => {
-                reasoning.push_str(r);
-                // Reasoning deltas have no dedicated RunEventKind yet;
-                // they are preserved in Content::Reasoning blocks.
-            }
-            ModelEvent::ToolCallStart { id, name } => {
-                partial = Some((id.clone(), name.clone(), String::new()));
-            }
-            ModelEvent::ToolCallArgs { id, partial_json } => {
-                if let Some((cur_id, _, args)) = partial.as_mut()
-                    && cur_id == id
-                {
-                    args.push_str(partial_json);
-                }
-            }
-            ModelEvent::ToolCallEnd { id } => {
-                if let Some((_, name, args_str)) = partial.as_mut()
-                    && !tool_calls.iter().any(|tc| tc.id == *id)
-                {
-                    let args: serde_json::Value =
-                        serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
-                    tool_calls.push(ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        args,
-                    });
-                }
-                partial = None;
-            }
-            ModelEvent::Usage(_usage) => {
-                // Token accounting -- no dedicated RunEventKind in this version.
-            }
-            ModelEvent::Stop(_reason) => {
-                // All StopReason variants (EndTurn, ToolUse, MaxTokens) are
-                // clean terminators -- the model finished its turn.
-                break;
-            }
-            ModelEvent::Error { message } => {
+        match absorb_event(&event, &mut state, seq, sink, ctx) {
+            PumpStep::Continue => {}
+            PumpStep::Break => break,
+            PumpStep::Error(message) => {
                 let mut content = Vec::new();
-                if !reasoning.is_empty() {
-                    content.push(Content::Reasoning(reasoning));
+                if !state.reasoning.is_empty() {
+                    content.push(Content::Reasoning(state.reasoning));
                 }
-                if !text.is_empty() {
-                    content.push(Content::Text(text));
+                if !state.text.is_empty() {
+                    content.push(Content::Text(state.text));
                 }
                 return StreamTurn::Error {
-                    message: message.clone(),
+                    message,
                     partial_content: content,
-                    partial_calls: tool_calls,
+                    partial_calls: state.tool_calls,
                 };
             }
-            // ModelEvent is #[non_exhaustive]: future variants are ignored
-            // at the stream level (they are not terminal).
-            _ => {}
         }
     }
 
     // Build assistant content block from accumulated text, reasoning and tool calls.
     let mut content = Vec::new();
-    if !reasoning.is_empty() {
-        content.push(Content::Reasoning(reasoning));
+    if !state.reasoning.is_empty() {
+        content.push(Content::Reasoning(state.reasoning));
     }
-    if !text.is_empty() {
-        content.push(Content::Text(text));
+    if !state.text.is_empty() {
+        content.push(Content::Text(state.text));
     }
-    for tc in &tool_calls {
+    for tc in &state.tool_calls {
         content.push(Content::ToolCall(tc.clone()));
     }
 
     StreamTurn::Ok {
         content,
-        calls: tool_calls,
+        calls: state.tool_calls,
     }
 }
 
@@ -561,7 +699,7 @@ async fn dispatch_and_collect(
         approval_broker: &deps.approval_broker,
         hooks: &deps.hooks,
         seq,
-        sink: &*deps.event_sink,
+        sink: deps.event_sink.as_ref(),
         control,
     };
     let (results, _terminal) = dispatch_batch(calls, &dctx, deps.tool_mode).await;
@@ -570,13 +708,13 @@ async fn dispatch_and_collect(
 
 /// Emit `RunFinished` and return the reason.
 fn finish(
-    reason: RunStopReason,
     ctx: &RunContext,
-    sink: &dyn EventSink,
+    reason: RunStopReason,
+    event_sink: &dyn EventSink,
     seq: &AtomicU64,
 ) -> RunStopReason {
     emit_event(
-        sink,
+        event_sink,
         &ctx.run_id,
         &ctx.session_id,
         seq,
