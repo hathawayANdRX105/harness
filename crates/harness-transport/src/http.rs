@@ -139,13 +139,10 @@ fn event_stream(
         let value = live_run_id.clone();
         async move {
             let event = event.ok()?;
-            if event.run_id == value {
-                Some(Ok(Event::default().data(
-                    serde_json::to_string(&event).unwrap_or_else(|_| "{}".into()),
-                )))
-            } else {
-                None
-            }
+            (event.run_id == value).then(|| {
+                Ok(Event::default()
+                    .data(serde_json::to_string(&event).unwrap_or_else(|_| "{}".into())))
+            })
         }
     });
 
