@@ -150,16 +150,18 @@ async fn main() -> ExitCode {
 /// expands here so `session.directory = "~/..."` resolves.  Returns `path`
 /// unchanged when there is no leading `~` or `$HOME` is unset.
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        match std::env::var("HOME") {
-            Ok(home) => format!("{home}/{rest}"),
-            Err(_) => path.to_string(),
-        }
-    } else if path == "~" {
-        std::env::var("HOME").unwrap_or_else(|_| "~".into())
-    } else {
-        path.to_string()
+    match path.strip_prefix("~/") {
+        // "~/rest" expands to $HOME/rest; a bare "~" expands to $HOME itself,
+        // falling back to a literal "~" when HOME is unset.
+        Some(rest) => format!("{}/{}", home_dir(), rest),
+        None if path == "~" => home_dir(),
+        None => path.to_string(),
     }
+}
+
+/// `$HOME`, or a literal "~" when the variable is unset.
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "~".into())
 }
 
 /// Read the UDS bearer token from the env variable named by the config.  The
@@ -195,7 +197,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         std::fs::create_dir_all(&session_dir)
             .with_context(|| format!("create session directory {session_dir}"))?;
     }
-    let store_path = PathBuf::from(&session_dir).join("sessions.sqlite");
+    // Turso (libsql) embedded mode persists to a single local database file
+    // beside the session directory — named `.db` (not `.sqlite`) because the
+    // engine is libsql, not plain SQLite.
+    let store_path = PathBuf::from(&session_dir).join("sessions.db");
     let store: Arc<dyn SessionStore> = Arc::new(
         TursoSessionStore::open(&store_path)
             .await

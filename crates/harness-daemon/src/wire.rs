@@ -72,13 +72,16 @@ impl EventLog for StoreEventLog {
     /// `after_seq`, in ascending order.  Read failures yield an empty replay
     /// window rather than failing the connection.
     async fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent> {
-        match self.store.events_for_run(run_id).await {
-            Ok(events) => events
-                .into_iter()
-                .filter(|event| event.seq > after_seq)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        self.store
+            .events_for_run(run_id)
+            .await
+            .map(|events| {
+                events
+                    .into_iter()
+                    .filter(|event| event.seq > after_seq)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

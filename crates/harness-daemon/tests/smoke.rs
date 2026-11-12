@@ -25,7 +25,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// The offline config: the upstream URL is never dialed at startup (the model
 /// adapter is lazy), so the smoke test needs no API backend. Each test gets
 /// its own `[session]` directory — two daemons otherwise race on the default
-/// `~/.local/share/harness/sessions/sessions.sqlite` file lock.
+/// `~/.local/share/harness/sessions/sessions.db` file lock.
 fn smoke_config(session_dir: &Path) -> String {
     format!(
         r#"version = 1
