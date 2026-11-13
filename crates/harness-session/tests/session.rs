@@ -483,6 +483,54 @@ async fn event_isolation_between_runs() -> Result<(), SessionStoreError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// latest run resolution (#9)
+// ---------------------------------------------------------------------------
+
+/// Purpose: `latest_run_for_session` resolves a session to the run whose
+/// latest event carries the highest seq, so a client that knows only the
+/// session can re-attach to its most recent run.
+/// Scenario: create a session, append one event to run-a (seq 1) and two
+/// events to run-b (seq 1, 2), then query `latest_run_for_session`.
+/// Acceptance: returns `Some(run_b)` — highest max seq wins.
+#[tokio::test]
+async fn latest_run_for_session_returns_newest_run() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let session = SessionId("resume-session".into());
+    store.create_session(&session).await?;
+    let run_a = RunId("run-a".into());
+    let run_b = RunId("run-b".into());
+    store
+        .append_event(&run_started_event(&run_a, &session, 1))
+        .await?;
+    store
+        .append_event(&run_started_event(&run_b, &session, 1))
+        .await?;
+    store
+        .append_event(&run_finished_event(&run_b, &session, 2))
+        .await?;
+    let latest = store.latest_run_for_session(&session).await?;
+    assert_eq!(latest, Some(run_b), "the run with the highest max seq wins");
+    Ok(())
+}
+
+/// Purpose: `latest_run_for_session` reports `None` for a session with no
+/// runs, so the transport can reject a `session_id`-only `subscribe`.
+/// Scenario: query `latest_run_for_session` for a session that was never
+/// created.
+/// Acceptance: returns `Ok(None)`.
+#[tokio::test]
+async fn latest_run_for_session_none_for_unknown_session() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let session = SessionId("no-such-session".into());
+    let latest = store.latest_run_for_session(&session).await?;
+    assert_eq!(latest, None, "an unknown session has no runs to resume");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Event gap detection
+
 /// Purpose: re-appending an already-persisted event is idempotent (writes
 /// nothing), since `run_events.idempotency_key` is `run_id:seq`.
 /// Scenario: append the same (run_id, seq) twice.

@@ -11,12 +11,16 @@
 //! # Reconnection
 //!
 //! On reconnect the client sends a `subscribe` method with `run_id`,
-//! optional `session_id`, and `after_seq`; the server replies with a
-//! `{"subscribed": run_id, "session_id"}` success frame, replays missed
-//! events from the [`EventLog`](crate::EventLog) seam before forwarding live
-//! events, and then forwards only events for that run.  This keeps the
-//! client's event log contiguous across reconnections without the transport
-//! needing session state.
+//! optional `session_id`, and `after_seq`.  When `run_id` is absent but
+//! `session_id` is given, the server resolves the session's latest run
+//! through the [`EventLog`](crate::EventLog) seam and binds to it — so a
+//! client that knows only the session can re-attach (#9).  A session with
+//! no runs answers with an `INVALID_REQUEST` error.  The server replies
+//! with a `{"subscribed": run_id, "session_id"}` success frame, replays
+//! missed events from the `EventLog` seam before forwarding live events,
+//! and then forwards only events for that run.  This keeps the client's
+//! event log contiguous across reconnections without the transport needing
+//! session state.
 //!
 //! # Design
 //!
@@ -37,7 +41,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
-use harness_core::{RunEvent, RunId};
+use harness_core::{RunEvent, RunId, SessionId};
 use serde_json::json;
 
 use crate::frame::{JsonRpcRequest, JsonRpcResponse, error_code};
@@ -100,12 +104,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<TransportState>) {
 struct SubscribeState {
     run_id: RunId,
     after_seq: u64,
-    /// Optional session the client is re-attaching to (#9).  v1 semantics:
-    /// the server echoes it in the subscribe reply; replay stays run-scoped
-    /// via the `EventLog` seam (`run_id` + `after_seq`), so the client names
-    /// the run it re-attaches to.  Resolving the session's latest run
-    /// server-side is intentionally out of scope for v1.
-    session_id: Option<String>,
+    /// Optional session the client is re-attaching to (#9).  Echoed in the
+    /// subscribe reply; replay stays run-scoped via the `EventLog` seam
+    /// (`run_id` + `after_seq`).
     replayed: bool,
 }
 
@@ -151,7 +152,7 @@ async fn read_loop(
         }
 
         let response = match req.method.as_str() {
-            "subscribe" => handle_subscribe(&req, &subscription).await,
+            "subscribe" => handle_subscribe(&req, &state, &subscription).await,
             _ => dispatch_jsonrpc(&req, &state),
         };
         if !send_response(&sender, response).await {
@@ -161,8 +162,15 @@ async fn read_loop(
 }
 /// Handle the documented `subscribe` method: record this connection's run
 /// subscription and acknowledge with `{"subscribed": run_id, "session_id"}`.
+///
+/// When `params` names `session_id` but no `run_id`, the server resolves
+/// the session's latest run through `state.event_log`
+/// (`EventLog::latest_run_for_session`) and binds to it (#9).  `run_id`
+/// present binds as before; `run_id` absent and `session_id` absent is
+/// `INVALID_REQUEST`.
 async fn handle_subscribe(
     req: &JsonRpcRequest,
+    state: &TransportState,
     subscription: &tokio::sync::Mutex<Option<SubscribeState>>,
 ) -> JsonRpcResponse {
     let Some(params) = req.params.as_ref().and_then(|params| params.as_object()) else {
@@ -172,34 +180,64 @@ async fn handle_subscribe(
             "subscribe params must be an object",
         );
     };
-    let Some(run_id) = params.get("run_id").and_then(|value| value.as_str()) else {
-        return JsonRpcResponse::error(
-            req.id.clone(),
-            error_code::INVALID_PARAMS,
-            "subscribe requires a string run_id",
-        );
-    };
-    let run_id = run_id.to_string();
-    let after_seq = params
-        .get("after_seq")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
+
+    let run_id_provided = params.contains_key("run_id");
+    let run_id = params.get("run_id").and_then(|value| value.as_str());
     let session_id = params
         .get("session_id")
         .and_then(|value| value.as_str())
         .map(|value| value.to_string());
 
+    // One match over the input shape: a string `run_id` binds directly, a
+    // non-string one keeps the historical rejection, a session-only
+    // subscribe resolves the session's latest run, and neither is a
+    // missing-parameter error.
+    let run_id = match (run_id, run_id_provided, session_id.as_deref()) {
+        (Some(run_id), _, _) => RunId(run_id.to_string()),
+        (None, true, _) => {
+            return JsonRpcResponse::error(
+                req.id.clone(),
+                error_code::INVALID_PARAMS,
+                "subscribe requires a string run_id",
+            );
+        }
+        (None, false, Some(session_id)) => match state
+            .event_log
+            .latest_run_for_session(&SessionId(session_id.to_string()))
+            .await
+        {
+            Some(run_id) => run_id,
+            None => {
+                return JsonRpcResponse::error(
+                    req.id.clone(),
+                    error_code::INVALID_REQUEST,
+                    "no runs for session",
+                );
+            }
+        },
+        (None, false, None) => {
+            return JsonRpcResponse::error(
+                req.id.clone(),
+                error_code::INVALID_REQUEST,
+                "subscribe requires a run_id or a session_id",
+            );
+        }
+    };
+
+    let after_seq = params
+        .get("after_seq")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+
     let subscription_state = SubscribeState {
-        run_id: RunId(run_id.clone()),
+        run_id: run_id.clone(),
         after_seq,
-        session_id: session_id.clone(),
         replayed: false,
     };
-    let bound_session = subscription_state.session_id.clone();
     *subscription.lock().await = Some(subscription_state);
     JsonRpcResponse::success(
         req.id.clone(),
-        json!({ "subscribed": run_id, "session_id": bound_session }),
+        json!({ "subscribed": run_id.0.clone(), "session_id": session_id.clone() }),
     )
 }
 
@@ -258,10 +296,9 @@ async fn event_push_loop(
 }
 
 /// Replay the subscribed run's persisted events once, before any live
-/// event is forwarded.  v1 session binding (#9): when the subscription
-/// carries a `session_id`, the server echoes it in the subscribe reply;
-/// replay itself stays run-scoped (`run_id` + `after_seq`) through the
-/// `EventLog` seam, so the client names the run it re-attaches to.  No-op
+/// event is forwarded.  The run is whatever the connection subscribed to:
+/// a `run_id` named by the client, or the session's latest run resolved
+/// server-side when the client subscribed with `session_id` only.  No-op
 /// when the connection is unsubscribed or the replay already happened.
 async fn maybe_replay(
     sender: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,

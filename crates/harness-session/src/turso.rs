@@ -434,6 +434,35 @@ impl SessionStore for TursoSessionStore {
         Ok(ids)
     }
 
+    async fn latest_run_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<RunId>, SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT run_id FROM run_events WHERE session_id = ?1
+                 GROUP BY run_id
+                 ORDER BY MAX(seq) DESC
+                 LIMIT 1",
+                params![session_id.0.clone()],
+            )
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let id: String = row
+            .get(0)
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        Ok(Some(RunId(id)))
+    }
+
     async fn delete_session(&self, id: &SessionId) -> Result<(), SessionStoreError> {
         let _guard = self.gate.lock().await;
         // Check existence within this same gate-held section: calling

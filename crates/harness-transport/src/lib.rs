@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use crate::frame::{JsonRpcResponse, error_code};
 use async_trait::async_trait;
-use harness_core::{EventSink, RunEvent, RunId};
+use harness_core::{EventSink, RunEvent, RunId, SessionId};
 use serde_json::json;
 use thiserror::Error;
 
@@ -144,6 +144,13 @@ pub trait EventLog: Send + Sync + 'static {
     /// Return all events for `run_id` whose `seq` is strictly greater than
     /// `after_seq`, in ascending order.
     async fn read_events_since(&self, run_id: &RunId, after_seq: u64) -> Vec<RunEvent>;
+
+    /// Return the most recent run for `session_id`, or `None` when the
+    /// session has no runs.  The WebSocket transport uses this to resolve a
+    /// `session_id`-only `subscribe` to the run it should bind to (#9).
+    /// Read failures yield `None` so a degraded seam never breaks a
+    /// connection.
+    async fn latest_run_for_session(&self, session_id: &SessionId) -> Option<RunId>;
 }
 
 // ── Error type ────────────────────────────────────────────────────────────

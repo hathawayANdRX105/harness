@@ -6,10 +6,6 @@
 //! [`TransportState`]. Scheduling, the loop, tools and compaction all live in
 //! their own crates; this process only assembles, starts, supervises and ends.
 
-mod lifecycle;
-mod pidlock;
-mod wire;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -28,8 +24,8 @@ use harness_session::{RecallStore, SessionStore, turso::TursoSessionStore};
 use harness_transport::{EventLog, uds::UdsConfig};
 use harness_transport::{TransportState, http, ws};
 
-use pidlock::PidLock;
-use wire::{DaemonHandler, StoreEventLog};
+use harness_daemon::pidlock::PidLock;
+use harness_daemon::wire::{DaemonHandler, StoreEventLog};
 
 /// Default UDS socket path for the v1 daemon.
 const DEFAULT_SOCKET: &str = "/tmp/harness-daemon.sock";
@@ -124,7 +120,7 @@ fn build_runtime(
         std::env::current_dir().context("resolving the current directory for tool execution")?;
     HarnessBuilder::new(spec)
         .with_model(Arc::new(model))
-        .with_policy(Arc::new(wire::DaemonPolicy))
+        .with_policy(Arc::new(harness_daemon::wire::DaemonPolicy))
         .with_event_sink(event_sink)
         .with_cwd(cwd)
         .with_config(config)
@@ -245,14 +241,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         cli.http
     );
 
-    lifecycle::wait_for_shutdown_signal().await;
+    harness_daemon::lifecycle::wait_for_shutdown_signal().await;
     eprintln!("daemon: shutdown signal received");
     // Stop accepting new connections before draining in-flight runs.
     http_handle.abort();
     uds_handle.abort();
     let _ = http_handle.await;
     let _ = uds_handle.await;
-    lifecycle::drain(&handler, &cli.socket).await;
+    harness_daemon::lifecycle::drain(&handler, &cli.socket).await;
     drop(lock);
     Ok(())
 }

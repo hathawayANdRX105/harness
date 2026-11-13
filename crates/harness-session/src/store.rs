@@ -150,6 +150,18 @@ pub trait SessionStore: Send + Sync + 'static {
     /// log (`DISTINCT run_id` over `run_events`), which is what makes the
     /// daemon's restart hydration possible without a second schema object.
     async fn run_ids(&self) -> Result<Vec<RunId>, SessionStoreError>;
+    /// Return the most recent run for `session_id`, or `None` when the
+    /// session has no runs.
+    ///
+    /// "Most recent" is the run whose latest event carries the highest
+    /// `seq` — the event log is append-only, so the highest seq is the
+    /// latest write. Returns `None` when the session has no runs (or is
+    /// unknown entirely); neither can be resumed, which is exactly what the
+    /// transport needs to answer a `session_id`-only `subscribe`.
+    async fn latest_run_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<RunId>, SessionStoreError>;
 
     /// Delete a session and all its data (messages and events).
     async fn delete_session(&self, id: &SessionId) -> Result<(), SessionStoreError>;
