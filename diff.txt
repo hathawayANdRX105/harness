@@ -1,0 +1,541 @@
+diff --git a/arch/harness-daemon-runtime.svg b/arch/harness-daemon-runtime.svg
+index bf0fb975..09cb74d7 100644
+--- a/arch/harness-daemon-runtime.svg
++++ b/arch/harness-daemon-runtime.svg
+@@ -129,7 +129,7 @@
+     <rect x="848" y="554" width="88" height="26" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="892" y="571">skill</text>
+     <rect x="944" y="554" width="120" height="26" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="1004" y="571">MCP 桥（mcp__*）</text>
+   </g>
+-  <text x="1080" y="571" font-size="9.5" fill="#64748b">路径容器化 · spill · 每会话 allowlist</text>
++  <text x="1080" y="571" font-size="9.5" fill="#64748b">路径容器化 · spill · allowlist · subagent</text>
+   <line x1="1007" y1="450" x2="1007" y2="520" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+   <text x="1014" y="492" font-size="10" fill="#15803d">LoopDeps.tools</text>
+ 
+@@ -194,8 +194,8 @@
+   <rect x="40" y="880" width="260" height="70" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 3"/>
+   <text x="56" y="904" font-size="11" font-weight="600" fill="#475569">已规划 / 讨论中</text>
+   <text x="56" y="922" font-size="10" fill="#64748b">RunStopReason::BudgetBlocked 变体（待批）</text>
+-  <text x="56" y="938" font-size="10" fill="#64748b">session→latest-run 解析 · RecallStore/FTS（讨论中）</text>
+-  <text x="56" y="952" font-size="10" fill="#64748b">terminal / subagent / webfetch 工具（v2）</text>
++  <text x="56" y="938" font-size="10" fill="#64748b">RecallStore/FTS 检索增强（讨论中）</text>
++  <text x="56" y="952" font-size="10" fill="#64748b">子代理超时 / 级联取消 / 嵌套子代理（v2 待议）</text>
+ 
+   <!-- 图例 -->
+   <text x="40" y="1000" font-size="10.5" fill="#94a3b8">绿 = 运行时（loop/scheduler/tools）· 橙 = 数据层 · 紫 = 启动装配 · 红 = 拒绝/单实例 · 蓝 = core 契约 · 橙虚线框 = 下一个 PR</text>
+diff --git a/crates/harness-builder/tests/builder.rs b/crates/harness-builder/tests/builder.rs
+index 415dfe91..406667ca 100644
+--- a/crates/harness-builder/tests/builder.rs
++++ b/crates/harness-builder/tests/builder.rs
+@@ -34,8 +34,8 @@ use harness_builder::{
+     mcp_server_config_from_entry,
+ };
+ use harness_config::{
+-    BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry, ModelAlias,
+-    ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, UpstreamConfig,
++    AgentsConfig, BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry,
++    ModelAlias, ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, UpstreamConfig,
+ };
+ use harness_core::event::{EventSink, RunEvent, RunEventKind};
+ use harness_core::message::Message;
+@@ -513,6 +513,7 @@ fn config_bindings_map_into_runtime() -> Result<(), Box<dyn std::error::Error>>
+         },
+         registry: RegistryConfig::default(),
+         scheduler: SchedulerConfig::default(),
++        agents: AgentsConfig::default(),
+     };
+ 
+     let bindings = ConfigBindings::from_config(&config)?;
+diff --git a/crates/harness-config/src/config.rs b/crates/harness-config/src/config.rs
+index 60da3c5e..a554e445 100644
+--- a/crates/harness-config/src/config.rs
++++ b/crates/harness-config/src/config.rs
+@@ -58,6 +58,10 @@ pub struct Config {
+     /// Scheduler concurrency and queueing limits.
+     #[serde(default)]
+     pub scheduler: SchedulerConfig,
++    /// Agent configuration: subagent profiles the `subagent` tool can
++    /// spawn. Absent (or empty) means delegation is unavailable.
++    #[serde(default)]
++    pub agents: AgentsConfig,
+ }
+ 
+ pub(crate) fn default_version() -> u32 {
+@@ -75,6 +79,7 @@ impl fmt::Debug for Config {
+             .field("mcp", &self.mcp)
+             .field("registry", &self.registry)
+             .field("scheduler", &self.scheduler)
++            .field("agents", &self.agents)
+             .finish()
+     }
+ }
+@@ -389,3 +394,45 @@ impl Default for SchedulerConfig {
+         }
+     }
+ }
++
++// ── Agents ────────────────────────────────────────────────────────────────
++
++/// Agent configuration: subagent profiles the `subagent` tool can spawn.
++///
++/// A profile names a restricted tool subset and a turn ceiling for a child
++/// run. A subagent MUST be strictly more restricted than its parent: the
++/// profile's tools must be a subset of what the parent itself may call, so
++/// delegation never amplifies the caller's tool authority. This is a trust
++/// boundary, not a convenience — a compromised or misaligned subagent
++/// runs under the parent's policy with the parent's credentials.
++#[derive(Clone, Debug, Default, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct AgentsConfig {
++    /// Named subagent profiles. Empty means the `subagent` tool (when
++    /// registered by the daemon) cannot spawn any child run.
++    #[serde(default)]
++    pub subagents: Vec<SubagentProfile>,
++}
++
++/// One named subagent profile: the tools and turn ceiling of a child run.
++#[derive(Clone, Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct SubagentProfile {
++    /// Profile name referenced by the `subagent` tool's `profile` argument.
++    pub name: String,
++    /// Tool names the child run may call. Empty means the default read-only
++    /// trio (`read`, `glob`, `grep`) — a subagent must be able to observe
++    /// its environment without necessarily changing it.
++    #[serde(default)]
++    pub tools: Vec<String>,
++    /// Maximum turns for the child run. Defaults to harness-rs's subagent
++    /// default of 12.
++    #[serde(default = "default_subagent_max_turns")]
++    pub max_turns: u32,
++}
++
++pub(crate) const DEFAULT_SUBAGENT_MAX_TURNS: u32 = 12;
++
++pub(crate) fn default_subagent_max_turns() -> u32 {
++    DEFAULT_SUBAGENT_MAX_TURNS
++}
+diff --git a/crates/harness-config/src/lib.rs b/crates/harness-config/src/lib.rs
+index e41fca98..7ebf0322 100644
+--- a/crates/harness-config/src/lib.rs
++++ b/crates/harness-config/src/lib.rs
+@@ -36,8 +36,9 @@ mod loader;
+ mod migration;
+ 
+ pub use config::{
+-    BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry, ModelAlias,
+-    ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, UpstreamConfig,
++    AgentsConfig, BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry,
++    ModelAlias, ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, SubagentProfile,
++    UpstreamConfig,
+ };
+ pub use error::ConfigError;
+ pub use loader::{load, load_from_path, load_or_defaults};
+diff --git a/crates/harness-config/src/loader.rs b/crates/harness-config/src/loader.rs
+index cf87df84..c8aea065 100644
+--- a/crates/harness-config/src/loader.rs
++++ b/crates/harness-config/src/loader.rs
+@@ -130,6 +130,7 @@ fn defaults_only() -> Config {
+             skills: vec![],
+         },
+         scheduler: SchedulerConfig::default(),
++        agents: AgentsConfig { subagents: vec![] },
+     }
+ }
+ 
+diff --git a/crates/harness-core/src/event.rs b/crates/harness-core/src/event.rs
+index 1257b615..6f665d55 100644
+--- a/crates/harness-core/src/event.rs
++++ b/crates/harness-core/src/event.rs
+@@ -48,7 +48,10 @@ pub struct RunEvent {
+ }
+ 
+ /// The kinds of thing a run can report. `#[non_exhaustive]`: the compaction
+-/// and budget kinds land when harness-context (#5) is wired in.
++/// and budget kinds land when harness-context (#5) is wired in. The wire
++/// `type` tags are the frozen contract with transport subscribers: `SubagentStarted`
++/// and `SubagentReport` (issue #30) are the only variants approved beyond
++/// the original set; adding anything else requires maintainer sign-off.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(tag = "type", rename_all = "snake_case")]
+ #[non_exhaustive]
+@@ -97,6 +100,37 @@ pub enum RunEventKind {
+     /// A failure encoded as an event — the loop-level twin of the model
+     /// stream's terminal `Error`.
+     Error { message: String },
++    /// A subagent run started: the model delegated a task to a child run
++    /// anchored under `profile` (issue #30).
++    SubagentStarted {
++        child_run_id: RunId,
++        profile: String,
++    },
++    /// A subagent run reached a terminal state. `status` collapses the
++    /// child's terminal `reason` to the outcome the parent acts on
++    /// (issue #30).
++    SubagentReport {
++        child_run_id: RunId,
++        status: SubagentStatus,
++        reason: RunStopReason,
++    },
++}
++/// How a subagent run ended, derived from the child's terminal stop
++/// reason: `Completed` <- `RunStopReason::Completed`, `Blocked` <-
++/// `RunStopReason::MaxTurns`, `DoneWithConcerns` <-
++/// `RunStopReason::Error` / `RunStopReason::Cancelled`. A subagent report
++/// is not a tool failure: the child reached a terminal state, just one the
++/// parent may want to act on (retry with another profile, surface to the
++/// user, or escalate).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum SubagentStatus {
++    /// The child completed its task naturally.
++    Completed,
++    /// The child hit its `max_turns` ceiling without completing.
++    Blocked,
++    /// The child ended on an error or cancellation — done, with concerns.
++    DoneWithConcerns,
+ }
+ 
+ /// The observer seam: implementations push into a bounded channel and never
+diff --git a/crates/harness-core/tests/event_log.rs b/crates/harness-core/tests/event_log.rs
+index 3645c547..d6e0ec61 100644
+--- a/crates/harness-core/tests/event_log.rs
++++ b/crates/harness-core/tests/event_log.rs
+@@ -8,7 +8,7 @@
+ 
+ use parking_lot::Mutex;
+ 
+-use harness_core::event::{EventSink, RunEvent, RunEventKind};
++use harness_core::event::{EventSink, RunEvent, RunEventKind, SubagentStatus};
+ use harness_core::message::ToolCall;
+ use harness_core::policy::{ApprovalResult, PolicyOutcome, PolicyStage};
+ use harness_core::run::{RunId, RunStopReason, SessionId};
+@@ -118,6 +118,21 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
+                 message: "boom".into(),
+             },
+         ),
++        event(
++            17,
++            RunEventKind::SubagentStarted {
++                child_run_id: RunId("r-1--sub0".into()),
++                profile: "scout".into(),
++            },
++        ),
++        event(
++            18,
++            RunEventKind::SubagentReport {
++                child_run_id: RunId("r-1--sub0".into()),
++                status: SubagentStatus::Blocked,
++                reason: RunStopReason::MaxTurns,
++            },
++        ),
+     ];
+     for event in &events {
+         let wire = serde_json::to_value(event)?;
+@@ -143,6 +158,14 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
+     assert_eq!(wire["reason"]["kind"], "completed");
+     let wire = serde_json::to_value(&events[3])?;
+     assert_eq!(wire["reason"]["kind"], "max_turns");
++    let wire = serde_json::to_value(&events[16])?;
++    assert_eq!(wire["type"], "subagent_started");
++    assert_eq!(wire["child_run_id"], "r-1--sub0");
++    let wire = serde_json::to_value(&events[17])?;
++    assert_eq!(wire["type"], "subagent_report");
++    assert_eq!(wire["status"], "blocked");
++    assert_eq!(wire["reason"]["kind"], "max_turns");
++
+     Ok(())
+ }
+ 
+diff --git a/crates/harness-daemon/Cargo.toml b/crates/harness-daemon/Cargo.toml
+index 9c229bc6..71a21478 100644
+--- a/crates/harness-daemon/Cargo.toml
++++ b/crates/harness-daemon/Cargo.toml
+@@ -35,8 +35,9 @@ axum = { version = "0.8" }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ thiserror = "2"
+-# (tokio-util lives in dev-dependencies: only the test stub Tool impls use
+-# its CancellationToken.)
++# tokio-util: CancellationToken appears in the Tool trait signature the
++# daemon's subagent tool implements (and the test stubs use).
++tokio-util = { version = "0.7", default-features = false }
+ 
+ [dev-dependencies]
+ # The smoke test sends SIGTERM to the daemon child process.
+diff --git a/crates/harness-daemon/src/lib.rs b/crates/harness-daemon/src/lib.rs
+index be5c47bd..e21981ee 100644
+--- a/crates/harness-daemon/src/lib.rs
++++ b/crates/harness-daemon/src/lib.rs
+@@ -6,5 +6,6 @@
+ 
+ pub mod lifecycle;
+ pub mod pidlock;
++pub mod subagent;
+ pub mod tools;
+ pub mod wire;
+diff --git a/crates/harness-daemon/src/main.rs b/crates/harness-daemon/src/main.rs
+index c33d3a88..65c1f858 100644
+--- a/crates/harness-daemon/src/main.rs
++++ b/crates/harness-daemon/src/main.rs
+@@ -6,6 +6,7 @@
+ //! [`TransportState`]. Scheduling, the loop, tools and compaction all live in
+ //! their own crates; this process only assembles, starts, supervises and ends.
+ 
++use std::collections::HashMap;
+ use std::path::PathBuf;
+ use std::process::ExitCode;
+ use std::sync::Arc;
+@@ -15,9 +16,10 @@ use clap::Parser;
+ use harness_builder::{
+     AssembledRuntime, BUILTIN_TOOLS, HarnessBuilder, HarnessSpec, ModelSpec, ToolKind, ToolSpec,
+ };
+-use harness_config::Config;
++use harness_config::{Config, SubagentProfile};
+ use harness_core::model::ModelInfo;
+-use harness_core::{EventSink, RunEvent};
++use harness_core::tool::Tool;
++use harness_core::{EventSink, Model, RunEvent};
+ use harness_model::OpenAIModel;
+ use harness_scheduler::Scheduler;
+ use harness_session::{RecallStore, SessionStore, turso::TursoSessionStore};
+@@ -26,6 +28,7 @@ use harness_transport::ws;
+ use harness_transport::{EventLog, TransportState, uds::UdsConfig};
+ 
+ use harness_daemon::pidlock::PidLock;
++use harness_daemon::subagent::SubagentTool;
+ use harness_daemon::tools::ToolCatalog;
+ use harness_daemon::wire::{DaemonHandler, StoreEventLog};
+ 
+@@ -88,8 +91,9 @@ fn build_model(config: &Config) -> anyhow::Result<OpenAIModel> {
+ /// model, and the config-mapped bindings (limits, aliases, MCP servers).
+ fn build_runtime(
+     config: &Config,
+-    model: OpenAIModel,
++    model: Arc<dyn Model>,
+     event_sink: Arc<dyn EventSink>,
++    subagent_tool: Option<Arc<dyn Tool>>,
+ ) -> anyhow::Result<AssembledRuntime> {
+     // The model instance is injected by the host; the spec declares the same
+     // model in its directory so the builder can validate the injection.
+@@ -115,17 +119,32 @@ fn build_runtime(
+             manifest: Default::default(),
+         })
+         .to_vec();
++    // The `subagent` tool is declared as external so the builder validates
++    // the injection and installs it into the base tool set; per-session
++    // allowlists gate it like any other tool.
++    if subagent_tool.is_some() {
++        spec.tools.push(ToolSpec {
++            name: "subagent".into(),
++            kind: ToolKind::External,
++            server: None,
++            remote: None,
++            manifest: Default::default(),
++        });
++    }
+     let cwd =
+         std::env::current_dir().context("resolving the current directory for tool execution")?;
+-    HarnessBuilder::new(spec)
+-        .with_model(Arc::new(model))
++    let mut builder = HarnessBuilder::new(spec)
++        .with_model(Arc::clone(&model))
+         .with_policy(Arc::new(harness_daemon::wire::DaemonPolicy))
+         .with_event_sink(event_sink)
+-        .with_cwd(cwd)
++        .with_cwd(cwd);
++    builder = builder
+         .with_config(config)
+-        .context("mapping the config onto builder bindings")?
+-        .build()
+-        .context("assembling the runtime")
++        .context("mapping the config onto builder bindings")?;
++    if let Some(tool) = subagent_tool {
++        builder = builder.with_tool(tool);
++    }
++    builder.build().context("assembling the runtime")
+ }
+ 
+ /// A transient [`EventSink`] that forwards into `event_tx`: used while
+@@ -193,7 +212,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
+             .with_context(|| format!("config {}", path.display()))?,
+         None => harness_config::load_or_defaults().context("config")?,
+     };
+-    let model = build_model(&config)?;
++    let model: Arc<dyn Model> = Arc::new(build_model(&config)?);
+     let scheduler = Scheduler::new(
+         config.scheduler.queue_capacity,
+         config.scheduler.max_concurrency,
+@@ -222,21 +241,54 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
+     let store: Arc<dyn SessionStore> = Arc::new(store_inner);
+     let event_log: Arc<dyn EventLog> = Arc::new(StoreEventLog::new(store.clone()));
+     // The broadcast channel is created up front so the runtime's event sink
+-    // and the transport state share one `tx`.
++    // and the transport state share one `tx`; it also doubles as the event
++    // sink for subagent children, whose events fan out to transport clients.
+     let (event_tx, _) = tokio::sync::broadcast::channel(1024);
++    let event_sink: Arc<dyn EventSink> = Arc::new(EarlyEventSink(Arc::new(event_tx.clone())));
++
++    // The `subagent` tool is registered only when profiles are configured.
++    // It is injected before assembly and wired to the catalog right after
++    // (the catalog snapshot needs runtime.tools, which needs the tool — the
++    // shared sink created above breaks the construction circle).
++    let subagent_tool = if config.agents.subagents.is_empty() {
++        None
++    } else {
++        let profiles: HashMap<String, SubagentProfile> = config
++            .agents
++            .subagents
++            .iter()
++            .cloned()
++            .map(|profile| (profile.name.clone(), profile))
++            .collect();
++        Some(Arc::new(SubagentTool::new(
++            Arc::clone(&model),
++            profiles,
++            Arc::clone(&event_sink),
++            Arc::new(harness_daemon::wire::DaemonPolicy),
++        )))
++    };
++    let injected: Option<Arc<dyn Tool>> = subagent_tool
++        .as_ref()
++        .map(|tool| Arc::clone(tool) as Arc<dyn Tool>);
++
+     // The runtime is assembled before the handler: its tool set is the
+     // catalog's one-time base snapshot, registered once at startup.
+     let runtime = build_runtime(
+         &config,
+-        model,
+-        Arc::new(EarlyEventSink(Arc::new(event_tx.clone()))),
++        Arc::clone(&model),
++        Arc::clone(&event_sink),
++        injected,
+     )?;
+     let catalog = Arc::new(ToolCatalog::new(runtime.tools.clone()));
++    if let Some(tool) = &subagent_tool {
++        tool.set_catalog(Arc::clone(&catalog));
++    }
+     let handler = Arc::new(DaemonHandler::new(
+         scheduler.clone(),
+         store,
+         recall,
+         catalog,
++        subagent_tool.clone(),
+     ));
+     let state = Arc::new(TransportState::with_event_tx(
+         handler.clone(),
+diff --git a/crates/harness-daemon/src/tools.rs b/crates/harness-daemon/src/tools.rs
+index d1788588..68e4400f 100644
+--- a/crates/harness-daemon/src/tools.rs
++++ b/crates/harness-daemon/src/tools.rs
+@@ -67,6 +67,18 @@ impl ToolCatalog {
+         }
+     }
+ 
++    /// Look one base tool up by name, e.g. for resolving a profile's tool
++    /// subset at subagent-spawn time.
++    pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
++        self.base.iter().find(|tool| tool.name() == name).cloned()
++    }
++
++    /// Every base tool's name, in base order — for error messages that list
++    /// what a caller may select.
++    pub fn names(&self) -> Vec<&str> {
++        self.base.iter().map(|tool| tool.name()).collect()
++    }
++
+     /// The tools `session` may run: the base tools whose names are in the
+     /// session's override, in base order (stable so tool-schema ordering
+     /// stays stable for prefix caching), or every base tool when the
+diff --git a/crates/harness-daemon/src/wire.rs b/crates/harness-daemon/src/wire.rs
+index 8423a655..99578c6a 100644
+--- a/crates/harness-daemon/src/wire.rs
++++ b/crates/harness-daemon/src/wire.rs
+@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, OnceLock};
+ use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
++use crate::subagent::SubagentTool;
+ use crate::tools::{ToolCatalog, ToolCatalogError};
+ use harness_builder::AssembledRuntime;
+ use harness_core::RunEvent;
+@@ -126,6 +127,7 @@ pub struct DaemonHandler {
+     store: Arc<dyn SessionStore>,
+     recall: Arc<dyn RecallStore>,
+     catalog: Arc<ToolCatalog>,
++    subagent_tool: Option<Arc<SubagentTool>>,
+     run_counter: AtomicU64,
+ }
+ 
+@@ -147,6 +149,7 @@ impl DaemonHandler {
+         store: Arc<dyn SessionStore>,
+         recall: Arc<dyn RecallStore>,
+         catalog: Arc<ToolCatalog>,
++        subagent_tool: Option<Arc<SubagentTool>>,
+     ) -> Self {
+         Self {
+             scheduler,
+@@ -156,6 +159,7 @@ impl DaemonHandler {
+             store,
+             recall,
+             catalog,
++            subagent_tool,
+             run_counter: AtomicU64::new(0),
+         }
+     }
+@@ -231,7 +235,7 @@ impl DaemonHandler {
+         let active_tools = self.catalog.active(&session_id);
+         let ctx = RunContext {
+             run_id: run_id.clone(),
+-            session_id,
++            session_id: session_id.clone(),
+             task: Task {
+                 description: task,
+                 source: None,
+@@ -245,6 +249,25 @@ impl DaemonHandler {
+         // per-session allowlist overrides the shared base set; model, policy,
+         // budget and everything else stay shared across sessions.
+         deps.tools = active_tools;
++        // Swap the shared `subagent` tool for a per-run instance that carries
++        // this run's identity: the shared one has no run context, and stamping
++        // mutable parent state on it would race across concurrent sessions.
++        // A session that removed `subagent` from its allowlist keeps it out —
++        // delegation stays opt-out per session.
++        if let Some(tool) = &self.subagent_tool {
++            let scoped = tool.for_run(&run_id, &session_id, ctx.limits.clone());
++            deps.tools = deps
++                .tools
++                .into_iter()
++                .map(|t| {
++                    if t.name() == "subagent" {
++                        scoped.clone()
++                    } else {
++                        t
++                    }
++                })
++                .collect();
++        }
+         self.scheduler
+             .submit(RunRequest { ctx, deps })
+             .map_err(|err| TransportError::Internal(format!("submit failed: {err}")))?;
+diff --git a/crates/harness-daemon/tests/wire.rs b/crates/harness-daemon/tests/wire.rs
+index ae4dd1cd..bd903308 100644
+--- a/crates/harness-daemon/tests/wire.rs
++++ b/crates/harness-daemon/tests/wire.rs
+@@ -134,7 +134,7 @@ async fn daemon_search_returns_marker_events_as_json_hits() -> Result<(), Box<dy
+     let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
+     let scheduler = Scheduler::new(4, 4);
+     let catalog = Arc::new(ToolCatalog::new(Vec::new()));
+-    let handler = DaemonHandler::new(scheduler, store, recall, catalog);
++    let handler = DaemonHandler::new(scheduler, store, recall, catalog, None);
+ 
+     let value = match CommandHandler::handle(
+         &handler,
+@@ -267,7 +267,7 @@ async fn daemon_tools_commands_consult_catalog() {
+         Arc::new(StubTool::new("read")) as Arc<dyn Tool>,
+         Arc::new(StubTool::new("write")) as Arc<dyn Tool>,
+     ]));
+-    let handler = DaemonHandler::new(scheduler, store, recall, catalog);
++    let handler = DaemonHandler::new(scheduler, store, recall, catalog, None);
+ 
+     let list = |handler: &DaemonHandler| match CommandHandler::handle(
+         handler,

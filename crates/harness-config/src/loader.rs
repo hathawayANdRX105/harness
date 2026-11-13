@@ -130,6 +130,7 @@ fn defaults_only() -> Config {
             skills: vec![],
         },
         scheduler: SchedulerConfig::default(),
+        agents: AgentsConfig { subagents: vec![] },
     }
 }
 

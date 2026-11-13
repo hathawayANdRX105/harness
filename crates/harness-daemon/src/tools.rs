@@ -67,6 +67,18 @@ impl ToolCatalog {
         }
     }
 
+    /// Look one base tool up by name, e.g. for resolving a profile's tool
+    /// subset at subagent-spawn time.
+    pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.base.iter().find(|tool| tool.name() == name).cloned()
+    }
+
+    /// Every base tool's name, in base order — for error messages that list
+    /// what a caller may select.
+    pub fn names(&self) -> Vec<&str> {
+        self.base.iter().map(|tool| tool.name()).collect()
+    }
+
     /// The tools `session` may run: the base tools whose names are in the
     /// session's override, in base order (stable so tool-schema ordering
     /// stays stable for prefix caching), or every base tool when the
