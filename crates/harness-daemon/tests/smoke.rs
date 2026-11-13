@@ -291,7 +291,7 @@ fn restart_body(
     child1: &mut Child,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut uds = wait_socket(socket_path)?;
-    let run_id = submit_run(&mut uds, socket_path)?;
+    let run_id = submit_run(&mut uds, socket_path, None)?;
     drop(uds);
 
     // The upstream refuses every connection, so the run terminates quickly
@@ -342,12 +342,19 @@ fn round_trip(stream: &mut UnixStream, request: &str) -> Result<String, std::io:
 fn submit_run(
     stream: &mut UnixStream,
     socket_path: &Path,
+    session_id: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let reply = round_trip(
-        stream,
-        r#"{"jsonrpc":"2.0","method":"run","params":{"task":"smoke persistence run"},"id":1}"#,
-    )
-    .map_err(|err| format!("run submit failed on {socket_path:?}: {err}"))?;
+    let request: String = match session_id {
+        Some(id) => format!(
+            r#"{{"jsonrpc":"2.0","method":"run","params":{{"task":"session routing smoke alpha","session_id":"{id}"}},"id":1}}"#,
+        ),
+        None => {
+            r#"{"jsonrpc":"2.0","method":"run","params":{"task":"smoke persistence run"},"id":1}"#
+                .to_string()
+        }
+    };
+    let reply = round_trip(stream, &request)
+        .map_err(|err| format!("run submit failed on {socket_path:?}: {err}"))?;
     let response: serde_json::Value = serde_json::from_str(reply.trim())?;
     response["result"]["run_id"]
         .as_str()
@@ -409,4 +416,82 @@ fn assert_history_after_restart(
             Err(_) => return Err("daemon #2 socket never appeared".into()),
         }
     }
+}
+/// Purpose: a `run` whose JSON-RPC params name a `session_id` is recorded
+/// under that session, so `search` returns it carrying that session_id.
+/// Scenario: spawn `harness-daemon` with `smoke_config` in a temp session
+/// dir; submit `{"task":"session routing smoke alpha","session_id":"sess-smoke-alpha"}`;
+/// wait for the run to reach a terminal status; then search for
+/// "session routing smoke alpha" with id 5.
+/// Acceptance: at least one search hit carries `session_id == "sess-smoke-alpha"`;
+/// the daemon exits 0 after SIGTERM; the child is killed on every path.
+#[test]
+fn run_with_session_id_is_recorded_under_that_session() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!(
+        "harness-daemon-session-routing-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let config_path = dir.join("config.toml");
+    std::fs::write(&config_path, smoke_config(&dir.join("sessions")))?;
+    let socket_path = dir.join("daemon.sock");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_harness-daemon"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--socket")
+        .arg(&socket_path)
+        .arg("--http")
+        .arg("127.0.0.1:0")
+        .env("HARNESS_SMOKE_KEY", "smoke-key")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut uds = wait_socket(&socket_path)?;
+        let run_id = submit_run(&mut uds, &socket_path, Some("sess-smoke-alpha"))?;
+        drop(uds);
+
+        // The dead upstream exhausts retries, so the run reaches a terminal
+        // status quickly; its events (including the task) are persisted.
+        let terminal = wait_terminal(&socket_path, &run_id)?;
+        if !terminal.starts_with("finished:") {
+            return Err(
+                format!("run {run_id} must reach a terminal status, got {terminal}").into(),
+            );
+        }
+
+        // Retry the search boundedly: the pump persists the run's events
+        // asynchronously, so an immediate single shot can read the store
+        // before the events land and miss the run.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut stream = UnixStream::connect(&socket_path)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let reply = round_trip(
+                &mut stream,
+                r#"{"jsonrpc":"2.0","method":"search","params":{"query":"session routing smoke alpha"},"id":5}"#,
+            )?;
+            let response: serde_json::Value = serde_json::from_str(reply.trim())?;
+            if let Some(hits) = response["result"]["hits"].as_array()
+                && hits
+                    .iter()
+                    .any(|hit| hit["session_id"].as_str() == Some("sess-smoke-alpha"))
+            {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "search never surfaced the run under sess-smoke-alpha: {reply}"
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    })();
+    let _ = child.kill();
+    cleanup(&dir);
+    result
 }

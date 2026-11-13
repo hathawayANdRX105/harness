@@ -1,11 +1,12 @@
 //! The daemon's transport seams: the real [`CommandHandler`] and the v1
 //! [`EventLog`].
 /// DaemonHandler maps slash commands onto the scheduler: `run` submits a
-/// run assembled by the builder, `cancel` / `status` / `list` read scheduler
-/// state, `steer` is rejected until the scheduler exposes steering. Events
-/// flow loop → bus → a per-run pump task that appends into the session store
-/// and forwards into the transport broadcast channel, so every transport
-/// client sees every event.
+/// run assembled by the builder, routed to `session_id` when the command
+/// names one (otherwise the "default" session); `cancel` / `status` /
+/// `list` read scheduler state, `steer` is rejected until the scheduler
+/// exposes steering. Events flow loop → bus → a per-run pump task that
+/// appends into the session store and forwards into the transport broadcast
+/// channel, so every transport client sees every event.
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -187,13 +188,19 @@ impl DaemonHandler {
         format!("run-{}-{seq}", unix_millis())
     }
 
-    fn start_run(&self, task: String) -> Result<serde_json::Value, TransportError> {
+    fn start_run(
+        &self,
+        task: String,
+        session_id: Option<String>,
+    ) -> Result<serde_json::Value, TransportError> {
         let runtime = self
             .runtime
             .get()
             .ok_or_else(|| TransportError::Internal("runtime not assembled yet".into()))?;
         let run_id = RunId(self.fresh_run_id());
-        let session_id = SessionId("default".into());
+        // The command names the session; `None` falls back to the daemon's
+        // default session so existing clients keep landing in "default".
+        let session_id = SessionId(session_id.unwrap_or_else(|| "default".to_string()));
         // Ensure the session row exists before the run starts: the session is
         // the run's durable anchor across restarts; re-creation is idempotent.
         // The CommandHandler seam is sync, so drive the async store call on
@@ -374,7 +381,7 @@ impl DaemonHandler {
 impl CommandHandler for DaemonHandler {
     fn handle(&self, cmd: SlashCommand) -> Result<serde_json::Value, TransportError> {
         match cmd {
-            SlashCommand::Run { task } => self.start_run(task),
+            SlashCommand::Run { task, session_id } => self.start_run(task, session_id),
             SlashCommand::Cancel { run_id } => self.cancel(&run_id),
             SlashCommand::Status { run_id } => self.status(&run_id),
             SlashCommand::List => Ok(self.list()),
