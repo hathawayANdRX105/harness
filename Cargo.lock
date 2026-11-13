@@ -1241,10 +1241,12 @@ name = "harness-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "glob",
  "harness-core",
  "harness-mcp",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

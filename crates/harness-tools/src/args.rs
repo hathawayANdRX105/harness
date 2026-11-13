@@ -64,6 +64,32 @@ pub fn optional_string(args: &Value, key: &str) -> Result<Option<String>, ToolEr
         ),
     }
 }
+/// Extract an optional integer field from a JSON object argument map.
+///
+/// Returns `None` when the key is absent or the value is JSON `null`.
+/// A non-null, non-integer value produces an error — silently ignoring a
+/// type mismatch would hide the model's mistake.
+pub fn optional_integer(args: &Value, key: &str) -> Result<Option<i64>, ToolError> {
+    let obj = args.as_object().ok_or_else(|| ToolError::InvalidArgs {
+        name: "(arg extraction)".into(),
+        reason: "args must be a JSON object".into(),
+    })?;
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(val) => val.as_i64().map_or_else(
+            || {
+                Err(ToolError::InvalidArgs {
+                    name: "(arg extraction)".into(),
+                    reason: format!(
+                        "argument `{key}` must be an integer or null, got {}",
+                        val_type(val)
+                    ),
+                })
+            },
+            |n| Ok(Some(n)),
+        ),
+    }
+}
 
 /// Extract a required integer field from a JSON object argument map.
 ///

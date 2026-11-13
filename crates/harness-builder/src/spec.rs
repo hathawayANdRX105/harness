@@ -572,7 +572,9 @@ pub struct CompactionStageSpec {
 
 /// The builtin tool names `harness-tools` provides, in the order the builder
 /// recognizes them.
-pub const BUILTIN_TOOLS: [&str; 5] = ["read", "write", "edit", "glob", "grep"];
+pub const BUILTIN_TOOLS: [&str; 7] = [
+    "read", "write", "edit", "glob", "grep", "terminal", "webfetch",
+];
 
 fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOLS.contains(&name)

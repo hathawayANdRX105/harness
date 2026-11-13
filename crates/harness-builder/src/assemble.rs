@@ -42,7 +42,8 @@ use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode};
 use harness_mcp::{Mcp, McpServerConfig, ToolMeta};
 use harness_model::AliasRegistry;
 use harness_tools::{
-    EditTool, GlobTool, GrepTool, ReadTool, SkillMeta, SkillTool, WriteTool, discover_skills,
+    EditTool, GlobTool, GrepTool, ReadTool, SkillMeta, SkillTool, TerminalTool, WebFetchTool,
+    WriteTool, discover_skills,
 };
 
 use crate::BuildError;
@@ -647,6 +648,8 @@ fn builtin_tool(name: &str, cwd: Option<&Path>) -> Result<Arc<dyn Tool>, BuildEr
         "edit" => Ok(Arc::new(EditTool::new(cwd))),
         "glob" => Ok(Arc::new(GlobTool::new(cwd))),
         "grep" => Ok(Arc::new(GrepTool::new(cwd))),
+        "terminal" => Ok(Arc::new(TerminalTool::new(cwd))),
+        "webfetch" => Ok(Arc::new(WebFetchTool::new())),
         other => Err(BuildError::UnknownBuiltin {
             name: other.to_string(),
         }),
