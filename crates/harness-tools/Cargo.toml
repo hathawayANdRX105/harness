@@ -2,7 +2,7 @@
 name = "harness-tools"
 version = "0.1.0"
 edition = "2024"
-description = "Builtin tool implementations (read/write/edit/glob/grep) for the harness daemon: Tool trait impls, output truncation/spill, arg extraction helpers, and SKILL.md discovery"
+description = "Builtin tool implementations (read/write/edit/glob/grep/terminal/webfetch) for the harness daemon: Tool trait impls, output truncation/spill, arg extraction helpers, and SKILL.md discovery"
 license = "MIT"
 publish = false
 
@@ -17,18 +17,22 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",
-    "rt",
     "macros",
+    "process",
+    "rt",
+    "time",
 ] }
 regex = "1"
 glob = "0.3"
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
 harness-core = { path = "../harness-core" }
+axum = "0.8"
 
 [lints]
 workspace = true

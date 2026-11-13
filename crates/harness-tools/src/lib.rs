@@ -32,7 +32,7 @@ pub mod output;
 pub mod skills;
 
 pub use args::{optional_string, require_integer, require_string};
-pub use builtin::{EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+pub use builtin::{EditTool, GlobTool, GrepTool, ReadTool, TerminalTool, WebFetchTool, WriteTool};
 pub use catalog::ToolCatalog;
 pub use output::{DEFAULT_MAX_OUTPUT_CHARS, truncate_output};
 pub use skills::{SkillMeta, SkillTool, discover_skills};
