@@ -1,5 +1,6 @@
 //! Integration tests for the daemon's wire seams: the search command's
-//! recall wiring and the store-backed EventLog resolver.
+//! recall wiring, the store-backed EventLog resolver, and the per-session
+//! tool catalog (`tools.list` / `tools.set_active` / `tools.reset`).
 //!
 //! Each test opens its own temp turso store, so the tests are independent
 //! and parallel-safe.
@@ -10,14 +11,15 @@ use std::process::id;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use harness_core::RunEvent;
 use harness_core::event::RunEventKind;
 use harness_core::run::{RunId, SessionId};
+use harness_core::{RunEvent, Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
+use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::{DaemonHandler, StoreEventLog};
 use harness_scheduler::Scheduler;
 use harness_session::turso::TursoSessionStore;
 use harness_session::{RecallStore, SessionStore};
-use harness_transport::{CommandHandler, EventLog, SlashCommand};
+use harness_transport::{CommandHandler, EventLog, SlashCommand, TransportError};
 
 static SEARCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -60,6 +62,63 @@ async fn search_fixture() -> std::sync::Arc<TursoSessionStore> {
     std::sync::Arc::new(store)
 }
 
+/// Stub tool with a fixed name and no behaviour: enough for the catalog to
+/// filter by `name()` and for the wire test to round-trip through the
+/// handler.
+struct StubTool {
+    name: &'static str,
+}
+
+impl StubTool {
+    fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for StubTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name.to_string(),
+            description: "stub tool".into(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::ReadOnly
+    }
+
+    async fn invoke(
+        &self,
+        _args: serde_json::Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult {
+            content: "stub".into(),
+            is_error: false,
+            trace: None,
+        })
+    }
+}
+
+/// Open an empty temp store and pair it with its recall seam, to satisfy
+/// the [`DaemonHandler`] constructor without asserting on persistence.
+async fn store_and_recall() -> (Arc<dyn SessionStore>, Arc<dyn RecallStore>) {
+    let dir = env::temp_dir().join(format!("harness-wire-tools-{}", id()));
+    let _ = fs::create_dir_all(&dir);
+    let store_inner = TursoSessionStore::open(dir.join("tools.db"))
+        .await
+        .unwrap_or_else(|e| panic!("open store: {e}"));
+    let recall: Arc<dyn RecallStore> = Arc::new(store_inner.recall());
+    let store: Arc<dyn SessionStore> = Arc::new(store_inner);
+    (store, recall)
+}
+
 /// Purpose: `DaemonHandler::handle(Search)` queries the recall seam and
 /// returns JSON hits.
 /// Scenario: a store holds marker events; the handler is built with
@@ -74,7 +133,8 @@ async fn daemon_search_returns_marker_events_as_json_hits() -> Result<(), Box<dy
     let store = search_fixture().await;
     let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
     let scheduler = Scheduler::new(4, 4);
-    let handler = DaemonHandler::new(scheduler, store, recall);
+    let catalog = Arc::new(ToolCatalog::new(Vec::new()));
+    let handler = DaemonHandler::new(scheduler, store, recall, catalog);
 
     let value = match CommandHandler::handle(
         &handler,
@@ -136,6 +196,7 @@ async fn daemon_search_returns_marker_events_as_json_hits() -> Result<(), Box<dy
     assert!(empty_hits.is_empty(), "an absent term must return no hits");
     Ok(())
 }
+
 /// Purpose: `StoreEventLog::latest_run_for_session` resolves a session
 /// to its newest run by delegating to the session store.
 /// Scenario: a store holds run-a (one event at seq 1) and run-b (two
@@ -183,4 +244,125 @@ async fn store_event_log_resolves_latest_run_for_session() -> Result<(), Box<dyn
         "a session without events resolves to no run"
     );
     Ok(())
+}
+
+/// Purpose: the daemon's `tools.*` commands consult the per-session catalog:
+/// listing reports the active flag, restricting keeps base order, an
+/// unknown name is rejected as a typed transport error, and the rejection
+/// stores nothing.
+/// Scenario: build a handler whose catalog holds `read` and `write`;
+/// handle `ToolsList`, then `ToolsSetActive { names: ["read"] }`, then
+/// `ToolsList`, then `ToolsSetActive { names: ["bogus"] }`.
+/// Acceptance: initial list marks both tools active; after restricting to
+/// `read` the success body lists `["read"]` and the next list marks `read`
+/// active and `write` inactive; restricting to `["bogus"]` returns the
+/// typed `TransportError::UnknownTool` carrying `unknown=["bogus"]` and
+/// `available=["read","write"]`, and a final list still shows both tools
+/// (nothing stored).
+#[tokio::test]
+async fn daemon_tools_commands_consult_catalog() {
+    let scheduler = Scheduler::new(4, 4);
+    let (store, recall) = store_and_recall().await;
+    let catalog = Arc::new(ToolCatalog::new(vec![
+        Arc::new(StubTool::new("read")) as Arc<dyn Tool>,
+        Arc::new(StubTool::new("write")) as Arc<dyn Tool>,
+    ]));
+    let handler = DaemonHandler::new(scheduler, store, recall, catalog);
+
+    let list = |handler: &DaemonHandler| match CommandHandler::handle(
+        handler,
+        SlashCommand::ToolsList { session_id: None },
+    ) {
+        Ok(value) => value,
+        Err(err) => panic!("tools.list must not fail: {err}"),
+    };
+
+    let statuses = |value: &serde_json::Value| {
+        value
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("tools.list response carries a tools array: {value}"))
+            .iter()
+            .map(|v| {
+                (
+                    v.get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_else(|| panic!("tool entry carries a name: {v}"))
+                        .to_string(),
+                    v.get("active")
+                        .and_then(|a| a.as_bool())
+                        .unwrap_or_else(|| panic!("tool entry carries an active flag: {v}")),
+                )
+            })
+            .collect::<Vec<(String, bool)>>()
+    };
+
+    // Default: every base tool is active.
+    let mut seen = statuses(&list(&handler));
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![("read".to_string(), true), ("write".to_string(), true)],
+        "every base tool is active without an override"
+    );
+
+    // Restrict to `read`: succeeds and reports `["read"]` active.
+    let set = match CommandHandler::handle(
+        &handler,
+        SlashCommand::ToolsSetActive {
+            session_id: None,
+            names: vec!["read".to_string()],
+        },
+    ) {
+        Ok(value) => value,
+        Err(err) => panic!("set_active with known names must succeed: {err}"),
+    };
+    assert_eq!(
+        set.get("active"),
+        Some(&serde_json::json!(["read"])),
+        "set_active success body lists the active names"
+    );
+
+    // `read` active, `write` inactive.
+    seen = statuses(&list(&handler));
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![("read".to_string(), true), ("write".to_string(), false)],
+        "restricting to read deactivates write"
+    );
+
+    // Unknown name is a typed error carrying the available names and stores
+    // nothing.
+    let err = match CommandHandler::handle(
+        &handler,
+        SlashCommand::ToolsSetActive {
+            session_id: None,
+            names: vec!["bogus".to_string()],
+        },
+    ) {
+        Err(err) => err,
+        Ok(value) => panic!("set_active with unknown name must fail: {value:?}"),
+    };
+    match err {
+        TransportError::UnknownTool { unknown, available } => {
+            assert_eq!(unknown, vec!["bogus".to_string()]);
+            assert_eq!(
+                available,
+                vec!["read".to_string(), "write".to_string()],
+                "error lists every available name"
+            );
+        }
+        other => panic!("expected UnknownTool, got {other:?}"),
+    }
+
+    // Rejection stored nothing: the session keeps the `read`-only override
+    // it had BEFORE the rejected call.
+    seen = statuses(&list(&handler));
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![("read".to_string(), true), ("write".to_string(), false)],
+        "rejected set_active leaves the prior override untouched"
+    );
 }

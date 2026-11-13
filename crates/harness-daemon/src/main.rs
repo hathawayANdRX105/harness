@@ -16,15 +16,17 @@ use harness_builder::{
     AssembledRuntime, BUILTIN_TOOLS, HarnessBuilder, HarnessSpec, ModelSpec, ToolKind, ToolSpec,
 };
 use harness_config::Config;
-use harness_core::EventSink;
 use harness_core::model::ModelInfo;
+use harness_core::{EventSink, RunEvent};
 use harness_model::OpenAIModel;
 use harness_scheduler::Scheduler;
 use harness_session::{RecallStore, SessionStore, turso::TursoSessionStore};
-use harness_transport::{EventLog, uds::UdsConfig};
-use harness_transport::{TransportState, http, ws};
+use harness_transport::http;
+use harness_transport::ws;
+use harness_transport::{EventLog, TransportState, uds::UdsConfig};
 
 use harness_daemon::pidlock::PidLock;
+use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::{DaemonHandler, StoreEventLog};
 
 /// Default UDS socket path for the v1 daemon.
@@ -126,6 +128,20 @@ fn build_runtime(
         .context("assembling the runtime")
 }
 
+/// A transient [`EventSink`] that forwards into `event_tx`: used while
+/// building the runtime, before [`TransportState`] exists. The runtime is
+/// assembled before the handler so its tool set can snapshot into the
+/// catalog; both sinks refer to the same channel, so no events are lost.
+struct EarlyEventSink(std::sync::Arc<tokio::sync::broadcast::Sender<RunEvent>>);
+
+impl EventSink for EarlyEventSink {
+    fn emit(&self, event: RunEvent) {
+        // try_send drops the event if the channel is full — subscriber lag
+        // is observable but never blocks the loop (see EventSink docs).
+        let _ = self.0.send(event);
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -205,12 +221,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let recall: Arc<dyn RecallStore> = Arc::new(store_inner.recall());
     let store: Arc<dyn SessionStore> = Arc::new(store_inner);
     let event_log: Arc<dyn EventLog> = Arc::new(StoreEventLog::new(store.clone()));
-    let handler = Arc::new(DaemonHandler::new(scheduler.clone(), store, recall));
-    let state = Arc::new(TransportState::new(handler.clone(), event_log));
+    // The broadcast channel is created up front so the runtime's event sink
+    // and the transport state share one `tx`.
+    let (event_tx, _) = tokio::sync::broadcast::channel(1024);
+    // The runtime is assembled before the handler: its tool set is the
+    // catalog's one-time base snapshot, registered once at startup.
+    let runtime = build_runtime(
+        &config,
+        model,
+        Arc::new(EarlyEventSink(Arc::new(event_tx.clone()))),
+    )?;
+    let catalog = Arc::new(ToolCatalog::new(runtime.tools.clone()));
+    let handler = Arc::new(DaemonHandler::new(
+        scheduler.clone(),
+        store,
+        recall,
+        catalog,
+    ));
+    let state = Arc::new(TransportState::with_event_tx(
+        handler.clone(),
+        event_log,
+        event_tx,
+    ));
     handler.set_event_tx(state.event_tx.clone());
-    // The builder requires an event sink, but the scheduler replaces the run's
-    // sink with its bus — the transport channel is fed by the pump in wire.rs.
-    let runtime = build_runtime(&config, model, Arc::new(state.event_sink()))?;
     handler.set_runtime(runtime);
 
     let app = http::http_routes(state.clone()).merge(ws::ws_routes(state.clone()));

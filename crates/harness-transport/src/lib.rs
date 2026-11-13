@@ -89,6 +89,23 @@ impl TransportState {
         }
     }
 
+    /// Create a transport state around an existing broadcast sender.
+    ///
+    /// The daemon builds the runtime (and its event sink) before the handler,
+    /// so the channel must exist first; both the runtime's sink and the
+    /// transport state then share one sender.
+    pub fn with_event_tx(
+        handler: Arc<dyn CommandHandler>,
+        event_log: Arc<dyn EventLog>,
+        event_tx: tokio::sync::broadcast::Sender<RunEvent>,
+    ) -> Self {
+        Self {
+            handler,
+            event_log,
+            event_tx,
+        }
+    }
+
     /// Convenience: [`EventSink`] implementation that forwards every event
     /// into the broadcast channel.  Pass this to the run loop as the sink;
     /// the transport layer automatically receives every event.
@@ -169,6 +186,18 @@ pub enum TransportError {
     #[error("unknown command: {0}")]
     UnknownCommand(String),
 
+    /// A `tools.set_active` named tools missing from the base catalog.
+    ///
+    /// The client retries with names from `available`. Maps to
+    /// `INVALID_PARAMS` (-32602): the parameters reference tools that do
+    /// not exist, which is a bad-request problem rather than a missing
+    /// method.
+    #[error("unknown tool(s): {unknown:?}; available tools: {available:?}")]
+    UnknownTool {
+        unknown: Vec<String>,
+        available: Vec<String>,
+    },
+
     /// An internal daemon error not covered by the typed variants above.
     #[error("internal: {0}")]
     Internal(String),
@@ -180,6 +209,7 @@ impl TransportError {
         match self {
             TransportError::NoActiveRun(_) => error_code::NO_ACTIVE_RUN,
             TransportError::UnknownCommand(_) => error_code::UNKNOWN_COMMAND,
+            TransportError::UnknownTool { .. } => error_code::INVALID_PARAMS,
             TransportError::Internal(_) => error_code::INTERNAL_ERROR,
         }
     }
@@ -202,6 +232,21 @@ pub fn dispatch_command(
     let result = handler.handle(cmd);
     match result {
         Ok(value) => JsonRpcResponse::success(request_id, json!(value)),
+        Err(TransportError::UnknownTool { unknown, available }) => {
+            // The structured fields back a programmatic retry: the client
+            // learns which names were rejected and which are valid without
+            // re-fetching the catalog.
+            JsonRpcResponse::error_with_data(
+                request_id,
+                error_code::INVALID_PARAMS,
+                TransportError::UnknownTool {
+                    unknown: unknown.clone(),
+                    available: available.clone(),
+                }
+                .to_string(),
+                json!({ "unknown": unknown, "available": available }),
+            )
+        }
         Err(err) => JsonRpcResponse::error(request_id, err.code(), err.to_string()),
     }
 }
