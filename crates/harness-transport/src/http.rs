@@ -74,6 +74,12 @@ pub fn http_routes(state: Arc<TransportState>) -> Router {
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// POST /command — dispatch a JSON-RPC request.
+///
+/// Note: a malformed body never reaches this handler — axum's `Json`
+/// extractor rejects it with a 4xx before `JsonRpcRequest` deserialization,
+/// so HTTP parse errors are not JSON-RPC frames and are out of scope here.
+/// Only well-formed requests flow through [`dispatch_command`], which always
+/// echoes `req.id` (`None` serializes as `id: null`).
 async fn handle_command(
     State(state): State<Arc<TransportState>>,
     Json(req): Json<JsonRpcRequest>,
