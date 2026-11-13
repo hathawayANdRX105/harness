@@ -183,7 +183,7 @@ fn deps(model: Arc<dyn Model>, tools: Vec<Arc<dyn Tool>>, sink: Arc<dyn EventSin
 /// `QueueFull`, and nothing was silently discarded.
 #[tokio::test]
 async fn full_queue_rejects_explicitly() {
-    let scheduler = Scheduler::new(1);
+    let scheduler = Scheduler::new(1, 4);
     let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(500)));
     let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
 
@@ -216,7 +216,7 @@ async fn full_queue_rejects_explicitly() {
 /// `Running`.
 #[tokio::test]
 async fn cancel_active_promotes_the_queue() {
-    let scheduler = Scheduler::new(4);
+    let scheduler = Scheduler::new(4, 4);
     let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(200)));
     let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
 
@@ -255,7 +255,7 @@ async fn cancel_active_promotes_the_queue() {
 /// Acceptance: both subscriptions observe the run's terminal `RunFinished`.
 #[tokio::test]
 async fn two_subscribers_receive_the_same_run() {
-    let scheduler = Scheduler::new(1);
+    let scheduler = Scheduler::new(1, 4);
     let model = Arc::new(SlowModel::new(
         vec![vec![
             ModelEvent::TextDelta("hi".into()),
@@ -335,7 +335,7 @@ async fn two_subscribers_receive_the_same_run() {
 /// Acceptance: the run ends `Cancelled` — nobody is left to observe it.
 #[tokio::test]
 async fn dropping_the_last_subscriber_cancels_the_run() {
-    let scheduler = Scheduler::new(1);
+    let scheduler = Scheduler::new(1, 4);
     let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(5_000)));
     let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
     let bus = scheduler.events().clone();
@@ -364,7 +364,7 @@ async fn dropping_the_last_subscriber_cancels_the_run() {
 /// the scheduler preserves the loop's emitter-side counter.
 #[tokio::test]
 async fn sequence_stays_monotonic_across_the_fan_out() {
-    let scheduler = Scheduler::new(1);
+    let scheduler = Scheduler::new(1, 4);
     let model = Arc::new(SlowModel::new(
         vec![vec![
             ModelEvent::TextDelta("a".into()),
@@ -425,7 +425,7 @@ async fn approval_mid_ask_race_ends_the_run() {
     let asked = Arc::new(AtomicU64::new(0));
     let invocations = Arc::new(AtomicU64::new(0));
 
-    let scheduler = Scheduler::new(1);
+    let scheduler = Scheduler::new(1, 4);
     let model = Arc::new(SlowModel::new(
         vec![vec![
             ModelEvent::ToolCallStart {
@@ -624,7 +624,7 @@ impl Model for PacingModel {
 /// - `bus.dropped_events()` ends above where it started.
 #[tokio::test]
 async fn lagged_subscriber_observes_lagged_and_run_finishes() {
-    let scheduler = Scheduler::new(4);
+    let scheduler = Scheduler::new(4, 4);
     let bus = scheduler.events();
     let n_deltas = BUS_CAPACITY + 50;
 
@@ -700,7 +700,7 @@ async fn lagged_subscriber_observes_lagged_and_run_finishes() {
 /// — this pins behavior the handoff left undocumented.
 #[tokio::test]
 async fn resubmit_after_finished_is_duplicate_run() {
-    let scheduler = Scheduler::new(4);
+    let scheduler = Scheduler::new(4, 4);
     let model = Arc::new(SlowModel::new(
         vec![vec![ModelEvent::Stop(StopReason::EndTurn)]],
         Duration::ZERO,
@@ -726,4 +726,276 @@ async fn resubmit_after_finished_is_duplicate_run() {
         Ok(id) => panic!("resubmitting a finished id must fail, got {id:?}"),
         Err(err) => panic!("resubmitting a finished id must be DuplicateRun, got {err:?}"),
     }
+}
+/// Create a run context for `run_id` in `session`, mirroring `ctx` so
+/// per-session tests can place runs in different sessions.
+fn ctx_in(run_id: &str, session: &str) -> RunContext {
+    RunContext {
+        run_id: RunId(run_id.into()),
+        session_id: SessionId(session.into()),
+        task: Task {
+            description: "test task".into(),
+            source: None,
+            deadline: None,
+        },
+        limits: RunLimits::default(),
+        started_at_ms: 0,
+    }
+}
+
+/// Purpose: different sessions run concurrently up to the global cap.
+/// Scenario: cap 2; run "a" in session "s-a" and run "b" in session "s-b"
+/// stream slowly so both are active at once.
+/// Acceptance: both report `Running` at the same time, then both finish.
+#[tokio::test]
+async fn different_sessions_run_concurrently() {
+    let scheduler = Scheduler::new(4, 2);
+    let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(300)));
+    let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
+
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("a", "s-a"),
+            deps: deps(model.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("b", "s-b"),
+            deps: deps(model, vec![], sink),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    wait_for_status(&scheduler, &RunId("a".into()), |status| {
+        matches!(status, RunStatus::Running)
+    })
+    .await;
+    wait_for_status(&scheduler, &RunId("b".into()), |status| {
+        matches!(status, RunStatus::Running)
+    })
+    .await;
+    assert!(matches!(
+        scheduler.status(&RunId("a".into())),
+        Some(RunStatus::Running)
+    ));
+    assert!(matches!(
+        scheduler.status(&RunId("b".into())),
+        Some(RunStatus::Running)
+    ));
+    wait_for_status(&scheduler, &RunId("a".into()), |status| {
+        matches!(status, RunStatus::Finished(_))
+    })
+    .await;
+    wait_for_status(&scheduler, &RunId("b".into()), |status| {
+        matches!(status, RunStatus::Finished(_))
+    })
+    .await;
+}
+
+/// Purpose: same-session runs serialize — the second run waits instead of
+/// running alongside the first.
+/// Scenario: session "s" has an active slow run; submit a second run for "s".
+/// Acceptance: the second run reports `Queued` while the first is active, is
+/// never `Running` until the first finishes, then takes over.
+#[tokio::test]
+async fn same_session_second_run_waits() {
+    let scheduler = Scheduler::new(4, 4);
+    let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(300)));
+    let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
+
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("first", "s"),
+            deps: deps(model.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("second", "s"),
+            deps: deps(model, vec![], sink),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_eq!(
+        scheduler.status(&RunId("second".into())),
+        Some(RunStatus::Queued { position: 0 })
+    );
+    wait_for_status(&scheduler, &RunId("first".into()), |status| {
+        matches!(status, RunStatus::Running)
+    })
+    .await;
+    assert!(
+        !matches!(
+            scheduler.status(&RunId("second".into())),
+            Some(RunStatus::Running)
+        ),
+        "same-session run must not run concurrently with the active one"
+    );
+    wait_for_status(&scheduler, &RunId("first".into()), |status| {
+        matches!(status, RunStatus::Finished(_))
+    })
+    .await;
+    wait_for_status(&scheduler, &RunId("second".into()), |status| {
+        matches!(status, RunStatus::Running)
+    })
+    .await;
+}
+
+/// Purpose: the global cap serializes runs across different sessions.
+/// Scenario: cap 1; run "a" in session "s-a" runs while run "b" in session
+/// "s-b" waits although its session is idle; when "a" finishes, the launch
+/// round admits "b".
+/// Acceptance: "b" is `Queued` while "a" runs, becomes `Running` only after
+/// "a" finishes, then finishes itself.
+#[tokio::test]
+async fn global_cap_serializes_across_sessions() {
+    let scheduler = Scheduler::new(4, 1);
+    let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(300)));
+    let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
+
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("a", "s-a"),
+            deps: deps(model.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("b", "s-b"),
+            deps: deps(model, vec![], sink),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_eq!(
+        scheduler.status(&RunId("b".into())),
+        Some(RunStatus::Queued { position: 0 })
+    );
+    wait_for_status(&scheduler, &RunId("a".into()), |status| {
+        matches!(status, RunStatus::Finished(_))
+    })
+    .await;
+    wait_for_status(&scheduler, &RunId("b".into()), |status| {
+        matches!(status, RunStatus::Running)
+    })
+    .await;
+    wait_for_status(&scheduler, &RunId("b".into()), |status| {
+        matches!(status, RunStatus::Finished(_))
+    })
+    .await;
+}
+
+/// Purpose: queue capacity is per session, not global.
+/// Scenario: queue capacity 1; session "s-a" has an active run and one queued
+/// run; a third "s-a" run gets `QueueFull`. Session "s-b" still submits fine.
+/// Acceptance: the third "s-a" submission fails with `QueueFull { capacity: 1
+/// }`; an "s-b" submission starts immediately and one run waits overall.
+#[tokio::test]
+async fn queue_full_is_per_session() {
+    let scheduler = Scheduler::new(1, 4);
+    let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(300)));
+    let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
+
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("a1", "s-a"),
+            deps: deps(model.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("a2", "s-a"),
+            deps: deps(model.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let err = scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("a3", "s-a"),
+            deps: deps(model.clone(), vec![], sink.clone()),
+        })
+        .err();
+    assert_eq!(err, Some(ScheduleError::QueueFull { capacity: 1 }));
+
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("b1", "s-b"),
+            deps: deps(model, vec![], sink),
+        })
+        .unwrap_or_else(|e| panic!("other session must still submit: {e}"));
+    assert_eq!(
+        scheduler.status(&RunId("b1".into())),
+        Some(RunStatus::Running)
+    );
+    assert_eq!(scheduler.queued(), 1);
+}
+
+/// Purpose: when a slot frees, the launch round admits the oldest
+/// SUBMISSION across sessions, not whichever session happens to iterate
+/// first — the global ticket must order admission worldwide.
+/// Scenario: cap 2; "a" (fast model) and "b" (slow model) run in sessions
+/// s-a/s-b; "c" (s-c) then "d" (s-d) are submitted and queue; "a" finishes,
+/// freeing exactly one slot while "b" still holds the other.
+/// Acceptance: "c" — the older submission — becomes `Running`, while "d"
+/// stays `Queued` because the cap is saturated by "b" and "c".
+#[tokio::test]
+async fn launch_round_admits_oldest_submission_first() {
+    let scheduler = Scheduler::new(4, 2);
+    let fast = Arc::new(SlowModel::new(vec![], Duration::from_millis(150)));
+    let slow = Arc::new(SlowModel::new(vec![], Duration::from_millis(5000)));
+    let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
+
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("a", "s-a"),
+            deps: deps(fast.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("b", "s-b"),
+            deps: deps(slow.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    // Both slots are taken, so these two queue in submission order.
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("c", "s-c"),
+            deps: deps(fast.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx_in("d", "s-d"),
+            deps: deps(fast, vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        scheduler.status(&RunId("d".into())),
+        Some(RunStatus::Queued { position: 0 }),
+        "d must be queued while both slots are busy"
+    );
+
+    wait_for_status(&scheduler, &RunId("a".into()), |status| {
+        matches!(status, RunStatus::Finished(_))
+    })
+    .await;
+    wait_for_status(&scheduler, &RunId("c".into()), |status| {
+        matches!(status, RunStatus::Running)
+    })
+    .await;
+
+    // "b" still holds its slot, so the freed slot went to the older
+    // submission only.
+    assert!(matches!(
+        scheduler.status(&RunId("c".into())),
+        Some(RunStatus::Running)
+    ));
+    assert_eq!(
+        scheduler.status(&RunId("d".into())),
+        Some(RunStatus::Queued { position: 0 }),
+        "the younger submission must stay queued while the cap is saturated"
+    );
+
+    // Reap the long run so the task does not outlive the test.
+    assert!(scheduler.cancel(&RunId("b".into())));
 }

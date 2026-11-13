@@ -55,6 +55,9 @@ pub struct Config {
     /// Hook and skill registration sources.
     #[serde(default)]
     pub registry: RegistryConfig,
+    /// Scheduler concurrency and queueing limits.
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 pub(crate) fn default_version() -> u32 {
@@ -71,6 +74,7 @@ impl fmt::Debug for Config {
             .field("budget", &self.budget)
             .field("mcp", &self.mcp)
             .field("registry", &self.registry)
+            .field("scheduler", &self.scheduler)
             .finish()
     }
 }
@@ -334,5 +338,54 @@ impl fmt::Debug for RegistryConfig {
             .field("hooks", &self.hooks)
             .field("skills", &self.skills)
             .finish()
+    }
+}
+// ── Scheduler ────────────────────────────────────────────────────────────────
+
+/// Scheduler concurrency and queueing limits.
+///
+/// One run per session is active at a time; additional runs wait in that
+/// session's bounded queue. `max_concurrency` bounds how many sessions run at
+/// once, so the daemon cannot oversubscribe itself across sessions.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerConfig {
+    /// Maximum runs active across all sessions at once. Runs past this wait in
+    /// their session's queue. Defaults to 4, mirroring harness-rs's orchestrator
+    /// default.
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+    /// Maximum runs waiting per session. A burst beyond this is rejected with
+    /// `QueueFull`: a bounded queue means nothing is ever silently dropped.
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: usize,
+}
+
+pub(crate) const DEFAULT_MAX_CONCURRENCY: usize = 4;
+pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 4;
+
+pub(crate) fn default_max_concurrency() -> usize {
+    DEFAULT_MAX_CONCURRENCY
+}
+
+pub(crate) fn default_queue_capacity() -> usize {
+    DEFAULT_QUEUE_CAPACITY
+}
+
+impl fmt::Debug for SchedulerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SchedulerConfig")
+            .field("max_concurrency", &self.max_concurrency)
+            .field("queue_capacity", &self.queue_capacity)
+            .finish()
+    }
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrency: default_max_concurrency(),
+            queue_capacity: default_queue_capacity(),
+        }
     }
 }
