@@ -1,4 +1,4 @@
-//! Integration tests for the v2 tools: TerminalTool and WebFetchTool.
+//! Integration tests for the tool surface: TerminalTool and WebFetchTool.
 //!
 //! Each test is self-contained: TerminalTool runs against a temp directory,
 //! WebFetchTool against a local axum server on a random port. Nothing touches

@@ -222,13 +222,14 @@ async fn drain_pipe(
 /// Concatenate captured stdout with stderr under a `[stderr]` label.
 fn merge_output(stdout: String, stderr: String) -> String {
     let mut output = stdout;
-    if !stderr.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str("[stderr]\n");
-        output.push_str(&stderr);
+    if stderr.is_empty() {
+        return output;
     }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str("[stderr]\n");
+    output.push_str(&stderr);
     output
 }
 
