@@ -353,24 +353,16 @@ pub struct SchedulerConfig {
     /// Maximum runs active across all sessions at once. Runs past this wait in
     /// their session's queue. Defaults to 4, mirroring harness-rs's orchestrator
     /// default.
-    #[serde(default = "default_max_concurrency")]
+    #[serde(default)]
     pub max_concurrency: usize,
     /// Maximum runs waiting per session. A burst beyond this is rejected with
     /// `QueueFull`: a bounded queue means nothing is ever silently dropped.
-    #[serde(default = "default_queue_capacity")]
+    #[serde(default)]
     pub queue_capacity: usize,
 }
 
 pub(crate) const DEFAULT_MAX_CONCURRENCY: usize = 4;
 pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 4;
-
-pub(crate) fn default_max_concurrency() -> usize {
-    DEFAULT_MAX_CONCURRENCY
-}
-
-pub(crate) fn default_queue_capacity() -> usize {
-    DEFAULT_QUEUE_CAPACITY
-}
 
 impl fmt::Debug for SchedulerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -384,8 +376,8 @@ impl fmt::Debug for SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            max_concurrency: default_max_concurrency(),
-            queue_capacity: default_queue_capacity(),
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
         }
     }
 }
