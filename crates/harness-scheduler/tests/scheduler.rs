@@ -174,6 +174,8 @@ fn deps(model: Arc<dyn Model>, tools: Vec<Arc<dyn Tool>>, sink: Arc<dyn EventSin
         tool_mode: ToolExecutionMode::Sequential,
         budget: None,
         compactor: None,
+        seed: Vec::new(),
+        transcript_sink: None,
     }
 }
 
@@ -465,6 +467,8 @@ async fn approval_mid_ask_race_ends_the_run() {
                 tool_mode: ToolExecutionMode::Sequential,
                 budget: None,
                 compactor: None,
+                seed: Vec::new(),
+                transcript_sink: None,
             },
         })
         .unwrap_or_else(|e| panic!("{e}"));

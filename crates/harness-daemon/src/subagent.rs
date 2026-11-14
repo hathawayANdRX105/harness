@@ -281,6 +281,8 @@ impl Tool for SubagentTool {
             tool_mode: ToolExecutionMode::Sequential,
             budget: None,
             compactor: None,
+            seed: Vec::new(),
+            transcript_sink: None,
         };
         let ctx = RunContext {
             run_id: child_run_id.clone(),

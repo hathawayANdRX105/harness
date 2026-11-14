@@ -295,6 +295,8 @@ impl AssembledRuntime {
                 .compaction
                 .as_ref()
                 .and_then(|plan| plan.compactor.as_ref().map(Arc::clone)),
+            seed: Vec::new(),
+            transcript_sink: None,
         }
     }
 
@@ -311,6 +313,8 @@ impl AssembledRuntime {
             tool_mode: self.tool_mode,
             budget: Some(self.budget),
             compactor: self.compaction.and_then(|plan| plan.compactor),
+            seed: Vec::new(),
+            transcript_sink: None,
         }
     }
 }
