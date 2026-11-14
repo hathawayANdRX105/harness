@@ -129,6 +129,7 @@ fn defaults_only() -> Config {
             hooks: vec![],
             skills: vec![],
         },
+        scheduler: SchedulerConfig::default(),
     }
 }
 

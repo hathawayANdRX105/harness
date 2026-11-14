@@ -73,7 +73,7 @@ async fn daemon_search_returns_marker_events_as_json_hits() -> Result<(), Box<dy
 {
     let store = search_fixture().await;
     let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
-    let scheduler = Scheduler::new(4);
+    let scheduler = Scheduler::new(4, 4);
     let handler = DaemonHandler::new(scheduler, store, recall);
 
     let value = match CommandHandler::handle(

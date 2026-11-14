@@ -34,9 +34,6 @@ const DEFAULT_HTTP: &str = "127.0.0.1:8718";
 /// Context window assumed for models with no metadata; compaction
 /// calibrates against it.
 const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
-/// Queue capacity behind the single active run. v1 has no config surface for
-/// this; a burst beyond four queued runs is an explicit `QueueFull` error.
-const QUEUE_CAPACITY: usize = 4;
 
 /// The headless harness daemon: assemble a runtime from config, hand runs to
 /// the scheduler, and serve UDS / HTTP+SSE / WebSocket clients.
@@ -181,7 +178,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         None => harness_config::load_or_defaults().context("config")?,
     };
     let model = build_model(&config)?;
-    let scheduler = Scheduler::new(QUEUE_CAPACITY);
+    let scheduler = Scheduler::new(
+        config.scheduler.queue_capacity,
+        config.scheduler.max_concurrency,
+    );
     let session_dir = expand_tilde(&config.session.directory);
     // Ensure the session directory exists so `TursoSessionStore::open` can
     // create the database file; a missing directory is a config error, not a

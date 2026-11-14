@@ -31,7 +31,6 @@ pub struct QueuedRun {
 /// A FIFO queue with a hard capacity.
 pub(crate) struct BoundedQueue {
     capacity: usize,
-    next_ticket: u64,
     items: VecDeque<QueuedRun>,
 }
 
@@ -41,7 +40,6 @@ impl BoundedQueue {
             // A zero-capacity queue would reject every request; one slot is the
             // smallest useful queue and keeps `is_full` meaningful.
             capacity: capacity.max(1),
-            next_ticket: 0,
             items: VecDeque::new(),
         }
     }
@@ -54,22 +52,25 @@ impl BoundedQueue {
         self.items.len()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     pub(crate) fn is_full(&self) -> bool {
         self.items.len() >= self.capacity
     }
 
-    /// Append one request, assigning the next ticket.
+    /// Append one request under the scheduler-assigned ticket.
     ///
-    /// Returns the ticket, or `None` when the queue is full — the caller turns
-    /// that into an explicit rejection.
-    pub(crate) fn push(&mut self, request: RunRequest) -> Option<u64> {
+    /// Returns `false` when the queue is full — the caller turns that into an
+    /// explicit rejection. Tickets are assigned by the scheduler (submission
+    /// order) so the admission order across sessions is a single global FIFO.
+    pub(crate) fn push(&mut self, request: RunRequest, ticket: u64) -> bool {
         if self.is_full() {
-            return None;
+            return false;
         }
-        let ticket = self.next_ticket;
-        self.next_ticket += 1;
         self.items.push_back(QueuedRun { ticket, request });
-        Some(ticket)
+        true
     }
 
     pub(crate) fn pop(&mut self) -> Option<QueuedRun> {
