@@ -1,7 +1,7 @@
 //! Integration tests for the slash/JSON-RPC command surface.
 
 use harness_transport::slash::{
-    ParseSlashError, SlashCommand, command_from_jsonrpc, slash_to_jsonrpc,
+    ParseSlashError, SlashCommand, command_from_jsonrpc, parse_slash, slash_to_jsonrpc,
 };
 
 /// Purpose: the `search` JSON-RPC method parses into [`SlashCommand::Search`]
