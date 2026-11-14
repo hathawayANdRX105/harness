@@ -1115,3 +1115,71 @@ fn config_prompt_and_skills_reach_the_runtime() -> Result<(), Box<dyn std::error
     );
     Ok(())
 }
+
+/// Purpose: the injected compactor survives assembly and reaches the loop
+/// dependencies, but only when the spec declares compaction stages — without
+/// stages the builder records no plan and drops the compactor.
+/// Scenario: the default ladder declared in the spec plus a structural
+/// compactor built from the same ladder.
+/// Acceptance: `loop_deps().compactor` is `Some`, and the plan's stages match
+/// the ladder.
+#[test]
+fn compactor_injection_reaches_loop_deps() -> Result<(), Box<dyn std::error::Error>> {
+    let ladder = harness_context::default_stages();
+    let mut spec = HarnessSpec::new("compacted");
+    spec.compaction.stages = ladder
+        .iter()
+        .map(|stage| harness_builder::CompactionStageSpec {
+            threshold: stage.threshold,
+            target_ratio: stage.target_ratio,
+            label: stage.label.clone(),
+        })
+        .collect();
+    spec.models.push(mock_model_spec());
+    spec.default_model = Some("mock".into());
+
+    let compactor = Arc::new(harness_context::DefaultCompactor::with_stages(
+        harness_context::default_stages(),
+    ));
+    let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
+        .with_compactor(Arc::clone(&compactor) as Arc<dyn harness_context::Compactor>)
+        .build()?;
+
+    let plan = runtime
+        .compaction
+        .as_ref()
+        .ok_or("a declared ladder must record a compaction plan")?;
+    assert_eq!(plan.stages.len(), 5, "the default ladder has five stages");
+    assert!(
+        plan.compactor.is_some(),
+        "the injected compactor is recorded"
+    );
+    assert!(
+        runtime.loop_deps().compactor.is_some(),
+        "the compactor reaches the loop"
+    );
+    Ok(())
+}
+
+/// Purpose: without declared stages the builder records no compaction plan
+/// even when a compactor was injected — the explicit-injection contract cuts
+/// both ways.
+/// Scenario: an empty ladder plus an injected compactor.
+/// Acceptance: `runtime.compaction` is `None` and `loop_deps().compactor` is
+/// `None`.
+#[test]
+fn compactor_without_stages_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
+    let mut spec = HarnessSpec::new("no-ladder");
+    spec.models.push(mock_model_spec());
+    spec.default_model = Some("mock".into());
+
+    let compactor: Arc<dyn harness_context::Compactor> =
+        Arc::new(harness_context::DefaultCompactor::new());
+    let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
+        .with_compactor(compactor)
+        .build()?;
+
+    assert!(runtime.compaction.is_none(), "no stages, no plan");
+    assert!(runtime.loop_deps().compactor.is_none());
+    Ok(())
+}

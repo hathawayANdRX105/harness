@@ -27,11 +27,13 @@
 mod budget;
 mod checkpoint;
 mod compactor;
+mod default_compactor;
 mod stage;
 mod stop_reason;
 
 pub use budget::Budget;
 pub use checkpoint::CompactionCheckpoint;
 pub use compactor::{CompactionResult, Compactor};
+pub use default_compactor::{DEFAULT_TOKENS_PER_CHAR, DefaultCompactor};
 pub use stage::{CompactionStage, default_stages};
 pub use stop_reason::BudgetBlocked;

@@ -10,6 +10,7 @@ publish = false
 harness-core = { path = "../harness-core" }
 harness-config = { path = "../harness-config" }
 harness-builder = { path = "../harness-builder" }
+harness-context = { path = "../harness-context" }
 harness-model = { path = "../harness-model" }
 harness-loop = { path = "../harness-loop" }
 harness-scheduler = { path = "../harness-scheduler" }

@@ -40,6 +40,8 @@ use tokio_util::sync::CancellationToken;
 struct MockModel {
     info: ModelInfo,
     turns: Mutex<VecDeque<Vec<ModelEvent>>>,
+    /// Every request the model saw, in call order.
+    requests: Mutex<Vec<ModelRequest>>,
 }
 
 impl MockModel {
@@ -47,7 +49,15 @@ impl MockModel {
         Self {
             info,
             turns: Mutex::new(turns.into()),
+            requests: Mutex::new(Vec::new()),
         }
+    }
+
+    fn requests(&self) -> Vec<ModelRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| panic!("model lock poisoned: {e}"))
+            .clone()
     }
 }
 
@@ -57,7 +67,11 @@ impl Model for MockModel {
         &self.info
     }
 
-    async fn stream(&self, _req: &ModelRequest) -> ModelStream<'_> {
+    async fn stream(&self, req: &ModelRequest) -> ModelStream<'_> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| panic!("model lock poisoned: {e}"))
+            .push(req.clone());
         let events = self
             .turns
             .lock()
@@ -491,4 +505,151 @@ async fn compaction_frees_room_then_turn_proceeds() -> Result<(), String> {
         "no budget-blocked error when compaction relieves pressure"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Real DefaultCompactor through the gate
+// ---------------------------------------------------------------------------
+
+/// Purpose: the shipped structural compactor (not a mock) makes an oversized
+/// history fit through the budget gate, so the turn proceeds instead of
+/// being refused.
+/// Scenario: a seed ledger of six oversized tool results (24k chars ≈ 7.2k
+/// tokens by the 0.30 chars/token estimate) against a 4k-token window — every
+/// ladder stage is active on the first boundary.
+/// Acceptance: exactly one model call happens; the request the model sees
+/// carries the compaction digest and no oversized tool output; the run
+/// completes.
+#[tokio::test]
+async fn real_default_compactor_shrinks_oversized_history() {
+    /// The oversized seed: one task, then assistant/tool-result pairs whose
+    /// outputs dwarf the 4k-token window (24k chars ≈ 7.2k tokens).
+    fn seed_oversized_history() -> Vec<Message> {
+        let mut messages = vec![Message::user_text("collect twelve markers")];
+        for index in 0..6 {
+            messages.push(Message::Assistant {
+                content: vec![
+                    Content::Text(format!("calling tool {index}")),
+                    Content::ToolCall(harness_core::ToolCall {
+                        id: format!("call-{index}"),
+                        name: "grep".into(),
+                        args: serde_json::json!({}),
+                    }),
+                ],
+            });
+            messages.push(Message::ToolResult(
+                harness_core::message::ToolResultMessage {
+                    tool_call_id: format!("call-{index}"),
+                    tool_name: "grep".into(),
+                    content: "y".repeat(2_000),
+                    is_error: false,
+                },
+            ));
+        }
+        messages
+    }
+
+    let model = Arc::new(MockModel::new(
+        make_model_info(),
+        vec![vec![
+            ModelEvent::TextDelta("done".into()),
+            ModelEvent::Stop(StopReason::EndTurn),
+        ]],
+    ));
+    let compactor = Arc::new(harness_context::DefaultCompactor::new());
+    let deps = Arc::new(LoopDeps {
+        model: Arc::clone(&model) as Arc<dyn Model>,
+        tools: Vec::new(),
+        event_sink: Arc::new(TestSink::default()),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        tool_mode: ToolExecutionMode::Sequential,
+        budget: None,
+        compactor: Some(Arc::clone(&compactor) as Arc<dyn Compactor>),
+        seed: seed_oversized_history(),
+        transcript_sink: None,
+    });
+
+    let reason = run(make_ctx(10), deps, RunControl::new()).await;
+
+    assert_eq!(
+        reason,
+        RunStopReason::Completed,
+        "compaction must make the history fit"
+    );
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1, "exactly one model call");
+    let seen = serde_json::to_string(&requests[0]).unwrap_or_else(|e| panic!("serialize: {e}"));
+    assert!(
+        seen.contains("[compaction:"),
+        "the model must see the compaction digest: {seen}"
+    );
+    let request_chars: usize = requests[0]
+        .messages
+        .iter()
+        .map(|message| match message {
+            Message::User { content } | Message::Assistant { content } => content
+                .iter()
+                .filter_map(|block| match block {
+                    Content::Text(text) | Content::Reasoning(text) => Some(text.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            Message::ToolResult(result) => result.content.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!(
+        request_chars < 10_000,
+        "the model request must be far smaller than the 24k-char seed: {request_chars} chars"
+    );
+}
+
+/// Purpose: with the real structural compactor, a ledger that cannot shrink
+/// (a single oversized user message: nothing to trim, no legal digest split)
+/// is refused with `BudgetBlocked` semantics instead of being sent to the
+/// provider.
+/// Scenario: seed = one user message of 100k chars against a 4k window; the
+/// model is never called because the gate fires first.
+/// Acceptance: stop is `Error` whose message round-trips through
+/// `BudgetBlocked::from_error_message`, and the model saw zero requests.
+#[tokio::test]
+async fn real_default_compactor_refuses_unshrinkable_history() {
+    let model = Arc::new(MockModel::new(
+        make_model_info(),
+        vec![vec![
+            ModelEvent::TextDelta("should never run".into()),
+            ModelEvent::Stop(StopReason::EndTurn),
+        ]],
+    ));
+    let deps = Arc::new(LoopDeps {
+        model: Arc::clone(&model) as Arc<dyn Model>,
+        tools: Vec::new(),
+        event_sink: Arc::new(TestSink::default()),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        tool_mode: ToolExecutionMode::Sequential,
+        budget: None,
+        compactor: Some(Arc::new(harness_context::DefaultCompactor::new()) as Arc<dyn Compactor>),
+        seed: vec![Message::user_text("y".repeat(100_000))],
+        transcript_sink: None,
+    });
+
+    let reason = run(make_ctx(10), deps, RunControl::new()).await;
+
+    let RunStopReason::Error { message } = reason else {
+        panic!("an unshrinkable ledger must be refused, got {reason:?}");
+    };
+    let blocked = BudgetBlocked::from_error_message(&message)
+        .unwrap_or_else(|| panic!("the error must carry BudgetBlocked semantics: {message}"));
+    // The recorded stage is the FIRST active stage (the gate records where
+    // compaction was attempted), not necessarily the deepest one reached.
+    assert_eq!(blocked.stage, "soft", "the first active stage is recorded");
+    assert_eq!(
+        model.requests().len(),
+        0,
+        "the provider call never happened"
+    );
 }
