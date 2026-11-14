@@ -129,17 +129,11 @@
     <rect x="940" y="518" width="120" height="26" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="1000" y="535">terminal</text>
     <rect x="1068" y="518" width="122" height="26" rx="6" fill="#f0fdf4" stroke="#16a34a"/><text x="1129" y="535">webfetch</text>
   </g>
-<<<<<<< HEAD
   <rect x="940" y="554" width="250" height="30" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
   <text x="1065" y="573" text-anchor="middle" font-size="11" font-weight="600" fill="#166534">MCP 桥（mcp__*）</text>
   <rect x="940" y="592" width="250" height="42" rx="8" fill="#ffffff" stroke="#16a34a" stroke-dasharray="5 3"/>
   <text x="1065" y="610" text-anchor="middle" font-size="10.5" fill="#166534">ToolCatalog：per-session allowlist</text>
   <text x="1065" y="626" text-anchor="middle" font-size="10.5" fill="#166534">tools.list / set_active / reset</text>
-=======
-  <text x="1080" y="571" font-size="9.5" fill="#64748b">路径容器化 · spill · 每会话 allowlist</text>
-  <line x1="1007" y1="450" x2="1007" y2="520" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
-  <text x="1014" y="492" font-size="10" fill="#15803d">LoopDeps.tools</text>
->>>>>>> 2785bdeb (feat(daemon,transport): per-session runtime tool catalog)
 
   <line x1="490" y1="470" x2="538" y2="470" stroke="#16a34a" stroke-width="2" marker-end="url(#arr-green)"/>
   <text x="514" y="462" text-anchor="middle" font-size="10" fill="#15803d">run</text>
