@@ -58,7 +58,8 @@ pub use analyze::{Analysis, analyze};
 pub use assemble::{
     AssembledRuntime, CompactionPlan, ConfigBindings, HarnessBuilder, McpPool, McpServerTools,
     alias_registry_from_models, budget_from_config, compaction_stages_from_spec,
-    mcp_server_config_from_entry, model_info_from_spec, run_limits_from_config,
+    mcp_server_config_from_entry, mcp_server_specs, mcp_tool_specs, model_info_from_spec,
+    prompt_sections, run_limits_from_config, skill_specs_from_roots,
 };
 pub use error::{AnalyzeError, BuildError, SpecError};
 pub use explain::explain;

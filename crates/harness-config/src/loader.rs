@@ -115,6 +115,7 @@ fn defaults_only() -> Config {
             api_key_var: default_api_key_var(),
         },
         models: ModelsConfig { aliases: vec![] },
+        prompt: PromptConfig::default(),
         session: SessionConfig {
             directory: default_session_dir(),
             auth_token_var: None,
