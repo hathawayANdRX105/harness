@@ -411,6 +411,29 @@ impl ToolSpec {
     pub fn unit_id(&self) -> String {
         format!("tool:{}", self.name)
     }
+
+    /// A built-in harness-tools entry by name.
+    pub fn builtin(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: ToolKind::Builtin,
+            server: None,
+            remote: None,
+            manifest: Default::default(),
+        }
+    }
+
+    /// A host-injected tool: the builder resolves the name against the
+    /// tools registered via `HarnessBuilder::with_tool`.
+    pub fn external(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: ToolKind::External,
+            server: None,
+            remote: None,
+            manifest: Default::default(),
+        }
+    }
 }
 
 /// One named section of the system-prompt ledger. Sections are assembled into

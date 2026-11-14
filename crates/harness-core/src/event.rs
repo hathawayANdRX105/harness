@@ -117,8 +117,8 @@ pub enum RunEventKind {
 }
 /// How a subagent run ended, derived from the child's terminal stop
 /// reason: `Completed` <- `RunStopReason::Completed`, `Blocked` <-
-/// `RunStopReason::MaxTurns`, `DoneWithConcerns` <-
-/// `RunStopReason::Error` / `RunStopReason::Cancelled`. A subagent report
+/// `RunStopReason::MaxTurns`, `Error` <- `RunStopReason::Error`,
+/// `DoneWithConcerns` <- `RunStopReason::Cancelled`. A subagent report
 /// is not a tool failure: the child reached a terminal state, just one the
 /// parent may want to act on (retry with another profile, surface to the
 /// user, or escalate).
@@ -129,7 +129,9 @@ pub enum SubagentStatus {
     Completed,
     /// The child hit its `max_turns` ceiling without completing.
     Blocked,
-    /// The child ended on an error or cancellation — done, with concerns.
+    /// The child's stream errored: the model call itself failed.
+    Error,
+    /// The child was cancelled — done, with concerns.
     DoneWithConcerns,
 }
 

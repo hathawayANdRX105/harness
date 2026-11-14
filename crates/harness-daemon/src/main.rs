@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use harness_builder::{
-    AssembledRuntime, BUILTIN_TOOLS, HarnessBuilder, HarnessSpec, ModelSpec, ToolKind, ToolSpec,
+    AssembledRuntime, BUILTIN_TOOLS, HarnessBuilder, HarnessSpec, ModelSpec, ToolSpec,
 };
 use harness_config::{Config, SubagentProfile};
 use harness_core::model::ModelInfo;
@@ -111,26 +111,17 @@ fn build_runtime(
         supports_streaming: true,
     }];
     spec.tools = BUILTIN_TOOLS
-        .map(|name| ToolSpec {
-            name: name.into(),
-            kind: ToolKind::Builtin,
-            server: None,
-            remote: None,
-            manifest: Default::default(),
-        })
-        .to_vec();
+        .iter()
+        .map(|name| ToolSpec::builtin(*name))
+        .collect();
     // The `subagent` tool is declared as external so the builder validates
     // the injection and installs it into the base tool set; per-session
     // allowlists gate it like any other tool.
-    if subagent_tool.is_some() {
-        spec.tools.push(ToolSpec {
-            name: "subagent".into(),
-            kind: ToolKind::External,
-            server: None,
-            remote: None,
-            manifest: Default::default(),
-        });
-    }
+    spec.tools.extend(
+        subagent_tool
+            .is_some()
+            .then_some(ToolSpec::external("subagent")),
+    );
     let cwd =
         std::env::current_dir().context("resolving the current directory for tool execution")?;
     let mut builder = HarnessBuilder::new(spec)

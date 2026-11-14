@@ -1,12 +1,11 @@
 //! Integration tests for the daemon's tool catalog.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use harness_core::run::SessionId;
 use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
 
-use harness_daemon::tools::{ToolCatalog, ToolCatalogError, ToolStatus};
+use harness_daemon::tools::{ToolCatalog, ToolStatus};
 
 /// Stub tool with a fixed name and no behaviour: mirrors the repo's
 /// existing test stubs (harness-builder's `FixedTool`, the loop
