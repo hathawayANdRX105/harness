@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use harness_config::{BudgetConfig, Config, McpServerEntry, ModelsConfig};
+use harness_config::{BudgetConfig, Config, McpServerEntry, ModelsConfig, PromptSection};
 use harness_context::{Budget, CompactionStage, Compactor};
 use harness_core::EventSink;
 use harness_core::message::Message;
@@ -195,6 +195,84 @@ impl Default for ConfigBindings {
             mcp_servers: Vec::new(),
         }
     }
+}
+
+// ── Config → spec mapping ───────────────────────────────────────────────────
+
+/// Map config prompt sections into spec entries, preserving the config's
+/// order. The assembled ledger is ordered by section name, so duplicate
+/// section names are rejected by spec validation as duplicate units.
+pub fn prompt_sections(sections: &[PromptSection]) -> Vec<PromptSectionSpec> {
+    sections
+        .iter()
+        .map(|section| PromptSectionSpec {
+            name: section.name.clone(),
+            content: section.content.clone(),
+            manifest: Default::default(),
+        })
+        .collect()
+}
+
+/// Map config MCP server entries into spec server declarations.
+///
+/// `from_config: true` defers command/env resolution to [`ConfigBindings`] at
+/// assembly time, so each server is described once in the config and the
+/// spec stays free of deployment detail.
+pub fn mcp_server_specs(entries: &[McpServerEntry]) -> Vec<McpServerSpec> {
+    entries
+        .iter()
+        .map(|entry| McpServerSpec {
+            name: entry.name.clone(),
+            command: None,
+            args: Vec::new(),
+            env: Default::default(),
+            url: None,
+            tool_call_timeout_ms: None,
+            from_config: true,
+            manifest: Default::default(),
+        })
+        .collect()
+}
+
+/// One MCP tool unit per server: `remote: None` installs every tool the
+/// server advertises. The spec name is only the unit label — the model-facing
+/// names are the server's remote tools with the `mcp__<server>__<tool>`
+/// namespace — so the `mcp-<server>` label cannot collide with a builtin.
+pub fn mcp_tool_specs(entries: &[McpServerEntry]) -> Vec<ToolSpec> {
+    entries
+        .iter()
+        .map(|entry| ToolSpec {
+            name: format!("mcp-{}", entry.name),
+            kind: ToolKind::Mcp,
+            server: Some(entry.name.clone()),
+            remote: None,
+            manifest: Default::default(),
+        })
+        .collect()
+}
+
+/// Scan each skills root and map every discovered skill to a spec entry.
+///
+/// Duplicate names keep the first root's skill (a user-level root shadows a
+/// later project-level root); the builder would otherwise reject the
+/// duplicate unit ids at validation time. Roots need not exist — an
+/// unreadable root yields no skills rather than a startup failure.
+pub fn skill_specs_from_roots(roots: &[String]) -> Vec<SkillSpec> {
+    let mut seen = std::collections::HashSet::new();
+    roots
+        .iter()
+        .flat_map(|root| {
+            discover_skills(Path::new(root))
+                .into_iter()
+                .map(|skill| (skill.name, root.clone()))
+        })
+        .filter(|(name, _)| seen.insert(name.clone()))
+        .map(|(name, root)| SkillSpec {
+            name,
+            path: root,
+            manifest: Default::default(),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

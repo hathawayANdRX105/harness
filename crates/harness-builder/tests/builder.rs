@@ -31,11 +31,13 @@ use std::sync::{Arc, Mutex};
 use harness_builder::{
     AnalyzeError, BuildError, ConfigBindings, HarnessBuilder, HarnessSpec, HookKind, HookSpec,
     ModelSpec, PromptSectionSpec, SkillSpec, SpecError, ToolKind, ToolSpec, UnitManifest, analyze,
-    mcp_server_config_from_entry,
+    mcp_server_config_from_entry, mcp_server_specs, mcp_tool_specs, prompt_sections,
+    skill_specs_from_roots,
 };
 use harness_config::{
     AgentsConfig, BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry,
-    ModelAlias, ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, UpstreamConfig,
+    ModelAlias, ModelsConfig, PromptConfig, PromptSection, RegistryConfig, SchedulerConfig,
+    SessionConfig, UpstreamConfig,
 };
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
 use harness_core::message::Message;
@@ -514,6 +516,7 @@ fn config_bindings_map_into_runtime() -> Result<(), Box<dyn std::error::Error>> 
         registry: RegistryConfig::default(),
         scheduler: SchedulerConfig::default(),
         agents: AgentsConfig::default(),
+        prompt: PromptConfig::default(),
     };
 
     let bindings = ConfigBindings::from_config(&config)?;
@@ -937,4 +940,178 @@ fn spec_validation_is_standalone() {
         ),
         "an out-of-range threshold is rejected"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Config → spec mapping
+// ---------------------------------------------------------------------------
+
+/// Purpose: config prompt sections map one-to-one into spec entries.
+/// Scenario: two named sections; the mapping is order-preserving.
+/// Acceptance: the spec entries carry the config's names and content.
+#[test]
+fn prompt_sections_map_in_order() {
+    let sections = prompt_sections(&[
+        PromptSection {
+            name: "identity".into(),
+            content: "You are harness.".into(),
+        },
+        PromptSection {
+            name: "rules".into(),
+            content: "Be terse.".into(),
+        },
+    ]);
+    assert_eq!(sections.len(), 2);
+    assert_eq!(sections[0].name, "identity");
+    assert_eq!(sections[0].content, "You are harness.");
+    assert_eq!(sections[1].name, "rules");
+    assert_eq!(prompt_sections(&[]), Vec::new());
+}
+
+/// Purpose: config MCP entries map into server declarations plus one tool
+/// unit per server that installs the server's whole tool set.
+/// Scenario: one stdio server entry.
+/// Acceptance: the server spec defers to config (`from_config`), and the
+/// tool spec selects that server with no remote filter.
+#[test]
+fn mcp_specs_map_from_entries() {
+    let entries = vec![McpServerEntry {
+        name: "docs".into(),
+        command: "npx".into(),
+        args: vec!["-y".into(), "docs-server".into()],
+        env_var: None,
+    }];
+
+    let servers = mcp_server_specs(&entries);
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "docs");
+    assert!(
+        servers[0].from_config,
+        "resolution stays in config bindings"
+    );
+
+    let tools = mcp_tool_specs(&entries);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].kind, ToolKind::Mcp);
+    assert_eq!(tools[0].server.as_deref(), Some("docs"));
+    assert_eq!(tools[0].remote, None, "no remote filter installs all tools");
+}
+
+/// Purpose: skill roots are scanned and mapped one spec per discovered skill.
+/// Scenario: two roots, the second repeating a name from the first.
+/// Acceptance: first-root skills win, no duplicate names, and an unreadable
+/// root contributes nothing instead of failing startup.
+#[test]
+fn skill_specs_from_roots_scan_and_dedupe() -> Result<(), Box<dyn std::error::Error>> {
+    let first = tempfile::TempDir::new()?;
+    for name in ["alpha", "beta"] {
+        let dir = first.path().join(name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("SKILL.md"), format!("# {name}\nFirst root.\n"))?;
+    }
+    let second = tempfile::TempDir::new()?;
+    let dir = second.path().join("alpha");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("SKILL.md"), "# alpha\nSecond root.\n")?;
+    let missing = tempfile::TempDir::new()?
+        .path()
+        .join("does-not-exist")
+        .display()
+        .to_string();
+
+    let specs = skill_specs_from_roots(&[
+        first.path().display().to_string(),
+        second.path().display().to_string(),
+        missing,
+    ]);
+    let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "beta"],
+        "first root wins, dedup applied"
+    );
+    assert_eq!(specs[0].path, first.path().display().to_string());
+    Ok(())
+}
+
+/// Purpose: prompt and skill config sections reach the assembled runtime.
+/// Scenario: a config with two prompt sections and one skills root holding
+/// one skill, built through the full builder.
+/// Acceptance: the runtime carries the prompt ledger with both sections, the
+/// skill metadata, and the auto-registered `skill` tool.
+#[test]
+fn config_prompt_and_skills_reach_the_runtime() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+    let skill_dir = dir.path().join("greet");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(skill_dir.join("SKILL.md"), "# Greet\nA greeting skill.\n")?;
+
+    let config = Config {
+        version: CURRENT_CONFIG_VERSION,
+        upstream: UpstreamConfig {
+            base_url: "https://example.invalid/v1".into(),
+            api_key_var: "HARNESS_API_KEY".into(),
+        },
+        models: ModelsConfig::default(),
+        session: SessionConfig::default(),
+        budget: BudgetConfig::default(),
+        mcp: McpConfig::default(),
+        registry: RegistryConfig {
+            hooks: Vec::new(),
+            skills: vec![dir.path().display().to_string()],
+        },
+        scheduler: SchedulerConfig::default(),
+        agents: AgentsConfig::default(),
+        prompt: PromptConfig {
+            sections: vec![
+                PromptSection {
+                    name: "identity".into(),
+                    content: "You are harness.".into(),
+                },
+                PromptSection {
+                    name: "rules".into(),
+                    content: "Be terse.".into(),
+                },
+            ],
+        },
+    };
+
+    let mut spec = HarnessSpec::new("config-wired");
+    spec.models.push(mock_model_spec());
+    spec.default_model = Some("mock".into());
+    spec.prompt_sections = prompt_sections(&config.prompt.sections);
+    spec.skills = skill_specs_from_roots(&config.registry.skills);
+
+    let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
+        .with_cwd(dir.path().to_path_buf())
+        .build()?;
+
+    let Some(prompt) = runtime.prompt.as_ref() else {
+        panic!("configured prompt sections must assemble a system message");
+    };
+    let Message::System { sections } = prompt else {
+        panic!("prompt should be a system message");
+    };
+    assert_eq!(
+        sections.get("identity").map(|c| c.as_deref()),
+        Some(Some("You are harness."))
+    );
+    assert_eq!(
+        sections.get("rules").map(|c| c.as_deref()),
+        Some(Some("Be terse."))
+    );
+    assert_eq!(
+        runtime
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["greet"],
+        "the skills root fed the spec"
+    );
+    assert!(
+        runtime.tools.iter().any(|tool| tool.name() == "skill"),
+        "declaring skills registers the skill tool"
+    );
+    Ok(())
 }

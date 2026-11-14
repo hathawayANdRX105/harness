@@ -37,8 +37,8 @@ mod migration;
 
 pub use config::{
     AgentsConfig, BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry,
-    ModelAlias, ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, SubagentProfile,
-    UpstreamConfig,
+    ModelAlias, ModelsConfig, PromptConfig, PromptSection, RegistryConfig, SchedulerConfig,
+    SessionConfig, SubagentProfile, UpstreamConfig,
 };
 pub use error::ConfigError;
 pub use loader::{load, load_from_path, load_or_defaults};

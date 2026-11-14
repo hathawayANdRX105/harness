@@ -62,6 +62,10 @@ pub struct Config {
     /// spawn. Absent (or empty) means delegation is unavailable.
     #[serde(default)]
     pub agents: AgentsConfig,
+    /// System-prompt sections assembled into the prompt ledger at startup.
+    /// Absent means no system prompt.
+    #[serde(default)]
+    pub prompt: PromptConfig,
 }
 
 pub(crate) fn default_version() -> u32 {
@@ -80,6 +84,7 @@ impl fmt::Debug for Config {
             .field("registry", &self.registry)
             .field("scheduler", &self.scheduler)
             .field("agents", &self.agents)
+            .field("prompt", &self.prompt)
             .finish()
     }
 }
@@ -345,6 +350,29 @@ impl fmt::Debug for RegistryConfig {
             .finish()
     }
 }
+// ── Prompt ──────────────────────────────────────────────────────────────────
+
+/// System-prompt sections the builder assembles into the prompt ledger.
+///
+/// Absent (the serde default) means the daemon runs without a system prompt.
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptConfig {
+    /// Named sections; the builder orders the ledger by section name.
+    #[serde(default)]
+    pub sections: Vec<PromptSection>,
+}
+
+/// One named prompt section.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptSection {
+    /// Ledger section name (the map key the replay contract uses).
+    pub name: String,
+    /// Section content, verbatim.
+    pub content: String,
+}
+
 // ── Scheduler ────────────────────────────────────────────────────────────────
 
 /// Scheduler concurrency and queueing limits.
