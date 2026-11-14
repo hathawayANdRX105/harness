@@ -34,8 +34,8 @@ use harness_builder::{
     mcp_server_config_from_entry,
 };
 use harness_config::{
-    BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry, ModelAlias,
-    ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, UpstreamConfig,
+    AgentsConfig, BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry,
+    ModelAlias, ModelsConfig, RegistryConfig, SchedulerConfig, SessionConfig, UpstreamConfig,
 };
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
 use harness_core::message::Message;
@@ -513,6 +513,7 @@ fn config_bindings_map_into_runtime() -> Result<(), Box<dyn std::error::Error>> 
         },
         registry: RegistryConfig::default(),
         scheduler: SchedulerConfig::default(),
+        agents: AgentsConfig::default(),
     };
 
     let bindings = ConfigBindings::from_config(&config)?;

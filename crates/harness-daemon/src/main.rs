@@ -6,6 +6,7 @@
 //! [`TransportState`]. Scheduling, the loop, tools and compaction all live in
 //! their own crates; this process only assembles, starts, supervises and ends.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -13,11 +14,12 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use harness_builder::{
-    AssembledRuntime, BUILTIN_TOOLS, HarnessBuilder, HarnessSpec, ModelSpec, ToolKind, ToolSpec,
+    AssembledRuntime, BUILTIN_TOOLS, HarnessBuilder, HarnessSpec, ModelSpec, ToolSpec,
 };
-use harness_config::Config;
+use harness_config::{Config, SubagentProfile};
 use harness_core::model::ModelInfo;
-use harness_core::{EventSink, RunEvent};
+use harness_core::tool::Tool;
+use harness_core::{EventSink, Model, RunEvent};
 use harness_model::OpenAIModel;
 use harness_scheduler::Scheduler;
 use harness_session::{RecallStore, SessionStore, turso::TursoSessionStore};
@@ -26,6 +28,7 @@ use harness_transport::ws;
 use harness_transport::{EventLog, TransportState, uds::UdsConfig};
 
 use harness_daemon::pidlock::PidLock;
+use harness_daemon::subagent::SubagentTool;
 use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::{DaemonHandler, StoreEventLog};
 
@@ -88,8 +91,9 @@ fn build_model(config: &Config) -> anyhow::Result<OpenAIModel> {
 /// model, and the config-mapped bindings (limits, aliases, MCP servers).
 fn build_runtime(
     config: &Config,
-    model: OpenAIModel,
+    model: Arc<dyn Model>,
     event_sink: Arc<dyn EventSink>,
+    subagent_tool: Option<Arc<dyn Tool>>,
 ) -> anyhow::Result<AssembledRuntime> {
     // The model instance is injected by the host; the spec declares the same
     // model in its directory so the builder can validate the injection.
@@ -107,25 +111,31 @@ fn build_runtime(
         supports_streaming: true,
     }];
     spec.tools = BUILTIN_TOOLS
-        .map(|name| ToolSpec {
-            name: name.into(),
-            kind: ToolKind::Builtin,
-            server: None,
-            remote: None,
-            manifest: Default::default(),
-        })
-        .to_vec();
+        .iter()
+        .map(|name| ToolSpec::builtin(*name))
+        .collect();
+    // The `subagent` tool is declared as external so the builder validates
+    // the injection and installs it into the base tool set; per-session
+    // allowlists gate it like any other tool.
+    spec.tools.extend(
+        subagent_tool
+            .as_ref()
+            .map(|_| ToolSpec::external("subagent")),
+    );
     let cwd =
         std::env::current_dir().context("resolving the current directory for tool execution")?;
-    HarnessBuilder::new(spec)
-        .with_model(Arc::new(model))
+    let mut builder = HarnessBuilder::new(spec)
+        .with_model(Arc::clone(&model))
         .with_policy(Arc::new(harness_daemon::wire::DaemonPolicy))
         .with_event_sink(event_sink)
-        .with_cwd(cwd)
+        .with_cwd(cwd);
+    builder = builder
         .with_config(config)
-        .context("mapping the config onto builder bindings")?
-        .build()
-        .context("assembling the runtime")
+        .context("mapping the config onto builder bindings")?;
+    if let Some(tool) = subagent_tool {
+        builder = builder.with_tool(tool);
+    }
+    builder.build().context("assembling the runtime")
 }
 
 /// A transient [`EventSink`] that forwards into `event_tx`: used while
@@ -188,12 +198,12 @@ fn uds_auth_token(config: &Config) -> Option<String> {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let lock_path = PathBuf::from(format!("{}.lock", cli.socket.display()));
     let lock = PidLock::acquire(&lock_path)?;
-    let config = match &cli.config {
+    let mut config = match &cli.config {
         Some(path) => harness_config::load_from_path(path)
             .with_context(|| format!("config {}", path.display()))?,
         None => harness_config::load_or_defaults().context("config")?,
     };
-    let model = build_model(&config)?;
+    let model: Arc<dyn Model> = Arc::new(build_model(&config)?);
     let scheduler = Scheduler::new(
         config.scheduler.queue_capacity,
         config.scheduler.max_concurrency,
@@ -222,21 +232,57 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let store: Arc<dyn SessionStore> = Arc::new(store_inner);
     let event_log: Arc<dyn EventLog> = Arc::new(StoreEventLog::new(store.clone()));
     // The broadcast channel is created up front so the runtime's event sink
-    // and the transport state share one `tx`.
+    // and the transport state share one `tx`; it also doubles as the event
+    // sink for subagent children, whose events fan out to transport clients.
     let (event_tx, _) = tokio::sync::broadcast::channel(1024);
+    let event_sink: Arc<dyn EventSink> = Arc::new(EarlyEventSink(Arc::new(event_tx.clone())));
+
+    // The `subagent` tool is registered only when profiles are configured.
+    // It is injected before assembly and wired to the catalog right after
+    // (the catalog snapshot needs runtime.tools, which needs the tool — the
+    // shared sink created above breaks the construction circle).
+    let subagent_profiles = std::mem::take(&mut config.agents.subagents);
+    let mut profiles: HashMap<String, SubagentProfile> = HashMap::new();
+    for profile in subagent_profiles {
+        let name = profile.name.clone();
+        if profiles.insert(name.clone(), profile).is_some() {
+            // A silently overwritten profile is a config mistake the
+            // operator must hear about at startup.
+            return Err(anyhow::anyhow!(
+                "duplicate subagent profile name in [agents]: {name}"
+            ));
+        }
+    }
+    let subagent_tool = (!profiles.is_empty()).then(|| {
+        Arc::new(SubagentTool::new(
+            Arc::clone(&model),
+            profiles,
+            Arc::clone(&event_sink),
+            Arc::new(harness_daemon::wire::DaemonPolicy),
+        ))
+    });
+    let injected: Option<Arc<dyn Tool>> = subagent_tool
+        .as_ref()
+        .map(|tool| Arc::clone(tool) as Arc<dyn Tool>);
+
     // The runtime is assembled before the handler: its tool set is the
     // catalog's one-time base snapshot, registered once at startup.
     let runtime = build_runtime(
         &config,
-        model,
-        Arc::new(EarlyEventSink(Arc::new(event_tx.clone()))),
+        Arc::clone(&model),
+        Arc::clone(&event_sink),
+        injected,
     )?;
     let catalog = Arc::new(ToolCatalog::new(runtime.tools.clone()));
+    if let Some(tool) = &subagent_tool {
+        tool.set_catalog(Arc::clone(&catalog));
+    }
     let handler = Arc::new(DaemonHandler::new(
         scheduler.clone(),
         store,
         recall,
         catalog,
+        subagent_tool.clone(),
     ));
     let state = Arc::new(TransportState::with_event_tx(
         handler.clone(),

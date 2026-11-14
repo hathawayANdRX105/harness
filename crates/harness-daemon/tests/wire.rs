@@ -134,7 +134,7 @@ async fn daemon_search_returns_marker_events_as_json_hits() -> Result<(), Box<dy
     let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
     let scheduler = Scheduler::new(4, 4);
     let catalog = Arc::new(ToolCatalog::new(Vec::new()));
-    let handler = DaemonHandler::new(scheduler, store, recall, catalog);
+    let handler = DaemonHandler::new(scheduler, store, recall, catalog, None);
 
     let value = match CommandHandler::handle(
         &handler,
@@ -267,7 +267,7 @@ async fn daemon_tools_commands_consult_catalog() {
         Arc::new(StubTool::new("read")) as Arc<dyn Tool>,
         Arc::new(StubTool::new("write")) as Arc<dyn Tool>,
     ]));
-    let handler = DaemonHandler::new(scheduler, store, recall, catalog);
+    let handler = DaemonHandler::new(scheduler, store, recall, catalog, None);
 
     let list = |handler: &DaemonHandler| match CommandHandler::handle(
         handler,

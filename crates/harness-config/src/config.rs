@@ -58,6 +58,10 @@ pub struct Config {
     /// Scheduler concurrency and queueing limits.
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    /// Agent configuration: subagent profiles the `subagent` tool can
+    /// spawn. Absent (or empty) means delegation is unavailable.
+    #[serde(default)]
+    pub agents: AgentsConfig,
 }
 
 pub(crate) fn default_version() -> u32 {
@@ -75,6 +79,7 @@ impl fmt::Debug for Config {
             .field("mcp", &self.mcp)
             .field("registry", &self.registry)
             .field("scheduler", &self.scheduler)
+            .field("agents", &self.agents)
             .finish()
     }
 }
@@ -380,4 +385,46 @@ impl Default for SchedulerConfig {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
         }
     }
+}
+
+// ── Agents ────────────────────────────────────────────────────────────────
+
+/// Agent configuration: subagent profiles the `subagent` tool can spawn.
+///
+/// A profile names a restricted tool subset and a turn ceiling for a child
+/// run. A subagent MUST be strictly more restricted than its parent: the
+/// profile's tools must be a subset of what the parent itself may call, so
+/// delegation never amplifies the caller's tool authority. This is a trust
+/// boundary, not a convenience — a compromised or misaligned subagent
+/// runs under the parent's policy with the parent's credentials.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsConfig {
+    /// Named subagent profiles. Empty means the `subagent` tool (when
+    /// registered by the daemon) cannot spawn any child run.
+    #[serde(default)]
+    pub subagents: Vec<SubagentProfile>,
+}
+
+/// One named subagent profile: the tools and turn ceiling of a child run.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentProfile {
+    /// Profile name referenced by the `subagent` tool's `profile` argument.
+    pub name: String,
+    /// Tool names the child run may call. Empty means the default read-only
+    /// trio (`read`, `glob`, `grep`) — a subagent must be able to observe
+    /// its environment without necessarily changing it.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Maximum turns for the child run. Defaults to harness-rs's subagent
+    /// default of 12.
+    #[serde(default = "default_subagent_max_turns")]
+    pub max_turns: u32,
+}
+
+pub(crate) const DEFAULT_SUBAGENT_MAX_TURNS: u32 = 12;
+
+pub(crate) fn default_subagent_max_turns() -> u32 {
+    DEFAULT_SUBAGENT_MAX_TURNS
 }

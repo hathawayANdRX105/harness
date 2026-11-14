@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::subagent::SubagentTool;
 use crate::tools::{ToolCatalog, ToolCatalogError};
 use harness_builder::AssembledRuntime;
 use harness_core::RunEvent;
@@ -126,6 +127,7 @@ pub struct DaemonHandler {
     store: Arc<dyn SessionStore>,
     recall: Arc<dyn RecallStore>,
     catalog: Arc<ToolCatalog>,
+    subagent_tool: Option<Arc<SubagentTool>>,
     run_counter: AtomicU64,
 }
 
@@ -147,6 +149,7 @@ impl DaemonHandler {
         store: Arc<dyn SessionStore>,
         recall: Arc<dyn RecallStore>,
         catalog: Arc<ToolCatalog>,
+        subagent_tool: Option<Arc<SubagentTool>>,
     ) -> Self {
         Self {
             scheduler,
@@ -156,6 +159,7 @@ impl DaemonHandler {
             store,
             recall,
             catalog,
+            subagent_tool,
             run_counter: AtomicU64::new(0),
         }
     }
@@ -231,7 +235,7 @@ impl DaemonHandler {
         let active_tools = self.catalog.active(&session_id);
         let ctx = RunContext {
             run_id: run_id.clone(),
-            session_id,
+            session_id: session_id.clone(),
             task: Task {
                 description: task,
                 source: None,
@@ -245,6 +249,29 @@ impl DaemonHandler {
         // per-session allowlist overrides the shared base set; model, policy,
         // budget and everything else stay shared across sessions.
         deps.tools = active_tools;
+        // Swap the shared `subagent` tool for a per-run instance that carries
+        // this run's identity: the shared one has no run context, and stamping
+        // mutable parent state on it would race across concurrent sessions.
+        // A session that removed `subagent` from its allowlist keeps it out —
+        // delegation stays opt-out per session.
+        if let Some(tool) = &self.subagent_tool {
+            // The parent's active tool names: the child's profile is
+            // intersected with them so delegation never amplifies the
+            // parent's tool authority.
+            let allowed: Vec<String> = deps.tools.iter().map(|t| t.name().to_string()).collect();
+            let scoped = tool.for_run(&run_id, &session_id, ctx.limits, allowed);
+            deps.tools = deps
+                .tools
+                .into_iter()
+                .map(|t| {
+                    if t.name() == "subagent" {
+                        scoped.clone()
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+        }
         self.scheduler
             .submit(RunRequest { ctx, deps })
             .map_err(|err| TransportError::Internal(format!("submit failed: {err}")))?;

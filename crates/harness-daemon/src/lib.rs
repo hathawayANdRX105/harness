@@ -6,5 +6,6 @@
 
 pub mod lifecycle;
 pub mod pidlock;
+pub mod subagent;
 pub mod tools;
 pub mod wire;

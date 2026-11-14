@@ -48,7 +48,10 @@ pub struct RunEvent {
 }
 
 /// The kinds of thing a run can report. `#[non_exhaustive]`: the compaction
-/// and budget kinds land when harness-context (#5) is wired in.
+/// and budget kinds land when harness-context (#5) is wired in. The wire
+/// `type` tags are the frozen contract with transport subscribers: `SubagentStarted`
+/// and `SubagentReport` (issue #30) are the only variants approved beyond
+/// the original set; adding anything else requires maintainer sign-off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -97,6 +100,39 @@ pub enum RunEventKind {
     /// A failure encoded as an event — the loop-level twin of the model
     /// stream's terminal `Error`.
     Error { message: String },
+    /// A subagent run started: the model delegated a task to a child run
+    /// anchored under `profile` (issue #30).
+    SubagentStarted {
+        child_run_id: RunId,
+        profile: String,
+    },
+    /// A subagent run reached a terminal state. `status` collapses the
+    /// child's terminal `reason` to the outcome the parent acts on
+    /// (issue #30).
+    SubagentReport {
+        child_run_id: RunId,
+        status: SubagentStatus,
+        reason: RunStopReason,
+    },
+}
+/// How a subagent run ended, derived from the child's terminal stop
+/// reason: `Completed` <- `RunStopReason::Completed`, `Blocked` <-
+/// `RunStopReason::MaxTurns`, `Error` <- `RunStopReason::Error`,
+/// `DoneWithConcerns` <- `RunStopReason::Cancelled`. A subagent report
+/// is not a tool failure: the child reached a terminal state, just one the
+/// parent may want to act on (retry with another profile, surface to the
+/// user, or escalate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    /// The child completed its task naturally.
+    Completed,
+    /// The child hit its `max_turns` ceiling without completing.
+    Blocked,
+    /// The child's stream errored: the model call itself failed.
+    Error,
+    /// The child was cancelled — done, with concerns.
+    DoneWithConcerns,
 }
 
 /// The observer seam: implementations push into a bounded channel and never

@@ -1,21 +1,9 @@
-//! Per-session active-tool allowlist: the runtime tool catalog.
-//!
-//! The daemon assembles one static tool list at startup
-//! (`AssembledRuntime.tools`) and injects the same list into every run
-//! via `runtime.loop_deps()`.  The catalog wraps that base list and lets
-//! a session opt into a restricted subset:
-//! `ToolCatalog::active(session)` returns only the base tools whose
-//! `name()` is in the session's override, or every base tool when the
-//! session has no entry — the default is permissive; `set_active` is
-//! what restricts.
-//!
-//! # WHY
-//!
-//! A session can run a restricted tool subset without restarting the
-//! daemon: pi's `setActiveToolsByName` seam maps onto
-//! `ToolCatalog::set_active`, and every run built against the catalog sees
-//! only its session's active tools while model, policy, budget and
-//! everything else stays shared.
+//! Per-session active-tool allowlist over the daemon's one assembled tool
+//! list. The base set (`AssembledRuntime.tools`) is fixed at startup;
+//! `active(session)` filters it by the session's override (default
+//! permissive), so a session restricts its tools at runtime without a
+//! restart — pi's `setActiveToolsByName` seam. Model, policy and budget
+//! stay shared across sessions.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -65,6 +53,18 @@ impl ToolCatalog {
             base,
             sessions: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Look one base tool up by name, e.g. for resolving a profile's tool
+    /// subset at subagent-spawn time.
+    pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.base.iter().find(|tool| tool.name() == name).cloned()
+    }
+
+    /// Every base tool's name, in base order — for error messages that list
+    /// what a caller may select.
+    pub fn names(&self) -> Vec<&str> {
+        self.base.iter().map(|tool| tool.name()).collect()
     }
 
     /// The tools `session` may run: the base tools whose names are in the
@@ -120,13 +120,14 @@ impl ToolCatalog {
         names: Vec<String>,
     ) -> Result<(), ToolCatalogError> {
         let available: HashSet<&str> = self.base.iter().map(|tool| tool.name()).collect();
-        let mut unknown: Vec<String> = Vec::new();
         let mut seen_unknown: HashSet<String> = HashSet::new();
-        for name in &names {
-            if !available.contains(name.as_str()) && seen_unknown.insert(name.clone()) {
-                unknown.push(name.clone());
-            }
-        }
+        let unknown: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                !available.contains(name.as_str()) && seen_unknown.insert((*name).clone())
+            })
+            .cloned()
+            .collect();
         if !unknown.is_empty() {
             return Err(ToolCatalogError {
                 unknown,

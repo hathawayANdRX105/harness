@@ -8,7 +8,7 @@
 
 use parking_lot::Mutex;
 
-use harness_core::event::{EventSink, RunEvent, RunEventKind};
+use harness_core::event::{EventSink, RunEvent, RunEventKind, SubagentStatus};
 use harness_core::message::ToolCall;
 use harness_core::policy::{ApprovalResult, PolicyOutcome, PolicyStage};
 use harness_core::run::{RunId, RunStopReason, SessionId};
@@ -118,6 +118,21 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
                 message: "boom".into(),
             },
         ),
+        event(
+            17,
+            RunEventKind::SubagentStarted {
+                child_run_id: RunId("r-1--sub0".into()),
+                profile: "scout".into(),
+            },
+        ),
+        event(
+            18,
+            RunEventKind::SubagentReport {
+                child_run_id: RunId("r-1--sub0".into()),
+                status: SubagentStatus::Blocked,
+                reason: RunStopReason::MaxTurns,
+            },
+        ),
     ];
     for event in &events {
         let wire = serde_json::to_value(event)?;
@@ -143,6 +158,14 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
     assert_eq!(wire["reason"]["kind"], "completed");
     let wire = serde_json::to_value(&events[3])?;
     assert_eq!(wire["reason"]["kind"], "max_turns");
+    let wire = serde_json::to_value(&events[16])?;
+    assert_eq!(wire["type"], "subagent_started");
+    assert_eq!(wire["child_run_id"], "r-1--sub0");
+    let wire = serde_json::to_value(&events[17])?;
+    assert_eq!(wire["type"], "subagent_report");
+    assert_eq!(wire["status"], "blocked");
+    assert_eq!(wire["reason"]["kind"], "max_turns");
+
     Ok(())
 }
 
