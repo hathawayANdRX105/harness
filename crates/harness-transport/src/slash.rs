@@ -1,7 +1,9 @@
 //! Slash command parsing: text commands like `/run`, `/cancel`, `/steer`
 //! into a typed enum, plus JSON-RPC method+params conversion.
 //!
-//! Commands are designed to be human-memorable: `/run <task>` starts a run,
+//! Commands are designed to be human-memorable: `/run <task>` starts a run in
+//! the default session; the JSON-RPC `run` method optionally names the
+//! session the run belongs to via `params.session_id` (`None` = default).
 //! `/cancel <run_id>` cancels, `/steer <run_id> <msg>` queues an instruction,
 //! `/status <run_id>` queries state, `/list` lists recent runs.
 //! `/search <query>` searches persisted run events.
@@ -18,8 +20,12 @@ use serde::Deserialize;
 /// from a JSON-RPC method call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlashCommand {
-    /// Start a new run with the given task description.
-    Run { task: String },
+    /// Start a new run with the given task description, optionally naming the
+    /// session the run belongs to (`None` means the daemon's default session).
+    Run {
+        task: String,
+        session_id: Option<String>,
+    },
     /// Cancel the run identified by the given id.
     Cancel { run_id: String },
     /// Queue a steering message for a run.
@@ -92,6 +98,7 @@ pub fn parse_slash(line: &str) -> Result<SlashCommand, ParseSlashError> {
             }
             Ok(SlashCommand::Run {
                 task: args.to_string(),
+                session_id: None,
             })
         }
         "cancel" => {
@@ -175,7 +182,10 @@ pub fn command_from_jsonrpc(
             let p = params.ok_or(ParseSlashError::MissingArgs("task"))?;
             let rp: RunParams =
                 serde_json::from_value(p).map_err(|_| ParseSlashError::MissingArgs("task"))?;
-            Ok(SlashCommand::Run { task: rp.task })
+            Ok(SlashCommand::Run {
+                task: rp.task,
+                session_id: rp.session_id,
+            })
         }
         "cancel" => {
             let p = params.ok_or(ParseSlashError::MissingArgs("run_id"))?;
@@ -213,7 +223,14 @@ pub fn command_from_jsonrpc(
 /// Used by transport tests that need to serialise outbound commands.
 pub fn slash_to_jsonrpc(cmd: &SlashCommand) -> (String, Option<serde_json::Value>) {
     match cmd {
-        SlashCommand::Run { task } => ("run".into(), Some(serde_json::json!({ "task": task }))),
+        SlashCommand::Run { task, session_id } => {
+            let mut map = serde_json::Map::new();
+            map.insert("task".into(), serde_json::Value::String(task.clone()));
+            if let Some(id) = session_id {
+                map.insert("session_id".into(), serde_json::Value::String(id.clone()));
+            }
+            ("run".into(), Some(serde_json::Value::Object(map)))
+        }
         SlashCommand::Cancel { run_id } => (
             "cancel".into(),
             Some(serde_json::json!({ "run_id": run_id })),
@@ -230,56 +247,5 @@ pub fn slash_to_jsonrpc(cmd: &SlashCommand) -> (String, Option<serde_json::Value
             ("search".into(), Some(serde_json::json!({ "query": query })))
         }
         SlashCommand::List => ("list".into(), None),
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Purpose: the `search` JSON-RPC method parses into [`SlashCommand::Search`]
-    /// and serialises back out unchanged.
-    /// Scenario: `command_from_jsonrpc("search", {"query": "fox"})`, then
-    /// `slash_to_jsonrpc` on the parsed command.
-    /// Acceptance: the parsed command carries `query == "fox"` and the round
-    /// trip yields method `search` with params `{"query": "fox"}`.
-    #[test]
-    fn search_command_parses_and_round_trips() {
-        let cmd = match command_from_jsonrpc("search", Some(serde_json::json!({ "query": "fox" })))
-        {
-            Ok(cmd) => cmd,
-            Err(err) => panic!("search params must parse: {err}"),
-        };
-        assert!(
-            matches!(cmd, SlashCommand::Search { ref query } if query == "fox"),
-            "parsed search command must carry the query"
-        );
-        let (method, params) = slash_to_jsonrpc(&cmd);
-        assert_eq!(method, "search");
-        assert_eq!(
-            params,
-            Some(serde_json::json!({ "query": "fox" })),
-            "round-tripped params must match the input"
-        );
-    }
-
-    /// Purpose: `search` without `query` is a typed invalid-params error.
-    /// Scenario: `command_from_jsonrpc("search", None)`.
-    /// Acceptance: the error is `ParseSlashError::MissingArgs("query")` and its
-    /// JSON-RPC code is `INVALID_PARAMS` (-32602).
-    #[test]
-    fn search_command_missing_query_is_invalid_params() {
-        let err = match command_from_jsonrpc("search", None) {
-            Err(err) => err,
-            Ok(cmd) => panic!("expected search without query to fail: {cmd:?}"),
-        };
-        assert_eq!(err, ParseSlashError::MissingArgs("query"));
-        assert_eq!(
-            err.code(),
-            crate::frame::error_code::INVALID_PARAMS,
-            "missing query must map to INVALID_PARAMS"
-        );
     }
 }

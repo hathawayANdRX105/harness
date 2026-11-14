@@ -339,6 +339,11 @@ impl SessionStore for TursoSessionStore {
     }
 
     async fn append_event(&self, event: &RunEvent) -> Result<(), SessionStoreError> {
+        // The pump appends while readers (search, list, replay) query the same
+        // connection, so this write must take the serialization gate like every
+        // other direct statement — an ungated append races readers with a
+        // "concurrent use forbidden" storage error.
+        let _guard = self.gate.lock().await;
         let event_json = serde_json::to_string(event).map_err(SessionStoreError::Serialization)?;
         // idempotency_key = run_id:seq re-anchors the append-only log:
         // re-applying an already-persisted event is a no-op (ON CONFLICT DO
