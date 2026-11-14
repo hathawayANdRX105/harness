@@ -96,6 +96,7 @@ Jev 校验结果：9 条断言全部 `verified`；其中 6 条 `auto`，3 条 co
 
 - 记录本审计（本文件）。
 - 修复 D1：解决 SVG 中提交进仓库的冲突块（取 HEAD 侧：MCP 桥 + ToolCatalog；另一侧的重复标题与内部箭头是中间版本残留）。
+- 按审计结果重画 `arch/harness-daemon-runtime.svg`：绿/灰/红标注接线状态与缺陷编号，底部增加参考项目汲取面板。
 
 P1-P4 是后续 PR，不在本次改动内。
 
