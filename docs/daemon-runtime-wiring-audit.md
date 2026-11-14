@@ -33,6 +33,7 @@ Jev 校验结果：9 条断言全部 `verified`；其中 6 条 `auto`，3 条 co
 | D8 | 基线事实：scheduler 每会话最多 1 个活跃 run，全局上限默认 4，每会话队列默认 4 | `harness-config/src/config.rs:369-370`；`scheduler.rs:2,102` | verified 0.91 · auto |
 | D9 | 事件泵用普通 `tokio::spawn` + `await append_event` 落盘，不是 `spawn_blocking` | `wire.rs:283`、`wire.rs:519-528` | verified 0.88 · auto |
 | D10 | `harness-tools` 声明了 `harness-mcp` 依赖但代码从未使用；crate 文档却声称依赖它是为了 MCP 桥类型 | `crates/harness-tools/Cargo.toml:11`；`cargo check` 报 `unused dependency harness-mcp`；`src/` 无 `harness_mcp` 引用 | 编译器证据 |
+| D11 | 模型适配器对 `content: ""` 也发 `TextDelta`，空 delta 进入事件日志与 WS 推送（一次短回答 82 条 text_delta，仅 4 条非空） | `crates/harness-model/src/openai.rs:620-622`；真实运行观察 | 运行观察 |
 
 > Jev 运行备注：`compatible` 端点一次最多接受 8 条 claims（9 条返回 400），所以校验分两批完成；usage 块返回 `0/0`，不代表未调用模型。D4/D5/D7 的 `review` 是阈值问题，不是判定反转。
 
@@ -102,9 +103,21 @@ P1-P4 是后续 PR，不在本次改动内。
 
 ## 7. 验证
 
+### 真实上游运行（2026-11-15）
+
+用临时配置（`base_url = http://localhost:3100/v1`、`model = fast-l`）启动本仓库 daemon，走 UDS：
+
+- `tools.list` → 七个内建工具（read/write/edit/glob/grep/terminal/webfetch），无 `skill` / `mcp__*` / 无 subagent profile。
+- run 1（session `mem`）`run-1794674137772-0` → `finished:Completed`，`text_delta: "OK"`。
+- run 2（同一 session）`run-1794674141111-1` → `finished:Completed`，回答 `I don't have any information about a codeword for you.`——尽管 run 1 明确让模型记住 `BANANA`。**D4 的行为证据**：同会话第二次 run 看不到第一次的对话。
+- `search "OK"` → 命中 FTS 索引（run_started 与 text_delta 两条）。
+- run 2 的事件日志里 82 条 `text_delta`、4 条非空 → **D11**。
+
+### 静态与 CI 门
+
 ```sh
 xmllint --noout arch/harness-daemon-runtime.svg   # XML OK（修复前在 132 行报 parser error）
 just verify                                       # fmt-check + clippy + check 通过
 ```
 
-`just verify` 唯一告警是 D10 的 `unused dependency harness-mcp`（既有问题，非本次引入）；`spec-check` 因本机预编译 dylint 库未就绪而 skip，由 PR CI 补跑。
+`just verify` 唯一告警是 D10 的 `unused dependency harness-mcp`（既有问题，非本次引入）；`spec-check` 因本机预编译 dylint 库未就绪而 skip。PR #35 CI 的 lint / spec-check / test 三 job 已全部通过。
