@@ -7,6 +7,10 @@
 //! `/cancel <run_id>` cancels, `/steer <run_id> <msg>` queues an instruction,
 //! `/status <run_id>` queries state, `/list` lists recent runs.
 //! `/search <query>` searches persisted run events.
+//! `/tools` lists a session's active tools, `/tools set a,b,c` restricts a
+//! session to the named tools (comma-separated), and `/tools reset` drops a
+//! session's allowlist override; the same surface exists as the
+//! `tools.list`, `tools.set_active` and `tools.reset` JSON-RPC methods.
 //!
 //! The same [`SlashCommand`] enum is produced by two paths:
 //!
@@ -36,6 +40,18 @@ pub enum SlashCommand {
     List,
     /// Search persisted run events for `query`.
     Search { query: String },
+    /// List the active tools of a session (`None` means the daemon's default
+    /// session): JSON-RPC `tools.list`, text `/tools`.
+    ToolsList { session_id: Option<String> },
+    /// Restrict a session to the named tools: JSON-RPC `tools.set_active`,
+    /// text `/tools set a,b,c` (comma-separated; empty segments are skipped).
+    ToolsSetActive {
+        session_id: Option<String>,
+        names: Vec<String>,
+    },
+    /// Drop a session's allowlist override so it sees every base tool again:
+    /// JSON-RPC `tools.reset`, text `/tools reset`.
+    ToolsReset { session_id: Option<String> },
 }
 
 /// Errors that can occur when parsing a slash command.
@@ -130,6 +146,31 @@ pub fn parse_slash(line: &str) -> Result<SlashCommand, ParseSlashError> {
             })
         }
         "list" => Ok(SlashCommand::List),
+        "tools" => {
+            if args.is_empty() {
+                return Ok(SlashCommand::ToolsList { session_id: None });
+            }
+            let mut words = args.split_whitespace();
+            match words.next() {
+                Some("set") => {
+                    let names: Vec<String> = words
+                        .flat_map(|segment| segment.split(','))
+                        .filter(|segment| !segment.is_empty())
+                        .map(|segment| segment.trim().to_string())
+                        .collect();
+                    if names.is_empty() {
+                        return Err(ParseSlashError::MissingArgs("names"));
+                    }
+                    Ok(SlashCommand::ToolsSetActive {
+                        session_id: None,
+                        names,
+                    })
+                }
+                Some("reset") => Ok(SlashCommand::ToolsReset { session_id: None }),
+                Some(other) => Err(ParseSlashError::Unknown(other.to_string())),
+                None => Err(ParseSlashError::Unknown("".to_string())),
+            }
+        }
         other => Err(ParseSlashError::Unknown(other.to_string())),
     }
 }
@@ -168,6 +209,28 @@ pub struct StatusParams {
 #[derive(Deserialize)]
 pub struct SearchParams {
     pub query: String,
+}
+
+/// Parameter shape for the `tools.list` JSON-RPC method.
+#[derive(Deserialize)]
+pub struct ToolsListParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Parameter shape for the `tools.set_active` JSON-RPC method.
+#[derive(Deserialize)]
+pub struct ToolsSetActiveParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub names: Vec<String>,
+}
+
+/// Parameter shape for the `tools.reset` JSON-RPC method.
+#[derive(Deserialize)]
+pub struct ToolsResetParams {
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Convert a JSON-RPC method name and optional params value into a
@@ -214,6 +277,33 @@ pub fn command_from_jsonrpc(
                 serde_json::from_value(p).map_err(|_| ParseSlashError::MissingArgs("query"))?;
             Ok(SlashCommand::Search { query: sp.query })
         }
+        "tools.list" => {
+            // `params: None` means "no fields", not the JSON value null.
+            let p = params.unwrap_or_else(|| serde_json::json!({}));
+            let tp: ToolsListParams = serde_json::from_value(p)
+                .map_err(|_| ParseSlashError::MissingArgs("session_id"))?;
+            Ok(SlashCommand::ToolsList {
+                session_id: tp.session_id,
+            })
+        }
+        "tools.set_active" => {
+            let p = params.ok_or(ParseSlashError::MissingArgs("names"))?;
+            let sp: ToolsSetActiveParams =
+                serde_json::from_value(p).map_err(|_| ParseSlashError::MissingArgs("names"))?;
+            Ok(SlashCommand::ToolsSetActive {
+                session_id: sp.session_id,
+                names: sp.names,
+            })
+        }
+        "tools.reset" => {
+            // `params: None` means "no fields", not the JSON value null.
+            let p = params.unwrap_or_else(|| serde_json::json!({}));
+            let rp: ToolsResetParams = serde_json::from_value(p)
+                .map_err(|_| ParseSlashError::MissingArgs("session_id"))?;
+            Ok(SlashCommand::ToolsReset {
+                session_id: rp.session_id,
+            })
+        }
         "list" => Ok(SlashCommand::List),
         other => Err(ParseSlashError::Unknown(other.to_string())),
     }
@@ -221,6 +311,8 @@ pub fn command_from_jsonrpc(
 
 /// Build a JSON-RPC method name and params value from a [`SlashCommand`].
 /// Used by transport tests that need to serialise outbound commands.
+///
+/// `session_id` is omitted from the params object when it is `None`.
 pub fn slash_to_jsonrpc(cmd: &SlashCommand) -> (String, Option<serde_json::Value>) {
     match cmd {
         SlashCommand::Run { task, session_id } => {
@@ -245,6 +337,41 @@ pub fn slash_to_jsonrpc(cmd: &SlashCommand) -> (String, Option<serde_json::Value
         ),
         SlashCommand::Search { query } => {
             ("search".into(), Some(serde_json::json!({ "query": query })))
+        }
+        SlashCommand::ToolsList { session_id } => {
+            let mut map = serde_json::Map::new();
+            if let Some(id) = session_id {
+                map.insert("session_id".into(), serde_json::Value::String(id.clone()));
+            }
+            let params = (!map.is_empty()).then_some(serde_json::Value::Object(map));
+            ("tools.list".into(), params)
+        }
+        SlashCommand::ToolsSetActive { session_id, names } => {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                "names".into(),
+                serde_json::Value::Array(
+                    names
+                        .iter()
+                        .map(|name| serde_json::Value::String(name.clone()))
+                        .collect(),
+                ),
+            );
+            if let Some(id) = session_id {
+                map.insert("session_id".into(), serde_json::Value::String(id.clone()));
+            }
+            (
+                "tools.set_active".into(),
+                Some(serde_json::Value::Object(map)),
+            )
+        }
+        SlashCommand::ToolsReset { session_id } => {
+            let mut map = serde_json::Map::new();
+            if let Some(id) = session_id {
+                map.insert("session_id".into(), serde_json::Value::String(id.clone()));
+            }
+            let params = (!map.is_empty()).then_some(serde_json::Value::Object(map));
+            ("tools.reset".into(), params)
         }
         SlashCommand::List => ("list".into(), None),
     }

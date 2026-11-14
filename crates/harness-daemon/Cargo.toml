@@ -35,10 +35,15 @@ axum = { version = "0.8" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# (tokio-util lives in dev-dependencies: only the test stub Tool impls use
+# its CancellationToken.)
 
 [dev-dependencies]
 # The smoke test sends SIGTERM to the daemon child process.
 libc = "0.2"
+# tokio-util: CancellationToken for the test-only stub Tool impls in the
+# daemon's tests and cfg(test) modules.
+tokio-util = { version = "0.7", default-features = false }
 
 [lints]
 workspace = true

@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 /// or non-scalar id deserializes as `None` — responses to such requests
 /// carry `id: null` per the JSON-RPC 2.0 spec.  The transport does not
 /// support notifications.  The method name corresponds to one of the
-/// supported slash commands (`run`, `cancel`, `steer`, `status`, `list`).
+/// supported slash commands (`run`, `cancel`, `steer`, `status`, `list`,
+/// `tools.list`, `tools.set_active`, `tools.reset`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
@@ -69,6 +70,27 @@ impl JsonRpcResponse {
             id,
             result: None,
             error: Some(RpcError::new(code, message)),
+        }
+    }
+
+    /// Build an error response carrying machine-readable `data` (JSON-RPC 2.0
+    /// §5.2.2): for typed errors whose fields a client needs to act on
+    /// programmatically (e.g. the valid tool names for a retry).
+    pub fn error_with_data(
+        id: Option<serde_json::Value>,
+        code: i32,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+                data: Some(data),
+            }),
         }
     }
 }

@@ -4,14 +4,16 @@
 /// run assembled by the builder, routed to `session_id` when the command
 /// names one (otherwise the "default" session); `cancel` / `status` /
 /// `list` read scheduler state, `steer` is rejected until the scheduler
-/// exposes steering. Events flow loop → bus → a per-run pump task that
-/// appends into the session store and forwards into the transport broadcast
-/// channel, so every transport client sees every event.
+/// exposes steering, `tools.list` / `tools.set_active` / `tools.reset`
+/// consult the per-session tool catalog. Events flow loop → bus → a per-run
+/// pump task that appends into the session store and forwards into the
+/// transport broadcast channel, so every transport client sees every event.
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::tools::{ToolCatalog, ToolCatalogError};
 use harness_builder::AssembledRuntime;
 use harness_core::RunEvent;
 use harness_core::event::RunEventKind;
@@ -123,6 +125,7 @@ pub struct DaemonHandler {
     runs: Arc<Mutex<Vec<RunId>>>,
     store: Arc<dyn SessionStore>,
     recall: Arc<dyn RecallStore>,
+    catalog: Arc<ToolCatalog>,
     run_counter: AtomicU64,
 }
 
@@ -134,10 +137,16 @@ impl DaemonHandler {
     /// [`RecallStore`] for hosts that opted into recall, [`NoRecall`]
     /// otherwise. The handler never constructs it — the host (main.rs) knows
     /// which store it opened.
+    ///
+    /// `catalog` is the runtime tool catalog: every run built by
+    /// `start_run` is filtered through `catalog.active(&session_id)`, so a
+    /// session sees only its active tool subset while model, policy, budget
+    /// and everything else stay shared.
     pub fn new(
         scheduler: Scheduler,
         store: Arc<dyn SessionStore>,
         recall: Arc<dyn RecallStore>,
+        catalog: Arc<ToolCatalog>,
     ) -> Self {
         Self {
             scheduler,
@@ -146,6 +155,7 @@ impl DaemonHandler {
             runs: Arc::new(Mutex::new(Vec::new())),
             store,
             recall,
+            catalog,
             run_counter: AtomicU64::new(0),
         }
     }
@@ -216,6 +226,9 @@ impl DaemonHandler {
                 )));
             }
         }
+        // The session's active tool subset is borrowed from the catalog
+        // before `session_id` is moved into the run context below.
+        let active_tools = self.catalog.active(&session_id);
         let ctx = RunContext {
             run_id: run_id.clone(),
             session_id,
@@ -227,7 +240,11 @@ impl DaemonHandler {
             limits: runtime.limits,
             started_at_ms: unix_millis(),
         };
-        let deps = runtime.loop_deps();
+        let mut deps = runtime.loop_deps();
+        // A session's run sees only its active tool subset: the catalog's
+        // per-session allowlist overrides the shared base set; model, policy,
+        // budget and everything else stay shared across sessions.
+        deps.tools = active_tools;
         self.scheduler
             .submit(RunRequest { ctx, deps })
             .map_err(|err| TransportError::Internal(format!("submit failed: {err}")))?;
@@ -376,6 +393,48 @@ impl DaemonHandler {
             .collect();
         Ok(serde_json::json!({ "query": query, "hits": hits }))
     }
+
+    /// List the active tools of a session: every base tool with whether the
+    /// session's allowlist admits it.  Sessions without an override see all
+    /// base tools.
+    fn tools_list(&self, session_id: Option<String>) -> serde_json::Value {
+        let session_id = SessionId(session_id.unwrap_or_else(|| "default".to_string()));
+        let tools = self.catalog.list(&session_id);
+        serde_json::json!({ "tools": tools })
+    }
+
+    /// Restrict a session to the named tools: validate the names against the
+    /// base catalog (an unknown name is a typed transport error), then
+    /// report the tools that are active afterwards.
+    fn tools_set_active(
+        &self,
+        session_id: Option<String>,
+        names: Vec<String>,
+    ) -> Result<serde_json::Value, TransportError> {
+        let session_id = SessionId(session_id.unwrap_or_else(|| "default".to_string()));
+        match self.catalog.set_active(&session_id, names) {
+            Ok(()) => {
+                let active: Vec<String> = self
+                    .catalog
+                    .active(&session_id)
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect();
+                Ok(serde_json::json!({ "active": active }))
+            }
+            Err(ToolCatalogError { unknown, available }) => {
+                Err(TransportError::UnknownTool { unknown, available })
+            }
+        }
+    }
+
+    /// Drop a session's allowlist override so it goes back to all base
+    /// tools.
+    fn tools_reset(&self, session_id: Option<String>) -> serde_json::Value {
+        let session_id = SessionId(session_id.unwrap_or_else(|| "default".to_string()));
+        self.catalog.reset(&session_id);
+        serde_json::json!({ "reset": true })
+    }
 }
 
 impl CommandHandler for DaemonHandler {
@@ -386,6 +445,11 @@ impl CommandHandler for DaemonHandler {
             SlashCommand::Status { run_id } => self.status(&run_id),
             SlashCommand::List => Ok(self.list()),
             SlashCommand::Search { query } => self.search(&query),
+            SlashCommand::ToolsList { session_id } => Ok(self.tools_list(session_id)),
+            SlashCommand::ToolsSetActive { session_id, names } => {
+                self.tools_set_active(session_id, names)
+            }
+            SlashCommand::ToolsReset { session_id } => Ok(self.tools_reset(session_id)),
             SlashCommand::Steer { run_id, .. } => Err(TransportError::Internal(format!(
                 "steering run {run_id} is not wired yet: the scheduler does not expose steering in v1"
             ))),

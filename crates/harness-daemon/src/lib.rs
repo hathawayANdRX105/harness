@@ -6,4 +6,5 @@
 
 pub mod lifecycle;
 pub mod pidlock;
+pub mod tools;
 pub mod wire;
