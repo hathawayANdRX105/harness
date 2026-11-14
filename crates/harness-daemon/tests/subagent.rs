@@ -242,10 +242,7 @@ async fn completed_child_reports_completed_with_captured_text() {
     .await;
 
     let result = result.unwrap_or_else(|e| panic!("subagent invoke failed: {e}"));
-    assert_eq!(
-        result.is_error, false,
-        "a completed child is not a tool error"
-    );
+    assert!(!result.is_error, "a completed child is not a tool error");
 
     let payload: Value =
         serde_json::from_str(&result.content).unwrap_or_else(|e| panic!("payload is JSON: {e}"));
@@ -256,7 +253,7 @@ async fn completed_child_reports_completed_with_captured_text() {
     assert_eq!(payload["text"], "ok");
 
     let events = sink.snapshot();
-    assert!(events.first().is_some(), "at least SubagentStarted emitted");
+    assert!(!events.is_empty(), "at least SubagentStarted emitted");
     let started = &events[0];
     assert_eq!(started.seq, 0);
     assert_eq!(
@@ -328,7 +325,7 @@ async fn max_turns_child_reports_blocked() {
     )
     .await;
     let result = result.unwrap_or_else(|e| panic!("subagent invoke failed: {e}"));
-    assert_eq!(result.is_error, false);
+    assert!(!result.is_error);
 
     let payload: Value =
         serde_json::from_str(&result.content).unwrap_or_else(|e| panic!("payload is JSON: {e}"));
@@ -373,7 +370,7 @@ async fn error_child_reports_error() {
     tool.set_catalog(base_catalog());
     let result = invoke(&tool, "parent-1", "s-1", parent_limits(), "fail", "scout").await;
     let result = result.unwrap_or_else(|e| panic!("subagent invoke failed: {e}"));
-    assert_eq!(result.is_error, false);
+    assert!(!result.is_error);
 
     let payload: Value =
         serde_json::from_str(&result.content).unwrap_or_else(|e| panic!("payload is JSON: {e}"));

@@ -119,8 +119,8 @@ fn build_runtime(
     // allowlists gate it like any other tool.
     spec.tools.extend(
         subagent_tool
-            .is_some()
-            .then_some(ToolSpec::external("subagent")),
+            .as_ref()
+            .map(|_| ToolSpec::external("subagent")),
     );
     let cwd =
         std::env::current_dir().context("resolving the current directory for tool execution")?;
@@ -198,7 +198,7 @@ fn uds_auth_token(config: &Config) -> Option<String> {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let lock_path = PathBuf::from(format!("{}.lock", cli.socket.display()));
     let lock = PidLock::acquire(&lock_path)?;
-    let config = match &cli.config {
+    let mut config = match &cli.config {
         Some(path) => harness_config::load_from_path(path)
             .with_context(|| format!("config {}", path.display()))?,
         None => harness_config::load_or_defaults().context("config")?,
@@ -241,32 +241,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // It is injected before assembly and wired to the catalog right after
     // (the catalog snapshot needs runtime.tools, which needs the tool — the
     // shared sink created above breaks the construction circle).
-    let subagent_tool = if config.agents.subagents.is_empty() {
-        None
-    } else {
-        // Collect into a map by name, failing loudly on duplicates: a
-        // silently overwritten profile is a config mistake the operator
-        // must hear about at startup, not at a random child spawn.
-        let mut profiles: HashMap<String, SubagentProfile> = HashMap::new();
-        let mut duplicated: Vec<String> = Vec::new();
-        for profile in config.agents.subagents.iter().cloned() {
-            let name = profile.name.clone();
-            if profiles.insert(name.clone(), profile).is_some() {
-                duplicated.push(name);
-            }
-        }
-        if !duplicated.is_empty() {
+    let subagent_profiles = std::mem::take(&mut config.agents.subagents);
+    let mut profiles: HashMap<String, SubagentProfile> = HashMap::new();
+    for profile in subagent_profiles {
+        let name = profile.name.clone();
+        if profiles.insert(name.clone(), profile).is_some() {
+            // A silently overwritten profile is a config mistake the
+            // operator must hear about at startup.
             return Err(anyhow::anyhow!(
-                "duplicate subagent profile names in [agents]: {duplicated:?}"
+                "duplicate subagent profile name in [agents]: {name}"
             ));
         }
-        Some(Arc::new(SubagentTool::new(
+    }
+    let subagent_tool = (!profiles.is_empty()).then(|| {
+        Arc::new(SubagentTool::new(
             Arc::clone(&model),
             profiles,
             Arc::clone(&event_sink),
             Arc::new(harness_daemon::wire::DaemonPolicy),
-        )))
-    };
+        ))
+    });
     let injected: Option<Arc<dyn Tool>> = subagent_tool
         .as_ref()
         .map(|tool| Arc::clone(tool) as Arc<dyn Tool>);

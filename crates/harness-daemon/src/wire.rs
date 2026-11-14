@@ -259,7 +259,7 @@ impl DaemonHandler {
             // intersected with them so delegation never amplifies the
             // parent's tool authority.
             let allowed: Vec<String> = deps.tools.iter().map(|t| t.name().to_string()).collect();
-            let scoped = tool.for_run(&run_id, &session_id, ctx.limits.clone(), allowed);
+            let scoped = tool.for_run(&run_id, &session_id, ctx.limits, allowed);
             deps.tools = deps
                 .tools
                 .into_iter()

@@ -292,7 +292,7 @@ impl Tool for SubagentTool {
             },
             limits: RunLimits {
                 max_turns: profile.max_turns,
-                ..parent.limits.clone()
+                ..parent.limits
             },
             started_at_ms: unix_millis(),
         };
