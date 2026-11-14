@@ -6,8 +6,7 @@
 //!
 //! ## Connection model
 //!
-//! Two paths are kept separate so a transaction never becomes a critical
-//! section:
+//! Two paths share one write gate:
 //!
 //! - **Direct statements** (`execute` / `query`) share one `Connection` held
 //!   in an `Arc`, serialized by a `tokio::Mutex` gate. turso's `Connection`
@@ -15,12 +14,14 @@
 //!   (`concurrent use forbidden` / `connection is busy`), so every direct
 //!   statement takes the gate.
 //! - **Transactions** (`append_message`) open a **separate connection** from
-//!   the `Database` handle: turso transactions are connection-level state, and
-//!   a separate connection keeps the transaction from holding the gate for its
-//!   whole lifetime.
+//!   the `Database` handle, because `transaction()` needs `&mut Connection`.
+//!   The transaction holds the same gate for its lifetime: a concurrent event
+//!   append on the shared connection would otherwise commit between `BEGIN`
+//!   and `COMMIT` and invalidate the transaction's snapshot.
 //!
-//! Concurrency is left to the engine: `BEGIN IMMEDIATE` plus `busy_timeout`
-//! queue at the file level.
+//! Within the process the gate serializes every writer (message sink, event
+//! pump, session setup). Across processes the engine queues on the file lock:
+//! `BEGIN IMMEDIATE` plus a 5 s `busy_timeout` on both connections.
 //!
 //! ## Schema
 //!
@@ -187,16 +188,42 @@ impl TursoSessionStore {
         {
             // consume the pragma result row
         }
+        Self::set_busy_timeout(&self.conn).await?;
         Ok(())
     }
 
     /// Open a separate connection for a transaction: turso transactions are
-    /// connection-level state, and a separate connection keeps the
-    /// transaction from holding the shared gate for its whole lifetime.
-    fn tx_conn(&self) -> Result<Connection, SessionStoreError> {
-        self.database
+    /// connection-level state, and `transaction()` needs `&mut Connection`.
+    /// The caller holds the write gate for the transaction's lifetime, so the
+    /// separate connection never races the shared one.
+    ///
+    /// The connection carries the same busy timeout as the shared one: the
+    /// message writer and the event pump are separate connections, so the
+    /// loser of the file-level write race must wait instead of failing.
+    async fn tx_conn(&self) -> Result<Connection, SessionStoreError> {
+        let conn = self
+            .database
             .connect()
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        Self::set_busy_timeout(&conn).await?;
+        Ok(conn)
+    }
+
+    /// Let a contending writer queue for the file lock instead of failing
+    /// with `database is locked`.
+    async fn set_busy_timeout(conn: &Connection) -> Result<(), SessionStoreError> {
+        let mut rows = conn
+            .query("PRAGMA busy_timeout = 5000", ())
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        while let Some(_row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        {
+            // consume the pragma result row
+        }
+        Ok(())
     }
 
     /// Current unix epoch millisecond timestamp.
@@ -264,7 +291,12 @@ impl SessionStore for TursoSessionStore {
         // The seq read and the insert must be atomic so concurrent appends
         // cannot observe a gap or hand out the same seq twice: do both inside
         // one transaction on a separate connection.
-        let mut conn = self.tx_conn()?;
+        //
+        // The gate serializes this transaction against the shared connection:
+        // a concurrent event append would otherwise commit between BEGIN and
+        // COMMIT and the transaction's snapshot would go stale.
+        let _guard = self.gate.lock().await;
+        let mut conn = self.tx_conn().await?;
         let tx = conn
             .transaction()
             .await

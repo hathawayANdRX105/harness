@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
-use harness_core::message::{Message, ToolResultMessage};
+use harness_core::message::{Content, Message, ToolResultMessage};
 
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream};
 use harness_core::policy::{
@@ -39,7 +39,7 @@ use harness_core::policy::{
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
 use harness_core::{RunControl, StopReason};
-use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, run};
+use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, TranscriptSink, run};
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -49,6 +49,8 @@ use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, run};
 struct MockModel {
     info: ModelInfo,
     turns: std::sync::Mutex<std::collections::VecDeque<Vec<ModelEvent>>>,
+    /// Every model request's message list, in call order.
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
 }
 
 impl MockModel {
@@ -56,7 +58,15 @@ impl MockModel {
         Self {
             info,
             turns: std::sync::Mutex::new(turns.into()),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| panic!("mock model lock poisoned: {e}"))
+            .clone()
     }
 }
 
@@ -66,7 +76,11 @@ impl Model for MockModel {
         &self.info
     }
 
-    async fn stream(&self, _req: &ModelRequest) -> ModelStream<'_> {
+    async fn stream(&self, req: &ModelRequest) -> ModelStream<'_> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| panic!("mock model lock poisoned: {e}"))
+            .push(req.messages.clone());
         let events = self
             .turns
             .lock()
@@ -157,6 +171,31 @@ impl EventSink for TestSink {
             .lock()
             .unwrap_or_else(|e| panic!("test sink lock poisoned: {e}"))
             .push(event);
+    }
+}
+
+/// Transcript sink that records every message the loop hands over.
+#[derive(Default)]
+struct RecordingTranscriptSink {
+    messages: std::sync::Mutex<Vec<Message>>,
+}
+
+#[async_trait::async_trait]
+impl TranscriptSink for RecordingTranscriptSink {
+    async fn append(&self, _session_id: &SessionId, message: &Message) {
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| panic!("transcript sink lock poisoned: {e}"))
+            .push(message.clone());
+    }
+}
+
+impl RecordingTranscriptSink {
+    fn messages(&self) -> Vec<Message> {
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| panic!("transcript sink lock poisoned: {e}"))
+            .clone()
     }
 }
 
@@ -264,6 +303,8 @@ async fn two_turns_normal() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -319,6 +360,8 @@ async fn model_ends_early() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -358,6 +401,8 @@ async fn cancellation_mid_loop() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     // Cancel before running.
@@ -439,6 +484,8 @@ async fn tool_failure_backfill() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -522,6 +569,8 @@ async fn max_turns_exceeded() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     // max_turns = 1 means exactly one model call.
@@ -570,6 +619,8 @@ async fn steering_injection() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -633,6 +684,8 @@ async fn hook_terminate_batch() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -752,6 +805,8 @@ async fn approval_denied_backfill() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -831,6 +886,8 @@ async fn approval_precancelled() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -895,6 +952,8 @@ async fn approval_required_no_broker_fails_closed() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -948,6 +1007,8 @@ async fn ignores_events_after_terminal_stop() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -1009,6 +1070,8 @@ async fn model_stream_error_is_terminal() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -1076,6 +1139,8 @@ async fn event_sequence_is_monotonic() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -1132,6 +1197,8 @@ async fn cancel_mid_stream_ends_promptly() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -1345,6 +1412,8 @@ async fn parallel_dispatch_executes_both_tools() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Parallel,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -1507,6 +1576,8 @@ async fn hook_seams_before_after_finish_and_prepare() {
         budget: None,
         compactor: None,
         tool_mode: ToolExecutionMode::Parallel,
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -1622,4 +1693,144 @@ async fn hook_seams_before_after_finish_and_prepare() {
 fn append_prepare_marker(mut transcript: Vec<Message>) -> Vec<Message> {
     transcript.push(Message::user_text("prepared by hook"));
     transcript
+}
+
+/// Purpose: a seeded transcript reaches the model and the run's own messages
+/// are mirrored to the transcript sink.
+/// Scenario: seed holds one earlier user message; the model answers in one
+/// turn without tools.
+/// Acceptance: the model request is `[seed, task]` (the task is appended even
+/// though the transcript is not empty), and the sink records `[task,
+/// assistant]` without re-persisting the seed.
+#[tokio::test]
+async fn seed_reaches_model_and_new_messages_reach_sink() {
+    let model = Arc::new(MockModel::new(
+        make_model_info(),
+        vec![vec![
+            ModelEvent::TextDelta("answer".into()),
+            ModelEvent::Stop(StopReason::EndTurn),
+        ]],
+    ));
+    let transcript_sink = Arc::new(RecordingTranscriptSink::default());
+    let deps = Arc::new(LoopDeps {
+        model: Arc::clone(&model) as Arc<dyn Model>,
+        tools: Vec::new(),
+        event_sink: Arc::new(TestSink::default()),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        tool_mode: ToolExecutionMode::Sequential,
+        budget: None,
+        compactor: None,
+        seed: vec![Message::user_text("earlier question")],
+        transcript_sink: Some(transcript_sink.clone() as Arc<dyn TranscriptSink>),
+    });
+
+    let reason = run(make_ctx(4), deps, RunControl::new()).await;
+    assert_eq!(reason, RunStopReason::Completed, "run should complete");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1, "one model call");
+    assert_eq!(requests[0].len(), 2, "seed plus the new task");
+    assert!(
+        matches!(&requests[0][0], Message::User { content }
+            if content == &vec![Content::Text("earlier question".into())]),
+        "the seeded message must lead the request"
+    );
+    assert!(
+        matches!(&requests[0][1], Message::User { content }
+            if content == &vec![Content::Text("test task".into())]),
+        "the run task must follow the seed"
+    );
+
+    let recorded = transcript_sink.messages();
+    assert_eq!(recorded.len(), 2, "task and assistant only");
+    assert!(
+        matches!(&recorded[0], Message::User { content }
+            if content == &vec![Content::Text("test task".into())]),
+        "the task is mirrored first"
+    );
+    assert!(
+        matches!(&recorded[1], Message::Assistant { content }
+            if content == &vec![Content::Text("answer".into())]),
+        "the assistant reply is mirrored second"
+    );
+}
+
+/// Purpose: tool results are mirrored to the transcript sink, not only the
+/// user and assistant messages.
+/// Scenario: turn 0 requests one tool, the tool succeeds, turn 1 answers.
+/// Acceptance: the sink records task, assistant, tool result, assistant in
+/// that order, and the tool result carries the tool's output.
+#[tokio::test]
+async fn tool_results_are_mirrored_to_sink() {
+    let model = Arc::new(MockModel::new(
+        make_model_info(),
+        vec![
+            vec![
+                ModelEvent::ToolCallStart {
+                    id: "call_1".into(),
+                    name: "test_tool".into(),
+                },
+                ModelEvent::ToolCallArgs {
+                    id: "call_1".into(),
+                    partial_json: "{}".into(),
+                },
+                ModelEvent::ToolCallEnd {
+                    id: "call_1".into(),
+                },
+                ModelEvent::Stop(StopReason::ToolUse),
+            ],
+            vec![
+                ModelEvent::TextDelta("The answer is 42.".into()),
+                ModelEvent::Stop(StopReason::EndTurn),
+            ],
+        ],
+    ));
+    let tool = Arc::new(MockTool::new(
+        "test_tool",
+        ToolResult {
+            content: "42".into(),
+            is_error: false,
+            trace: None,
+        },
+    ));
+    let transcript_sink = Arc::new(RecordingTranscriptSink::default());
+    let deps = Arc::new(LoopDeps {
+        model: Arc::clone(&model) as Arc<dyn Model>,
+        tools: vec![tool],
+        event_sink: Arc::new(TestSink::default()),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        budget: None,
+        compactor: None,
+        tool_mode: ToolExecutionMode::Sequential,
+        seed: Vec::new(),
+        transcript_sink: Some(transcript_sink.clone() as Arc<dyn TranscriptSink>),
+    });
+
+    let reason = run(make_ctx(10), deps, RunControl::new()).await;
+    assert_eq!(reason, RunStopReason::Completed, "run should complete");
+
+    let recorded = transcript_sink.messages();
+    let tags: Vec<&str> = recorded
+        .iter()
+        .map(|message| match message {
+            Message::User { .. } => "user",
+            Message::Assistant { .. } => "assistant",
+            Message::ToolResult(_) => "tool_result",
+            Message::System { .. } => "system",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        tags,
+        vec!["user", "assistant", "tool_result", "assistant"],
+        "every transcript message must reach the sink in order"
+    );
+    let Message::ToolResult(result) = &recorded[2] else {
+        panic!("third message should be the tool result");
+    };
+    assert_eq!(result.content, "42", "the tool output must be preserved");
 }
