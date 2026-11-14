@@ -54,7 +54,7 @@ Jev 校验结果：9 条断言全部 `verified`；其中 6 条 `auto`，3 条 co
 | scheduler「每会话 1 活跃 run · 全局 ≤ 4」 | 准确，且两个值都可配置 | D8 |
 | `subagent` 只画成 scheduler→loop 虚线 | 实际是 daemon 层工具，且可被 per-session allowlist 关闭 | `daemon/src/subagent.rs:1-24` |
 
-另外：`arch/harness-daemon-model.svg`（旧图）仍写着「Global Session Manager · 多会话并发」，已被 #32 之后的 per-session scheduler 取代；图例已声明保留对照。
+另外：旧图 `arch/harness-daemon-model.svg` 仍写着「Global Session Manager · 多会话并发」（#32 之前的世界观），已随本 PR 删除，只保留重画后的运行时现状图。
 
 ## 4. 参考项目对照
 
