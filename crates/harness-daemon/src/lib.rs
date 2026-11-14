@@ -5,6 +5,7 @@
 //! instead of reaching into `src/`.
 
 pub mod lifecycle;
+pub mod messages;
 pub mod pidlock;
 pub mod subagent;
 pub mod tools;

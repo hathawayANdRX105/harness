@@ -33,6 +33,7 @@ use harness_context::{Budget, BudgetBlocked, Compactor};
 
 use crate::dispatch::{DispatchCtx, dispatch_batch, emit_event};
 use crate::hooks::{LoopHooks, ToolExecutionMode};
+use crate::transcript::{self, TranscriptSink};
 
 /// Dependencies the loop needs to run one turn-loop.
 ///
@@ -64,6 +65,13 @@ pub struct LoopDeps {
     /// The builder sets it from the compaction plan; its presence, together
     /// with `budget`, enables the turn-boundary budget gate.
     pub compactor: Option<Arc<dyn Compactor>>,
+    /// Transcript to start from: the host's replay of the session ledger.
+    /// Empty for a fresh session. Seeded messages are already persisted, so
+    /// they are never mirrored to `transcript_sink`.
+    pub seed: Vec<Message>,
+    /// Optional sink for every message this run appends (task, steering,
+    /// assistant, tool results). `None` keeps the run in memory only.
+    pub transcript_sink: Option<Arc<dyn TranscriptSink>>,
 }
 
 impl std::fmt::Debug for LoopDeps {
@@ -78,6 +86,11 @@ impl std::fmt::Debug for LoopDeps {
             )
             .field("budget", &self.budget)
             .field("compactor", &self.compactor.as_ref().map(|_| "set"))
+            .field("seed_len", &self.seed.len())
+            .field(
+                "transcript_sink",
+                &self.transcript_sink.as_ref().map(|_| "set"),
+            )
             .field("hooks", &self.hooks)
             .field("tool_mode", &self.tool_mode)
             .finish()
@@ -90,7 +103,7 @@ impl std::fmt::Debug for LoopDeps {
 /// Returns `Ok` when the turn may proceed, or `Err` with the stop reason
 /// when the run ends at this boundary. The caller emits `RunFinished`
 /// exactly once for the returned reason and returns.
-fn turn_boundary(
+async fn turn_boundary(
     control: &RunControl,
     deps: &LoopDeps,
     transcript: &mut Vec<Message>,
@@ -122,13 +135,27 @@ fn turn_boundary(
                 message: msg.clone(),
             },
         );
-        transcript.push(Message::user_text(msg));
+        transcript::push(
+            transcript,
+            deps.transcript_sink.as_deref(),
+            &ctx.session_id,
+            Message::user_text(msg),
+        )
+        .await;
     }
 
     // Seed the first turn with the task description: every provider rejects
-    // an empty `messages` array on the first upstream request.
-    if turn == 0 && transcript.is_empty() && !ctx.task.description.is_empty() {
-        transcript.push(Message::user_text(ctx.task.description.clone()));
+    // an empty `messages` array on the first upstream request. A seeded
+    // transcript already holds the previous runs of this session, so the
+    // task is appended regardless of whether the transcript is empty.
+    if turn == 0 && !ctx.task.description.is_empty() {
+        transcript::push(
+            transcript,
+            deps.transcript_sink.as_deref(),
+            &ctx.session_id,
+            Message::user_text(ctx.task.description.clone()),
+        )
+        .await;
     }
 
     // Max-turns: refuse to start another turn once the turn budget is spent.
@@ -238,12 +265,12 @@ async fn dispatch_turn(
     let (result_msgs, terminal_reason) = dispatch_batch(calls, &dctx, deps.tool_mode).await;
 
     if let Some(reason) = terminal_reason {
-        transcript.extend(result_msgs.into_iter().map(Message::ToolResult));
+        push_tool_results(transcript, deps, ctx, result_msgs).await;
         return Err(reason);
     }
 
     let n_results = result_msgs.len();
-    transcript.extend(result_msgs.into_iter().map(Message::ToolResult));
+    push_tool_results(transcript, deps, ctx, result_msgs).await;
 
     // Hook: finish_turn observes the completed turn.
     if let Some(hook) = &deps.hooks.finish_turn {
@@ -259,6 +286,25 @@ async fn dispatch_turn(
     }
 
     Ok(n_results)
+}
+
+/// Append a dispatched tool batch to the transcript, mirroring each result to
+/// the host sink in dispatch order.
+async fn push_tool_results(
+    transcript: &mut Vec<Message>,
+    deps: &LoopDeps,
+    ctx: &RunContext,
+    results: Vec<ToolResultMessage>,
+) {
+    for result in results {
+        transcript::push(
+            transcript,
+            deps.transcript_sink.as_deref(),
+            &ctx.session_id,
+            Message::ToolResult(result),
+        )
+        .await;
+    }
 }
 
 /// The core turn loop.
@@ -299,7 +345,7 @@ async fn dispatch_turn(
 ///
 /// Every exit path emits `RunFinished` before returning.
 pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> RunStopReason {
-    let mut transcript: Vec<Message> = Vec::new();
+    let mut transcript: Vec<Message> = deps.seed.clone();
     let seq = AtomicU64::new(0);
 
     emit_run_started(&ctx, deps.event_sink.as_ref(), &seq);
@@ -308,7 +354,8 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
 
     loop {
         // Turn boundary: cancellation, steering drain, task seed, max-turns.
-        if let Err(reason) = turn_boundary(&control, &deps, &mut transcript, &ctx, &seq, turn) {
+        let boundary = turn_boundary(&control, &deps, &mut transcript, &ctx, &seq, turn).await;
+        if let Err(reason) = boundary {
             return finish(&ctx, reason, deps.event_sink.as_ref(), &seq);
         }
 
@@ -341,9 +388,15 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
             Err(reason) => return finish(&ctx, reason, deps.event_sink.as_ref(), &seq),
         };
 
-        transcript.push(Message::Assistant {
-            content: assistant_content,
-        });
+        transcript::push(
+            &mut transcript,
+            deps.transcript_sink.as_deref(),
+            &ctx.session_id,
+            Message::Assistant {
+                content: assistant_content,
+            },
+        )
+        .await;
 
         // No tool calls: the model answered the user, the run is done.
         if tool_calls.is_empty() {
@@ -483,13 +536,19 @@ async fn handle_stream_outcome(
             partial_content,
             partial_calls,
         } => {
-            transcript.push(Message::Assistant {
-                content: partial_content.clone(),
-            });
+            transcript::push(
+                transcript,
+                deps.transcript_sink.as_deref(),
+                &ctx.session_id,
+                Message::Assistant {
+                    content: partial_content.clone(),
+                },
+            )
+            .await;
             if !partial_calls.is_empty() {
-                transcript.extend(
-                    dispatch_and_collect(partial_calls, turn, ctx, deps, control, seq).await,
-                );
+                let results =
+                    dispatch_and_collect(partial_calls, turn, ctx, deps, control, seq).await;
+                push_tool_results(transcript, deps, ctx, results).await;
             }
             Err(RunStopReason::Error {
                 message: message.clone(),
@@ -682,7 +741,7 @@ async fn pump_stream(
     }
 }
 
-/// Dispatch tool calls and collect results as transcript messages.
+/// Dispatch tool calls and collect their results, in call order.
 async fn dispatch_and_collect(
     calls: &[ToolCall],
     turn: u32,
@@ -690,7 +749,7 @@ async fn dispatch_and_collect(
     deps: &LoopDeps,
     control: &RunControl,
     seq: &AtomicU64,
-) -> Vec<Message> {
+) -> Vec<ToolResultMessage> {
     let dctx = DispatchCtx {
         turn,
         ctx,
@@ -703,7 +762,7 @@ async fn dispatch_and_collect(
         control,
     };
     let (results, _terminal) = dispatch_batch(calls, &dctx, deps.tool_mode).await;
-    results.into_iter().map(Message::ToolResult).collect()
+    results
 }
 
 /// Emit `RunFinished` and return the reason.

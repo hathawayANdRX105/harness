@@ -330,6 +330,8 @@ async fn budget_exhausted_from_start_refuses_before_provider() -> Result<(), Str
             available_tokens: 0,
         }),
         compactor: Some(Arc::clone(&compactor) as Arc<dyn Compactor>),
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();
@@ -424,6 +426,8 @@ async fn compaction_frees_room_then_turn_proceeds() -> Result<(), String> {
             available_tokens: 256,
         }),
         compactor: Some(Arc::clone(&compactor) as Arc<dyn Compactor>),
+        seed: Vec::new(),
+        transcript_sink: None,
     });
 
     let control = RunControl::new();

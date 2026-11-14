@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::messages::SessionMessageSink;
 use crate::subagent::SubagentTool;
 use crate::tools::{ToolCatalog, ToolCatalogError};
 use harness_builder::AssembledRuntime;
@@ -21,6 +22,7 @@ use harness_core::event::RunEventKind;
 use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, SessionId, Task};
 use harness_core::tool::ToolRequest;
+use harness_loop::TranscriptSink;
 use harness_scheduler::bus::ReceiveError;
 use harness_scheduler::{EventBus, RunRequest, RunStatus, Scheduler, Subscription};
 use harness_session::{RecallHit, RecallScope, RecallStore, SessionStore, SessionStoreError};
@@ -230,6 +232,14 @@ impl DaemonHandler {
                 )));
             }
         }
+        // Seed the run from the session ledger: a second run in the same
+        // session continues the conversation instead of starting blank. The
+        // read is part of the command, so a storage failure fails the request
+        // rather than silently dropping history.
+        let seed = tokio::task::block_in_place(|| {
+            futures::executor::block_on(self.store.replay_ledger(&session_id))
+        })
+        .map_err(|e| TransportError::Internal(format!("load session history failed: {e}")))?;
         // The session's active tool subset is borrowed from the catalog
         // before `session_id` is moved into the run context below.
         let active_tools = self.catalog.active(&session_id);
@@ -245,6 +255,13 @@ impl DaemonHandler {
             started_at_ms: unix_millis(),
         };
         let mut deps = runtime.loop_deps();
+        // Every message this run appends is persisted through the session
+        // ledger. The loop awaits each append, so the next run replays a
+        // complete transcript without a background writer.
+        let transcript_sink: Arc<dyn TranscriptSink> =
+            Arc::new(SessionMessageSink::new(Arc::clone(&self.store)));
+        deps.seed = seed;
+        deps.transcript_sink = Some(transcript_sink);
         // A session's run sees only its active tool subset: the catalog's
         // per-session allowlist overrides the shared base set; model, policy,
         // budget and everything else stay shared across sessions.
