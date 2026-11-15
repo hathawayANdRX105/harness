@@ -52,9 +52,10 @@ use crate::{TransportState, dispatch_command};
 
 /// Build an [`axum::Router`] with the WebSocket transport route at `/ws`.
 pub fn ws_routes(state: Arc<TransportState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(state)
+        .with_state(state);
+    crate::cors::with_cors(router)
 }
 
 /// WebSocket upgrade handler.

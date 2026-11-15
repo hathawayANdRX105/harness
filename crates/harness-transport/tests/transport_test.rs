@@ -26,10 +26,6 @@
 //! full round-trip (parse → dispatch → response) produces the expected
 //! JSON-RPC frame.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use harness_core::{RunEvent, RunEventKind, RunId, SessionId};
@@ -37,8 +33,13 @@ use harness_transport::{
     CommandHandler, EventLog, TransportError, TransportState, frame::error_code,
     slash::SlashCommand,
 };
+use http::{Method, StatusCode, header};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Every test's error type: any boxed error the transport stack can produce.
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -777,5 +778,282 @@ async fn uds_command_roundtrip() -> TestResult {
 
     // Clean up the socket file.
     let _ = tokio::fs::remove_file(&socket_path).await;
+    Ok(())
+}
+// ── CORS (browser origins) ───────────────────────────────────
+
+/// Purpose: `POST /command` from an allowed dev origin reflects the request
+/// origin exactly in `Access-Control-Allow-Origin`.
+///
+/// Scenario: start an HTTP transport on port 0, send `status` with
+/// `Origin: http://127.0.0.1:{port}`.
+///
+/// Acceptance: the response is a JSON-RPC success and
+/// `Access-Control-Allow-Origin` equals the request origin.
+#[tokio::test]
+async fn cors_command_echoes_allowed_origin() -> TestResult {
+    let state = test_state();
+    let app = harness_transport::http::http_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/command");
+    let origin = format!("http://127.0.0.1:{}", addr.port());
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "status",
+        "params": {"run_id": "test-run"},
+        "id": 1,
+    });
+    let resp = poll_until(
+        || {
+            let client = client.clone();
+            let url = url.clone();
+            let req = req.clone();
+            let origin = origin.clone();
+            async move {
+                client
+                    .post(&url)
+                    .header(header::ORIGIN, &origin)
+                    .json(&req)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("HTTP server did not accept connections: {e}"))?;
+    assert!(resp.status().is_success(), "HTTP 200 expected");
+
+    let acao = resp
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .ok_or("missing Access-Control-Allow-Origin")?;
+    assert_eq!(acao.to_str().map_err(|e| e.to_string())?, origin);
+    Ok(())
+}
+
+/// Purpose: a disguised origin such as `http://localhost.evil.com` is
+/// rejected and gets no `Access-Control-Allow-Origin`.
+///
+/// Scenario: start an HTTP transport on port 0, POST /command with
+/// `Origin: http://localhost.evil.com:{port}` (host is
+/// `localhost.evil.com`, not `localhost`).
+///
+/// Acceptance: no `Access-Control-Allow-Origin` header is present.
+#[tokio::test]
+async fn cors_rejects_disguised_origin() -> TestResult {
+    let state = test_state();
+    let app = harness_transport::http::http_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/command");
+    let origin = format!("http://localhost.evil.com:{}", addr.port());
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "status",
+        "params": {"run_id": "test-run"},
+        "id": 1,
+    });
+    let resp = poll_until(
+        || {
+            let client = client.clone();
+            let url = url.clone();
+            let req = req.clone();
+            let origin = origin.clone();
+            async move {
+                client
+                    .post(&url)
+                    .header(header::ORIGIN, &origin)
+                    .json(&req)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("HTTP server did not accept connections: {e}"))?;
+    assert!(resp.status().is_success());
+
+    assert!(
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "disguised origin must not be reflected"
+    );
+    Ok(())
+}
+
+/// Purpose: a request without an `Origin` header keeps its original
+/// behaviour and gets no CORS header injected.
+///
+/// Scenario: start an HTTP transport on port 0, POST /command with no
+/// `Origin` header.
+///
+/// Acceptance: no `Access-Control-Allow-Origin` header is present.
+#[tokio::test]
+async fn cors_no_origin_no_header() -> TestResult {
+    let state = test_state();
+    let app = harness_transport::http::http_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/command");
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "status",
+        "params": {"run_id": "test-run"},
+        "id": 1,
+    });
+    let resp = poll_until(
+        || {
+            let client = client.clone();
+            let url = url.clone();
+            let req = req.clone();
+            async move {
+                client
+                    .post(&url)
+                    .json(&req)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("HTTP server did not accept connections: {e}"))?;
+    assert!(resp.status().is_success());
+
+    assert!(
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "request without Origin must not get a CORS header"
+    );
+    Ok(())
+}
+
+/// Purpose: an `OPTIONS` preflight from an allowed origin answers
+/// `204 No Content` with `Access-Control-Allow-Origin` echoed.
+///
+/// Scenario: start an HTTP transport on port 0, OPTIONS /command with
+/// `Origin: http://localhost:{port}` and
+/// `Access-Control-Request-Method: POST`.
+///
+/// Acceptance: status is 204 and `Access-Control-Allow-Origin` echoes the
+/// request origin.
+#[tokio::test]
+async fn cors_options_preflight_204() -> TestResult {
+    let state = test_state();
+    let app = harness_transport::http::http_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/command");
+    let origin = format!("http://localhost:{}", addr.port());
+    let resp = poll_until(
+        || {
+            let client = client.clone();
+            let url = url.clone();
+            let origin = origin.clone();
+            async move {
+                client
+                    .request(Method::OPTIONS, &url)
+                    .header(header::ORIGIN, &origin)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("HTTP server did not accept connections: {e}"))?;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "preflight 204");
+
+    let acao = resp
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .ok_or("missing Access-Control-Allow-Origin on preflight")?;
+    assert_eq!(acao.to_str().map_err(|e| e.to_string())?, origin);
+    Ok(())
+}
+
+/// Purpose: a WebSocket upgrade from an allowed dev origin reflects the
+/// request origin in `Access-Control-Allow-Origin` on the upgrade response.
+///
+/// Scenario: start a WebSocket transport on port 0, connect with
+/// `Origin: http://localhost:{port}`.
+///
+/// Acceptance: the upgrade response carries
+/// `Access-Control-Allow-Origin` equal to the request origin.
+#[tokio::test]
+async fn ws_upgrade_with_origin_echoes_origin() -> TestResult {
+    let state = test_state();
+    let app = harness_transport::ws::ws_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let _server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    poll_until(
+        || {
+            async move {
+                let origin = format!("http://localhost:{}", addr.port());
+                let mut request = format!("ws://{addr}/ws")
+                    .into_client_request()
+                    .map_err(|e| e.to_string())?;
+                request.headers_mut().insert(
+                    header::ORIGIN,
+                    header::HeaderValue::from_str(&origin).map_err(|e| e.to_string())?,
+                );
+                let (_stream, response) = tokio_tungstenite::connect_async(request)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let acao = response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .ok_or("missing Access-Control-Allow-Origin on WS upgrade")?;
+                assert_eq!(acao.to_str().map_err(|e| e.to_string())?, origin);
+                Ok(())
+            }
+        },
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("WebSocket server did not accept connections: {e}"))?;
     Ok(())
 }

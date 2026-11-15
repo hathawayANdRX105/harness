@@ -65,10 +65,11 @@ pub struct EventQuery {
 /// axum::serve(listener, app).await?;
 /// ```
 pub fn http_routes(state: Arc<TransportState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/command", post(handle_command))
         .route("/events", get(handle_events))
-        .with_state(state)
+        .with_state(state);
+    crate::cors::with_cors(router)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────
