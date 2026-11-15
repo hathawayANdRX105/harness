@@ -8,24 +8,39 @@
 //!   removal to reconstruct a full transcript.
 //! - [`turso`] — [`TursoSessionStore`], the default Turso-backed
 //!   implementation (ferrite's proven connection model, idempotent ledger).
+//! - [`unit`] — [`Unit`], [`StoredUnit`], the block ledger row, and the
+//!   split/assemble functions that map a `Message` onto units and back.
 //! - [`graph`] — [`GraphIndex`], the in-memory petgraph read model derived
-//!   from the `run_events` ledger (never persisted).
+//!   from the `units` ledger (never persisted): units are nodes, the parent
+//!   chain is the unit-tree edge, and each scope has a HEAD.
 //!
-//! # Two persistent objects
+//! # Three persistent stores
 //!
-//! 1. **Message ledger** — a `Vec<Message>` recording every turn in the
-//!    conversation. System messages are a named-section map; replay
-//!    accumulates them (including `None` removals) to reconstruct the prompt.
-//! 2. **RunEvent log** — ordered events keyed by `run_id` with a monotonic
-//!    `seq`. Recovery detects gaps from missing seqs.
+//! 1. **Unit ledger** (`units`) — one row per conversational block (prompt,
+//!    assistant text/reasoning, tool call, tool result, system section delta).
+//!    The index columns (ids, branch, epoch, order, role, kind, parent) and
+//!    the content (`payload_json`) live in the same Turso row; the graph holds
+//!    only the index columns.
+//! 2. **Session heads** (`session_heads`) — the HEAD pointer and the last
+//!    order/message sequence per session scope. Appends move it in the same
+//!    transaction that inserts units.
+//! 3. **RunEvent log** (`run_events`) — ordered events keyed by `run_id` with
+//!    a monotonic `seq`. Recovery detects gaps from missing seqs; recall's
+//!    full-text index is built on it.
 //!
 //! # Recovery
 //!
 //! ```text
 //! SessionStore::replay_ledger(id)
-//!   -> load all messages ordered by seq
+//!   -> graph HEAD -> ancestors() gives unit ids root..head
+//!   -> load the payload rows for those ids from Turso
+//!   -> assemble_messages() groups blocks back into messages
 //!   -> replay_messages() applies system-section accumulation
-//!   -> returns full transcript ready for the model
+//!   -> full transcript ready for the model
+//!
+//! SessionStore::load_messages(id)
+//!   -> read every unit ordered by event_order
+//!   -> assemble_messages() (the direct, graph-free path)
 //!
 //! SessionStore::events_for_run(id) + check_event_gaps(id)
 //!   -> load events ordered by seq
@@ -44,8 +59,10 @@ pub mod graph;
 pub mod recall;
 pub mod store;
 pub mod turso;
+pub mod unit;
 
-pub use graph::{GraphIndex, GraphUnit};
+pub use graph::GraphIndex;
 pub use recall::{NoRecall, RecallHit, RecallScope, RecallStore};
 pub use store::{MessageEntry, SessionStore, SessionStoreError, replay_messages};
 pub use turso::{TursoFtsRecall, TursoSessionStore};
+pub use unit::{StoredUnit, Unit, UnitKind, assemble_messages};
