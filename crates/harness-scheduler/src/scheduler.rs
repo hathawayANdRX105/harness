@@ -184,6 +184,28 @@ impl Scheduler {
         state.queue_remove(run_id)
     }
 
+    /// Queue a steering message on an active run.
+    ///
+    /// Returns `true` when the message was queued on an active run. Delivery
+    /// is best-effort: the loop drains the mailbox at its next turn boundary,
+    /// so a run that has already passed its last boundary finishes without
+    /// reading it. A queued run has not started, and a finished or unknown
+    /// run has no mailbox left — both return `false` rather than accepting a
+    /// message nothing will drain. Empty messages are rejected here for the
+    /// same reason [`RunControl::steer`] drops them.
+    pub fn steer(&self, run_id: &RunId, message: impl Into<String>) -> bool {
+        let text = message.into();
+        if text.trim().is_empty() {
+            return false;
+        }
+        let state = self.inner.state.lock();
+        let Some((_, active)) = state.active.values().find(|(id, _)| id == run_id) else {
+            return false;
+        };
+        active.control.steer(text);
+        true
+    }
+
     /// Current status of a run, if the scheduler knows it.
     pub fn status(&self, run_id: &RunId) -> Option<RunStatus> {
         let state = self.inner.state.lock();

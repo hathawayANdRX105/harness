@@ -3,8 +3,9 @@
 /// DaemonHandler maps slash commands onto the scheduler: `run` submits a
 /// run assembled by the builder, routed to `session_id` when the command
 /// names one (otherwise the "default" session); `cancel` / `status` /
-/// `list` read scheduler state, `steer` is rejected until the scheduler
-/// exposes steering, `tools.list` / `tools.set_active` / `tools.reset`
+/// `list` read scheduler state, `steer` queues a message on an active run
+/// (drained at the loop's next turn boundary), `tools.list` /
+/// `tools.set_active` / `tools.reset`
 /// consult the per-session tool catalog. Events flow loop → bus → a per-run
 /// pump task that appends into the session store and forwards into the
 /// transport broadcast channel, so every transport client sees every event.
@@ -338,6 +339,22 @@ impl DaemonHandler {
         rs.retain(|id| id != run_id);
     }
 
+    /// Queue a steering message on an active run.
+    ///
+    /// The loop drains the mailbox at its next turn boundary and replays the
+    /// message as a user turn; a run that has already passed its last
+    /// boundary finishes without reading it (best-effort, like the mailbox
+    /// itself). Steering a queued, finished, or unknown run is rejected:
+    /// there is no live transcript to read it.
+    fn steer(&self, run_id: &str, message: String) -> Result<serde_json::Value, TransportError> {
+        if !self.scheduler.steer(&RunId(run_id.to_string()), message) {
+            return Err(TransportError::NoActiveRun(format!(
+                "{run_id} is not running; steering requires an active run"
+            )));
+        }
+        Ok(serde_json::json!({ "run_id": run_id, "steered": true }))
+    }
+
     fn cancel(&self, run_id: &str) -> Result<serde_json::Value, TransportError> {
         let run_id = RunId(run_id.to_string());
         if !self.scheduler.cancel(&run_id) {
@@ -494,9 +511,7 @@ impl CommandHandler for DaemonHandler {
                 self.tools_set_active(session_id, names)
             }
             SlashCommand::ToolsReset { session_id } => Ok(self.tools_reset(session_id)),
-            SlashCommand::Steer { run_id, .. } => Err(TransportError::Internal(format!(
-                "steering run {run_id} is not wired yet: the scheduler does not expose steering in v1"
-            ))),
+            SlashCommand::Steer { run_id, message } => self.steer(&run_id, message),
         }
     }
 }
