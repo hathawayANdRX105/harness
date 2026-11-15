@@ -825,14 +825,12 @@ impl SessionStore for TursoSessionStore {
             // A session with units but no resolvable head is corrupt, not
             // empty: fail loudly instead of seeding an empty transcript.
             let empty = cold_units.as_ref().is_none_or(Vec::is_empty);
-            return if empty {
-                Ok(Vec::new())
-            } else {
-                Err(SessionStoreError::Internal(format!(
+            return empty.then_some(Vec::new()).ok_or_else(|| {
+                SessionStoreError::Internal(format!(
                     "session {} has units but no resolvable head",
                     session_id.0
-                )))
-            };
+                ))
+            });
         };
         let ancestors = graph.ancestors(&head_id);
         if ancestors.is_empty() {

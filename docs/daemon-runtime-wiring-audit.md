@@ -27,7 +27,7 @@ Jev 校验结果：9 条断言全部 `verified`；其中 6 条 `auto`，3 条 co
 | D2 | daemon 的 spec 未声明 prompt sections / skills / MCP servers，实际启动无 system prompt、无 `skill` 工具、MCP 池为空 | `main.rs:103-126`、`spec.rs:75-86`、`assemble.rs:493-498`、`assemble.rs:659` | verified 0.92 · auto |
 | D3 | 工作区没有 `Compactor` 具体实现，daemon 也从不 `with_compactor`，预算/压缩门永不触发 | `crates/harness-context/src/compactor.rs:63`；`grep 'impl Compactor'` 无结果；`assemble.rs:236-239`；`main.rs:127-137` | verified 0.87 · auto |
 | D4 | 会话消息历史既没写入也没重放：`append_message` / `replay_ledger` 在 session crate 外无调用者，`run()` 从空 transcript 开始 | `crates/harness-loop/src/engine.rs:301-302`；全仓检索无外部调用 | verified 0.76 · review |
-| D5 | **已解决**：`GraphIndex` 曾无运行时消费者；现在账本重塑为 `units`（索引列 + payload + parent），图是 unit 图并由 `replay_ledger` 消费 | 旧证据：`lib.rs:48`、仅测试引用；新实现：`unit.rs`、`graph.rs`、`turso.rs::replay_ledger` | verified 0.73 · review（当时） |
+| D5 | `GraphIndex` 没有运行时消费者，只在 harness-session 测试中使用 | `crates/harness-session/src/lib.rs:48`；`grep GraphIndex` 仅 `tests/session.rs` | verified 0.73 · review |
 | D6 | daemon 拒绝 `steer`，尽管 core 与 loop 已实现 steering 邮箱和 turn 边界注入 | `crates/harness-daemon/src/wire.rs:480-482`；`control.rs:75-92`；`engine.rs:107-110` | verified 0.86 · auto |
 | D7 | `harness-core` 不含 `SessionStore` seam；trait 定义在 `harness-session`（SVG 归属错误） | `crates/harness-core/src/lib.rs:69-75`；`harness-session/src/store.rs:91` | verified 0.65 · review |
 | D8 | 基线事实：scheduler 每会话最多 1 个活跃 run，全局上限默认 4，每会话队列默认 4 | `harness-config/src/config.rs:369-370`；`scheduler.rs:2,102` | verified 0.91 · auto |
@@ -36,8 +36,6 @@ Jev 校验结果：9 条断言全部 `verified`；其中 6 条 `auto`，3 条 co
 | D11 | 模型适配器对 `content: ""` 也发 `TextDelta`，空 delta 进入事件日志与 WS 推送（一次短回答 82 条 text_delta，仅 4 条非空） | `crates/harness-model/src/openai.rs:620-622`；真实运行观察 | 运行观察 |
 
 > Jev 运行备注：`compatible` 端点一次最多接受 8 条 claims（9 条返回 400），所以校验分两批完成；usage 块返回 `0/0`，不代表未调用模型。D4/D5/D7 的 `review` 是阈值问题，不是判定反转。
->
-> **2026-11-15 状态更新**：D2（prompt/skills/MCP 装配）由 config 接线关闭；D3（Compactor）由 `DefaultCompactor` 关闭；D4（会话历史）由消息/单元账本 + `replay_ledger` 关闭；D5 由 units 账本 + petgraph 单元图关闭；D6（steering）由 `Scheduler::steer` 关闭；D1/D7 由文档与 SVG 修正关闭。仍开放：D10（未使用依赖）、D11（空 TextDelta 噪声）。
 
 ## 3. 心智图漂移
 
