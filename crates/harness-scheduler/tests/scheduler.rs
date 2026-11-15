@@ -986,3 +986,45 @@ async fn launch_round_admits_oldest_submission_first() {
     // Reap the long run so the task does not outlive the test.
     assert!(scheduler.cancel(&RunId("b".into())));
 }
+
+/// Purpose: steering only reaches runs that own an active transcript.
+/// Scenario: one active slow run, one queued run in the same session, one
+/// unknown id, and a steer after the active run finishes.
+/// Acceptance: the active run accepts the message; queued, unknown and
+/// finished runs return false instead of accepting a message nobody drains.
+#[tokio::test]
+async fn steer_targets_only_active_runs() {
+    let scheduler = Scheduler::new(2, 1);
+    let model = Arc::new(SlowModel::new(vec![], Duration::from_millis(500)));
+    let sink: Arc<dyn EventSink> = Arc::new(CountingSink::default());
+
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx("active"),
+            deps: deps(model.clone(), vec![], sink.clone()),
+        })
+        .unwrap_or_else(|e| panic!("active run must start: {e}"));
+    scheduler
+        .submit(RunRequest {
+            ctx: ctx("waiting"),
+            deps: deps(model, vec![], sink),
+        })
+        .unwrap_or_else(|e| panic!("queued run must be accepted: {e}"));
+
+    assert!(
+        scheduler.steer(&RunId("active".into()), "short path"),
+        "an active run accepts a steering message"
+    );
+    assert!(
+        !scheduler.steer(&RunId("waiting".into()), "short path"),
+        "a queued run has no live transcript yet"
+    );
+    assert!(
+        !scheduler.steer(&RunId("missing".into()), "short path"),
+        "an unknown run cannot be steered"
+    );
+    assert!(
+        !scheduler.steer(&RunId("active".into()), "   "),
+        "an empty message is not queued"
+    );
+}
