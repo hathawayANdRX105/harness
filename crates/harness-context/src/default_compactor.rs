@@ -49,9 +49,12 @@ use crate::compactor::CompactionResult;
 use crate::stage::CompactionStage;
 use crate::{Compactor, default_stages};
 
-/// How many characters one token is worth — harness-rs's coarse estimate.
-/// The budget only drives threshold comparisons, not billing.
-pub const DEFAULT_TOKENS_PER_CHAR: f64 = 0.30;
+/// How many UTF-8 bytes one token is worth — harness-rs's coarse estimate,
+/// kept in bytes so non-ASCII text is not undercounted: a CJK character is
+/// three bytes, which lands near one token per character, while ASCII lands
+/// near 0.30 tokens per character. The budget only drives threshold
+/// comparisons, not billing.
+pub const DEFAULT_TOKENS_PER_BYTE: f64 = 0.30;
 
 /// Tool results older than this many trailing messages are "old".
 const OLD_WINDOW: usize = 8;
@@ -85,7 +88,7 @@ impl DefaultCompactor {
     pub fn with_stages(stages: Vec<CompactionStage>) -> Self {
         Self {
             stages,
-            tokens_per_char: DEFAULT_TOKENS_PER_CHAR,
+            tokens_per_char: DEFAULT_TOKENS_PER_BYTE,
         }
     }
 
@@ -97,7 +100,7 @@ impl DefaultCompactor {
 
     /// Rough token estimate for the ledger.
     fn estimate(&self, messages: &[Message]) -> u64 {
-        let chars: usize = messages.iter().map(message_chars).sum();
+        let chars: usize = messages.iter().map(message_bytes).sum();
         (chars as f64 * self.tokens_per_char) as u64
     }
 
@@ -159,6 +162,10 @@ impl Compactor for DefaultCompactor {
             if !stage.is_active(budget) {
                 continue;
             }
+            // Only stages that actually edited the ledger are recorded: a
+            // stage that was active but matched nothing is harmless to retry
+            // on resume, and recording it would claim work that never
+            // happened.
             if self.apply_stage(&stage.label, messages) {
                 applied.push(stage.label.clone());
                 summary_at = messages.len();
@@ -183,14 +190,14 @@ impl Compactor for DefaultCompactor {
 }
 
 /// Characters a message contributes to the token estimate.
-fn message_chars(message: &Message) -> usize {
+fn message_bytes(message: &Message) -> usize {
     match message {
         Message::System { sections } => sections
             .iter()
             .map(|(name, content)| name.len() + content.as_ref().map_or(0, String::len))
             .sum(),
         Message::User { content } | Message::Assistant { content } => {
-            content.iter().map(content_chars).sum()
+            content.iter().map(content_bytes).sum()
         }
         Message::ToolResult(result) => result.content.len(),
         _ => 0,
@@ -198,7 +205,7 @@ fn message_chars(message: &Message) -> usize {
 }
 
 /// Characters one content block contributes to the token estimate.
-fn content_chars(content: &Content) -> usize {
+fn content_bytes(content: &Content) -> usize {
     match content {
         Content::Text(text) => text.len(),
         Content::Reasoning(text) => text.len(),
@@ -222,13 +229,12 @@ fn trim_old_tool_results(
         let Message::ToolResult(result) = message else {
             continue;
         };
-        if result.content.len() > limit {
+        let chars = result.content.chars().count();
+        if chars > limit {
             let preview: String = result.content.chars().take(keep).collect();
             result.content = format!(
-                "[tool result {} trimmed from {} chars] {}…",
-                result.tool_name,
-                result.content.len(),
-                preview
+                "[tool result {} trimmed from {chars} chars] {preview}…",
+                result.tool_name
             );
             changed = true;
         }
@@ -254,13 +260,10 @@ fn trim_old_assistant_texts(
             let Content::Text(text) = block else {
                 continue;
             };
-            if text.len() > limit {
+            let chars = text.chars().count();
+            if chars > limit {
                 let preview: String = text.chars().take(keep).collect();
-                *text = format!(
-                    "[assistant text trimmed from {} chars] {}…",
-                    text.len(),
-                    preview
-                );
+                *text = format!("[assistant text trimmed from {chars} chars] {preview}…");
                 changed = true;
             }
         }

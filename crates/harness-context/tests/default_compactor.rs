@@ -72,10 +72,67 @@ fn oversized_budget() -> Budget {
 async fn read_budget_estimates_tokens() {
     let compactor = DefaultCompactor::new();
     let messages = vec![big_user_text(1_000), big_tool_result("grep", 1_000)];
-    // 1000 chars user + 1000 chars tool result = 2000 chars × 0.30.
+    // 1000 bytes user + 1000 bytes tool result = 2000 bytes × 0.30.
     let budget = compactor.read_budget(&messages, &small_window_info());
-    assert_eq!(budget.used_tokens, 600, "chars × 0.30, truncated to u64");
+    assert_eq!(budget.used_tokens, 600, "bytes × 0.30, truncated to u64");
     assert_eq!(budget.available_tokens, 4_096, "available is the window");
+
+    // Bytes, not characters: 100 CJK characters are 300 UTF-8 bytes, which
+    // is closer to one token per character than a char count would be.
+    let cjk = vec![Message::user_text("中".repeat(100))];
+    let budget = compactor.read_budget(&cjk, &small_window_info());
+    assert_eq!(budget.used_tokens, 90, "300 bytes × 0.30");
+}
+
+/// Purpose: trim markers report characters, not UTF-8 bytes, and the kept
+/// preview is a character count.
+/// Scenario: an old tool result of 1200 CJK characters (3600 bytes) behind
+/// the trailing window, compacted by the soft stage.
+/// Acceptance: the marker says `trimmed from 1200 chars`, and the surviving
+/// preview is 200 characters long (not 200 bytes).
+#[tokio::test]
+async fn trim_markers_count_characters_not_bytes() {
+    let compactor = DefaultCompactor::with_stages(vec![harness_context::CompactionStage {
+        threshold: 0.0,
+        target_ratio: 0.0,
+        label: "soft".into(),
+    }]);
+    let mut messages: Vec<Message> = Vec::new();
+    messages.push(Message::ToolResult(ToolResultMessage {
+        tool_call_id: "call-cjk".into(),
+        tool_name: "grep".into(),
+        content: "中".repeat(1_200),
+        is_error: false,
+    }));
+    for index in 0..8 {
+        messages.push(big_tool_result(&format!("recent{index}"), 20));
+    }
+
+    let result = compactor
+        .compact(
+            &mut messages,
+            &oversized_budget(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.completed);
+    let Message::ToolResult(trimmed) = &messages[0] else {
+        panic!("expected a tool result at index 0");
+    };
+    assert!(
+        trimmed.content.contains("trimmed from 1200 chars"),
+        "the marker counts characters: {}",
+        trimmed.content
+    );
+    let preview_start = trimmed
+        .content
+        .find("] ")
+        .unwrap_or_else(|| panic!("marker must end with '] '"))
+        + 2;
+    let preview_chars = trimmed.content[preview_start..].chars().count();
+    assert_eq!(preview_chars, 201, "200 kept chars plus the ellipsis");
 }
 
 #[tokio::test]

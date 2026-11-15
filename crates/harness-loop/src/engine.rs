@@ -24,7 +24,7 @@ use std::sync::atomic::AtomicU64;
 use futures::{StreamExt, pin_mut};
 use harness_core::event::RunEventKind;
 use harness_core::message::{Content, Message, ToolCall, ToolResultMessage};
-use harness_core::model::{Model, ModelEvent, ModelRequest};
+use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest};
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::{Tool, ToolSchema};
 use harness_core::{EventSink, RunControl};
@@ -57,9 +57,10 @@ pub struct LoopDeps {
     /// How tools are dispatched within one turn.
     pub tool_mode: ToolExecutionMode,
     /// Optional context budget: used vs available tokens plus the derived
-    /// ratio. The builder sets it from `[budget]`; its presence, together
-    /// with `compactor`, enables the turn-boundary budget gate that runs
-    /// before the provider call and can refuse a round as `BudgetBlocked`.
+    /// ratio. The builder sets it from `[budget]`. Its `available_tokens` is
+    /// the host's per-run input ceiling: the turn-boundary gate caps the
+    /// compactor's model-window estimate with it, so a configured limit
+    /// actually gates compaction. Without a compactor the gate stays off.
     pub budget: Option<Budget>,
     /// Optional compactor: assesses the budget and compacts the transcript.
     /// The builder sets it from the compaction plan; its presence, together
@@ -441,6 +442,26 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
 ///
 /// Returns `None` when the gate passes or is unconfigured (either dep
 /// missing), so the turn proceeds to the provider call.
+/// The gate's view of the budget: the compactor's model-window estimate,
+/// capped by the host's configured per-run input limit.
+///
+/// The two come from different places — the compactor reads
+/// `ModelInfo.context_window`, the host maps `[budget].max_input_tokens` into
+/// `LoopDeps.budget` — so the tighter value wins. Without the cap a configured
+/// limit would never gate anything.
+fn gate_budget(
+    compactor: &dyn Compactor,
+    transcript: &[Message],
+    info: &ModelInfo,
+    configured: Option<&Budget>,
+) -> Budget {
+    let mut budget = compactor.read_budget(transcript, info);
+    if let Some(configured) = configured {
+        budget.available_tokens = budget.available_tokens.min(configured.available_tokens);
+    }
+    budget
+}
+
 async fn enforce_budget_gate(
     deps: &LoopDeps,
     transcript: &mut Vec<Message>,
@@ -463,7 +484,7 @@ async fn enforce_budget_gate(
     }
 
     let info = deps.model.info();
-    let budget = compactor.read_budget(transcript, info);
+    let budget = gate_budget(compactor.as_ref(), transcript, info, deps.budget.as_ref());
     let stage = compactor.stages().iter().find(|s| s.is_active(&budget))?;
 
     // Compaction is the only relief available before refusing the round;
@@ -481,12 +502,15 @@ async fn enforce_budget_gate(
         ));
     }
 
-    let budget = compactor.read_budget(transcript, info);
+    let budget = gate_budget(compactor.as_ref(), transcript, info, deps.budget.as_ref());
     let still_blocked = compactor.stages().iter().any(|s| s.is_active(&budget));
     if !still_blocked {
         return None;
     }
 
+    // `stage` names the first stage that was active when the gate ran, not
+    // the deepest one the compactor reached: the applied labels live in the
+    // compaction result's checkpoint, which the gate does not keep.
     let blocked = BudgetBlocked {
         needed: budget.used_tokens,
         available: budget.available_tokens,

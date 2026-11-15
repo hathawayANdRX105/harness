@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use harness_context::{
     Budget, BudgetBlocked, CompactionCheckpoint, CompactionResult, CompactionStage, Compactor,
+    DefaultCompactor,
 };
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
 use harness_core::message::{Content, Message};
@@ -652,4 +653,49 @@ async fn real_default_compactor_refuses_unshrinkable_history() {
         0,
         "the provider call never happened"
     );
+}
+
+/// Purpose: the host's configured per-run input limit caps the compactor's
+/// model-window estimate, so `[budget].max_input_tokens` actually gates
+/// compaction instead of being ignored.
+/// Scenario: the model window is 4096 tokens; the configured budget allows
+/// only 100; the ledger is 1000 bytes ≈ 300 tokens — fits the window, not the
+/// configured cap.
+/// Acceptance: the gate refuses the round with BudgetBlocked semantics and the
+/// model sees zero requests (without the cap this run would have proceeded).
+#[tokio::test]
+async fn configured_budget_caps_the_compactor_window() {
+    let model = Arc::new(MockModel::new(
+        make_model_info(),
+        vec![vec![
+            ModelEvent::TextDelta("should never run".into()),
+            ModelEvent::Stop(StopReason::EndTurn),
+        ]],
+    ));
+    let deps = Arc::new(LoopDeps {
+        model: Arc::clone(&model) as Arc<dyn Model>,
+        tools: Vec::new(),
+        event_sink: Arc::new(TestSink::default()),
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        tool_mode: ToolExecutionMode::Sequential,
+        budget: Some(Budget {
+            used_tokens: 0,
+            available_tokens: 100,
+        }),
+        compactor: Some(Arc::new(DefaultCompactor::new()) as Arc<dyn Compactor>),
+        seed: vec![Message::user_text("x".repeat(1_000))],
+        transcript_sink: None,
+    });
+
+    let reason = run(make_ctx(10), deps, RunControl::new()).await;
+
+    let RunStopReason::Error { message } = reason else {
+        panic!("the configured cap must refuse the round, got {reason:?}");
+    };
+    let blocked = BudgetBlocked::from_error_message(&message)
+        .unwrap_or_else(|| panic!("BudgetBlocked semantics expected: {message}"));
+    assert_eq!(blocked.available, 100, "the configured cap is reported");
+    assert_eq!(model.requests().len(), 0, "no provider call");
 }
