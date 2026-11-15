@@ -103,7 +103,9 @@ use tokio::sync::Mutex;
 
 use crate::graph::GraphIndex;
 use crate::recall::{RecallHit, RecallScope, RecallStore};
-use crate::store::{MessageEntry, SessionStore, SessionStoreError, replay_messages};
+use crate::store::{
+    HistoryMarker, MessageEntry, RewindBoundary, SessionStore, SessionStoreError, replay_messages,
+};
 use crate::unit::{
     HeadState, INITIAL_EPOCH, MAIN_BRANCH, StoredUnit, Unit, UnitKind, assemble_messages,
     split_message,
@@ -135,7 +137,119 @@ pub struct TursoSessionStore {
     graphs: StdMutex<HashMap<SessionId, Arc<GraphIndex>>>,
 }
 
+/// Versioned schema migrations, applied oldest-first by
+/// [`TursoSessionStore::migrate`]. Each entry's SQL must be idempotent under
+/// its own version check (the runner only runs a migration once, keyed by
+/// version).
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATION_1_SQL: &str = "CREATE TABLE IF NOT EXISTS sessions (     session_id   TEXT PRIMARY KEY,     created_at_ms INTEGER NOT NULL ); CREATE TABLE IF NOT EXISTS units (     event_id        TEXT PRIMARY KEY,     session_id      TEXT NOT NULL,     branch_id       TEXT NOT NULL,     epoch           INTEGER NOT NULL,     event_order     INTEGER NOT NULL,     message_seq     INTEGER NOT NULL,     role            TEXT NOT NULL,     kind            TEXT NOT NULL,     payload_json    TEXT NOT NULL,     parent_event_id TEXT,     created_at_ms   INTEGER NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id),     UNIQUE(session_id, branch_id, epoch, event_order) ); CREATE TABLE IF NOT EXISTS session_heads (     session_id        TEXT PRIMARY KEY,     branch_id         TEXT NOT NULL,     epoch             INTEGER NOT NULL,     head_event_id     TEXT,     last_event_order  INTEGER NOT NULL,     last_message_seq  INTEGER NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ); CREATE TABLE IF NOT EXISTS run_events (     id           INTEGER PRIMARY KEY AUTOINCREMENT,     run_id       TEXT NOT NULL,     session_id   TEXT NOT NULL,     seq          INTEGER NOT NULL,     event_json   TEXT NOT NULL,     timestamp_ms INTEGER NOT NULL,     idempotency_key TEXT UNIQUE NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id),     UNIQUE(run_id, seq) ); CREATE INDEX IF NOT EXISTS idx_units_session_order     ON units(session_id, event_order); CREATE INDEX IF NOT EXISTS idx_run_events_run_seq     ON run_events(run_id, seq); CREATE INDEX IF NOT EXISTS idx_run_events_fts     ON run_events USING fts (event_json)     WITH (tokenizer = 'ngram');";
+
+const MIGRATION_2_SQL: &str = "ALTER TABLE units ADD COLUMN turn_id TEXT; ALTER TABLE units ADD COLUMN run_id TEXT; ALTER TABLE units ADD COLUMN source_kind TEXT; ALTER TABLE units ADD COLUMN tool_call_id TEXT; ALTER TABLE units ADD COLUMN idempotency_key TEXT; ALTER TABLE units ADD COLUMN integrity_hash TEXT; CREATE INDEX IF NOT EXISTS idx_units_run ON units(run_id); CREATE UNIQUE INDEX IF NOT EXISTS idx_units_idempotency     ON units(idempotency_key) WHERE idempotency_key IS NOT NULL;";
+
+const MIGRATION_3_SQL: &str = "CREATE TABLE IF NOT EXISTS history_markers (     session_id         TEXT NOT NULL,     branch_id          TEXT NOT NULL,     from_epoch         INTEGER NOT NULL,     to_epoch           INTEGER NOT NULL,     cutoff_event_id    TEXT,     cutoff_event_order INTEGER,     boundary           TEXT NOT NULL,     occurred_at_ms     INTEGER NOT NULL,     PRIMARY KEY (session_id, branch_id, to_epoch),     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ); CREATE INDEX IF NOT EXISTS idx_history_markers_session     ON history_markers(session_id, branch_id);";
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "base_tables",
+        sql: MIGRATION_1_SQL,
+    },
+    Migration {
+        version: 2,
+        name: "unit_integrity_columns",
+        sql: MIGRATION_2_SQL,
+    },
+    Migration {
+        version: 3,
+        name: "history_markers",
+        sql: MIGRATION_3_SQL,
+    },
+];
+
 impl TursoSessionStore {
+    /// Drop the cached graph so the next replay rebuilds from the committed
+    /// head. The graph is derived; eviction is always safe.
+    fn evict_graph(&self, session_id: &SessionId) {
+        self.graphs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+    }
+
+    /// Apply pending schema migrations, oldest first.
+    ///
+    /// Each migration runs once, recorded in `_session_migrations`; the
+    /// `execute_batch` + ledger insert share the gate but run autocommitted
+    /// (every migration is written so the version check is the only guard).
+    async fn migrate(&self) -> Result<(), SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS _session_migrations (\
+                     version       INTEGER PRIMARY KEY,\
+                     name          TEXT NOT NULL,\
+                     applied_at_ms INTEGER NOT NULL\
+                 );",
+            )
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let mut applied: Vec<i64> = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT version FROM _session_migrations ORDER BY version",
+                (),
+            )
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        {
+            let version: i64 = row
+                .get(0)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            applied.push(version);
+        }
+        for migration in MIGRATIONS {
+            if applied.contains(&migration.version) {
+                continue;
+            }
+            self.conn
+                .execute_batch(migration.sql)
+                .await
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _session_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                    params![migration.version, migration.name, Self::now_ms()],
+                )
+                .await
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        }
+        // WAL so readers and the single writer do not block each other.
+        let mut rows = self
+            .conn
+            .query("PRAGMA journal_mode=WAL", ())
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        while let Some(_row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        {
+            // consume the pragma result row
+        }
+        Self::set_busy_timeout(&self.conn).await?;
+        Ok(())
+    }
+
     /// Open or create a database at `path`, run the schema migration and
     /// enable WAL.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
@@ -165,85 +279,6 @@ impl TursoSessionStore {
     }
 
     /// Create the schema tables and indexes if they do not exist.
-    ///
-    /// All statements are `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT
-    /// EXISTS`, so re-running on an existing file is a no-op.
-    async fn migrate(&self) -> Result<(), SessionStoreError> {
-        let _guard = self.gate.lock().await;
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS sessions (
-                     session_id   TEXT PRIMARY KEY,
-                     created_at_ms INTEGER NOT NULL
-                 );
-
-                 CREATE TABLE IF NOT EXISTS units (
-                     event_id        TEXT PRIMARY KEY,
-                     session_id      TEXT NOT NULL,
-                     branch_id       TEXT NOT NULL,
-                     epoch           INTEGER NOT NULL,
-                     event_order     INTEGER NOT NULL,
-                     message_seq     INTEGER NOT NULL,
-                     role            TEXT NOT NULL,
-                     kind            TEXT NOT NULL,
-                     payload_json    TEXT NOT NULL,
-                     parent_event_id TEXT,
-                     created_at_ms   INTEGER NOT NULL,
-                     FOREIGN KEY (session_id) REFERENCES sessions(session_id),
-                     UNIQUE(session_id, branch_id, epoch, event_order)
-                 );
-
-                 CREATE TABLE IF NOT EXISTS session_heads (
-                     session_id        TEXT PRIMARY KEY,
-                     branch_id         TEXT NOT NULL,
-                     epoch             INTEGER NOT NULL,
-                     head_event_id     TEXT,
-                     last_event_order  INTEGER NOT NULL,
-                     last_message_seq  INTEGER NOT NULL,
-                     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-                 );
-
-                 CREATE TABLE IF NOT EXISTS run_events (
-                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                     run_id       TEXT NOT NULL,
-                     session_id   TEXT NOT NULL,
-                     seq          INTEGER NOT NULL,
-                     event_json   TEXT NOT NULL,
-                     timestamp_ms INTEGER NOT NULL,
-                     idempotency_key TEXT UNIQUE NOT NULL,
-                     FOREIGN KEY (session_id) REFERENCES sessions(session_id),
-                     UNIQUE(run_id, seq)
-                 );
-
-                 CREATE INDEX IF NOT EXISTS idx_units_session_order
-                     ON units(session_id, event_order);
-
-                 CREATE INDEX IF NOT EXISTS idx_run_events_run_seq
-                     ON run_events(run_id, seq);
-
-                 CREATE INDEX IF NOT EXISTS idx_run_events_fts
-                     ON run_events USING fts (event_json)
-                     WITH (tokenizer = 'ngram');",
-            )
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        // WAL so readers and the single writer do not block each other.
-        let mut rows = self
-            .conn
-            .query("PRAGMA journal_mode=WAL", ())
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        while let Some(_row) = rows
-            .next()
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
-        {
-            // consume the pragma result row
-        }
-        Self::set_busy_timeout(&self.conn).await?;
-        Ok(())
-    }
-
     /// Open a separate connection for a transaction: turso transactions are
     /// connection-level state, and `transaction()` needs `&mut Connection`.
     /// The caller holds the write gate for the transaction's lifetime, so the
@@ -305,7 +340,7 @@ impl TursoSessionStore {
     }
 
     /// Every unit of a session, in append order.
-    async fn load_units(
+    pub async fn load_units(
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<StoredUnit>, SessionStoreError> {
@@ -315,7 +350,7 @@ impl TursoSessionStore {
 
     /// The session's head row, creating the default one for a session that
     /// predates the unit ledger.
-    async fn load_head(&self, session_id: &SessionId) -> Result<HeadState, SessionStoreError> {
+    pub async fn load_head(&self, session_id: &SessionId) -> Result<HeadState, SessionStoreError> {
         let _guard = self.gate.lock().await;
         ensure_head_from(&self.conn, session_id).await
     }
@@ -398,7 +433,9 @@ impl TursoSessionStore {
                 .collect();
             let sql = format!(
                 "SELECT event_id, branch_id, epoch, event_order, message_seq, role, kind,
-                        payload_json, parent_event_id, created_at_ms
+                        payload_json, parent_event_id, created_at_ms,
+                        turn_id, run_id, source_kind, tool_call_id, idempotency_key,
+                        integrity_hash
                    FROM units
                   WHERE session_id = ?1 AND event_id IN ({})",
                 placeholders.join(", ")
@@ -455,7 +492,9 @@ async fn load_units_from(
     let mut rows = conn
         .query(
             "SELECT event_id, branch_id, epoch, event_order, message_seq, role, kind,
-                    payload_json, parent_event_id, created_at_ms
+                    payload_json, parent_event_id, created_at_ms,
+                    turn_id, run_id, source_kind, tool_call_id, idempotency_key,
+                    integrity_hash
                FROM units
               WHERE session_id = ?1
               ORDER BY branch_id, epoch, event_order",
@@ -509,6 +548,24 @@ fn decode_unit_row(
     let created_at_ms: i64 = row
         .get(9)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let turn_id: Option<String> = row
+        .get(10)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let run_id: Option<String> = row
+        .get(11)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let source_kind: String = row
+        .get(12)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let tool_call_id: Option<String> = row
+        .get(13)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let idempotency_key: Option<String> = row
+        .get(14)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let integrity_hash: String = row
+        .get(15)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
     Ok(StoredUnit {
         unit: Unit {
             event_id,
@@ -521,6 +578,12 @@ fn decode_unit_row(
                 .map_err(|_| SessionStoreError::Internal("negative unit message_seq".into()))?,
             role,
             kind: UnitKind::parse(&kind)?,
+            run_id,
+            turn_id,
+            source_kind,
+            tool_call_id,
+            idempotency_key,
+            integrity_hash,
             parent_event_id,
             created_at_ms,
         },
@@ -588,8 +651,10 @@ async fn insert_units_tx(
         conn.execute(
             "INSERT INTO units
                  (event_id, session_id, branch_id, epoch, event_order, message_seq,
-                  role, kind, payload_json, parent_event_id, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  role, kind, payload_json, parent_event_id, created_at_ms,
+                  turn_id, run_id, source_kind, tool_call_id, idempotency_key,
+                  integrity_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 unit.event_id.clone(),
                 unit.session_id.0.clone(),
@@ -602,6 +667,12 @@ async fn insert_units_tx(
                 payload_json.clone(),
                 unit.parent_event_id.clone(),
                 unit.created_at_ms,
+                unit.turn_id.clone(),
+                unit.run_id.clone(),
+                unit.source_kind.clone(),
+                unit.tool_call_id.clone(),
+                unit.idempotency_key.clone(),
+                unit.integrity_hash.clone(),
             ],
         )
         .await
@@ -651,6 +722,22 @@ fn order_by_ids(
             })
         })
         .collect()
+}
+
+/// Read the head row inside a transaction; `None` when absent (no ensure).
+async fn read_head_tx(
+    conn: &Connection,
+    session_id: &SessionId,
+) -> Result<Option<HeadState>, SessionStoreError> {
+    let mut rows = conn
+        .query(
+            "SELECT branch_id, epoch, head_event_id, last_event_order, last_message_seq
+               FROM session_heads WHERE session_id = ?1",
+            params![session_id.0.clone()],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    decode_head_row(&mut rows, session_id).await
 }
 
 /// Read the head row of a session from the shared connection.
@@ -768,9 +855,11 @@ impl SessionStore for TursoSessionStore {
         Ok(exists)
     }
 
-    async fn append_message(
+    async fn append_message_for_run(
         &self,
         session_id: &SessionId,
+        run_id: Option<&RunId>,
+        kind_override: Option<UnitKind>,
         message: &Message,
     ) -> Result<u64, SessionStoreError> {
         // The head read and the unit inserts must be atomic so concurrent
@@ -788,7 +877,13 @@ impl SessionStore for TursoSessionStore {
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         let head = ensure_head_tx(&tx, session_id).await?;
         let message_seq = head.last_message_seq + 1;
-        let units = split_message(&head, message, Self::now_ms())?;
+        let units = split_message(
+            &head,
+            run_id.map(|run| run.0.as_str()),
+            kind_override,
+            message,
+            Self::now_ms(),
+        )?;
         insert_units_tx(&tx, &units).await?;
         let last = units
             .last()
@@ -822,15 +917,30 @@ impl SessionStore for TursoSessionStore {
         // ledger = content.
         let (graph, cold_units, head) = self.graph_for(session_id).await?;
         let Some(head_id) = graph.head(session_id, &head.branch_id, head.epoch) else {
-            // A session with units but no resolvable head is corrupt, not
-            // empty: fail loudly instead of seeding an empty transcript.
-            let empty = cold_units.as_ref().is_none_or(Vec::is_empty);
-            return empty.then_some(Vec::new()).ok_or_else(|| {
-                SessionStoreError::Internal(format!(
-                    "session {} has units but no resolvable head",
-                    session_id.0
-                ))
-            });
+            // No resolvable head: legitimate when the ledger is empty (fresh
+            // session) or when the head epoch was opened by a ClearEmpty
+            // rewind. Units without either explanation are corruption.
+            let has_units = match &cold_units {
+                Some(units) => !units.is_empty(),
+                None => !self.load_units(session_id).await?.is_empty(),
+            };
+            if !has_units {
+                return Ok(Vec::new());
+            }
+            let cleared = self
+                .history_markers(session_id)
+                .await?
+                .into_iter()
+                .any(|marker| {
+                    marker.to_epoch == head.epoch && marker.boundary == RewindBoundary::ClearEmpty
+                });
+            if cleared {
+                return Ok(Vec::new());
+            }
+            return Err(SessionStoreError::Internal(format!(
+                "session {} has units but no resolvable head in epoch {}",
+                session_id.0, head.epoch
+            )));
         };
         let ancestors = graph.ancestors(&head_id);
         if ancestors.is_empty() {
@@ -1008,6 +1118,210 @@ impl SessionStore for TursoSessionStore {
         Ok(Some(event))
     }
 
+    async fn rewind_to_unit(
+        &self,
+        session_id: &SessionId,
+        unit_id: &str,
+        boundary: RewindBoundary,
+    ) -> Result<u64, SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        let mut conn = self.tx_conn().await?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let head = read_head_tx(&tx, session_id)
+            .await?
+            .ok_or_else(|| SessionStoreError::SessionNotFound(session_id.clone()))?;
+        let mut rows = tx
+            .query(
+                "SELECT branch_id, epoch, event_order, message_seq FROM units
+                  WHERE event_id = ?1 AND session_id = ?2",
+                params![unit_id.to_string(), session_id.0.clone()],
+            )
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+            .ok_or_else(|| {
+                SessionStoreError::Internal(format!(
+                    "session {} has no unit {unit_id}",
+                    session_id.0
+                ))
+            })?;
+        let unit_branch: String = row
+            .get(0)
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let unit_epoch: i64 = row
+            .get(1)
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let unit_order: i64 = row
+            .get(2)
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let unit_message_seq: i64 = row
+            .get(3)
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        // The cutoff must live in the head's branch and not in the future:
+        // rewinding into another branch or past the head is a caller bug.
+        if unit_branch != head.branch_id || unit_epoch > head.epoch {
+            return Err(SessionStoreError::InvalidQuery(format!(
+                "unit {unit_id} is outside the head scope (branch {}, epoch {})",
+                head.branch_id, head.epoch
+            )));
+        }
+        // Rewinding to the head is a no-op: nothing is superseded, no marker.
+        if head.head_event_id.as_deref() == Some(unit_id) {
+            return u64::try_from(head.epoch)
+                .map_err(|_| SessionStoreError::Internal("negative head epoch".into()));
+        }
+        let to_epoch = head.epoch + 1;
+        tx.execute(
+            "INSERT INTO history_markers
+                 (session_id, branch_id, from_epoch, to_epoch,
+                  cutoff_event_id, cutoff_event_order, boundary, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session_id.0.clone(),
+                head.branch_id.clone(),
+                head.epoch,
+                to_epoch,
+                Some(unit_id.to_string()),
+                Some(unit_order),
+                boundary.as_str().to_string(),
+                Self::now_ms(),
+            ],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        // Message numbering continues from the cutoff so the retained prefix
+        // and the new epoch assemble into a dense sequence.
+        tx.execute(
+            "UPDATE session_heads
+                SET epoch = ?2, head_event_id = ?3, last_event_order = 0,
+                    last_message_seq = ?4
+              WHERE session_id = ?1",
+            params![
+                session_id.0.clone(),
+                to_epoch,
+                Some(unit_id.to_string()),
+                unit_message_seq,
+            ],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        self.evict_graph(session_id);
+        Ok(u64::try_from(to_epoch)
+            .map_err(|_| SessionStoreError::Internal("negative head epoch".into()))?)
+    }
+
+    async fn rewind_clear(&self, session_id: &SessionId) -> Result<u64, SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        let mut conn = self.tx_conn().await?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let head = read_head_tx(&tx, session_id)
+            .await?
+            .ok_or_else(|| SessionStoreError::SessionNotFound(session_id.clone()))?;
+        let to_epoch = head.epoch + 1;
+        tx.execute(
+            "INSERT INTO history_markers
+                 (session_id, branch_id, from_epoch, to_epoch,
+                  cutoff_event_id, cutoff_event_order, boundary, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6)",
+            params![
+                session_id.0.clone(),
+                head.branch_id.clone(),
+                head.epoch,
+                to_epoch,
+                RewindBoundary::ClearEmpty.as_str().to_string(),
+                Self::now_ms(),
+            ],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        tx.execute(
+            "UPDATE session_heads
+                SET epoch = ?2, head_event_id = NULL, last_event_order = 0
+              WHERE session_id = ?1",
+            params![session_id.0.clone(), to_epoch],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        self.evict_graph(session_id);
+        Ok(u64::try_from(to_epoch)
+            .map_err(|_| SessionStoreError::Internal("negative head epoch".into()))?)
+    }
+
+    async fn history_markers(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<HistoryMarker>, SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT session_id, branch_id, from_epoch, to_epoch,
+                        cutoff_event_id, cutoff_event_order, boundary, occurred_at_ms
+                   FROM history_markers WHERE session_id = ?1 ORDER BY to_epoch ASC",
+                params![session_id.0.clone()],
+            )
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let mut markers = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        {
+            let session: String = row
+                .get(0)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let branch_id: String = row
+                .get(1)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let from_epoch: i64 = row
+                .get(2)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let to_epoch: i64 = row
+                .get(3)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let cutoff_event_id: Option<String> = row
+                .get(4)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let cutoff_order: Option<i64> = row
+                .get(5)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let boundary: String = row
+                .get(6)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            let occurred_at_ms: i64 = row
+                .get(7)
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            markers.push(HistoryMarker {
+                session_id: SessionId(session),
+                branch_id,
+                from_epoch,
+                to_epoch,
+                cutoff_event_id,
+                cutoff_event_order: cutoff_order.map(u64::try_from).transpose().map_err(|_| {
+                    SessionStoreError::Internal("negative marker event_order".into())
+                })?,
+                boundary: RewindBoundary::parse(&boundary)?,
+                occurred_at_ms,
+            });
+        }
+        Ok(markers)
+    }
     async fn delete_session(&self, id: &SessionId) -> Result<(), SessionStoreError> {
         let _guard = self.gate.lock().await;
         // Children first, all in one transaction: a crash mid-delete must not
@@ -1033,6 +1347,7 @@ impl SessionStore for TursoSessionStore {
         }
         for statement in [
             "DELETE FROM units WHERE session_id = ?1",
+            "DELETE FROM history_markers WHERE session_id = ?1",
             "DELETE FROM session_heads WHERE session_id = ?1",
             "DELETE FROM run_events WHERE session_id = ?1",
             "DELETE FROM sessions WHERE session_id = ?1",

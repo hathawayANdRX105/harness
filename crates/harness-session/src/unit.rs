@@ -29,6 +29,7 @@
 
 use harness_core::message::{Content, Message, ToolCall, ToolResultMessage};
 use harness_core::run::SessionId;
+use sha2::{Digest, Sha256};
 
 use crate::store::{MessageEntry, SessionStoreError};
 
@@ -42,8 +43,10 @@ pub(crate) const INITIAL_EPOCH: i64 = 1;
 /// What one ledger row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitKind {
-    /// A user prompt (or a steering message replayed as one).
+    /// A user prompt.
     Prompt,
+    /// A steering message replayed as a user turn.
+    Steering,
     /// A text or reasoning block of an assistant message.
     Assistant,
     /// A tool call block of an assistant message.
@@ -59,6 +62,7 @@ impl UnitKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Prompt => "prompt",
+            Self::Steering => "steering",
             Self::Assistant => "assistant",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
@@ -70,6 +74,7 @@ impl UnitKind {
     pub fn parse(value: &str) -> Result<Self, SessionStoreError> {
         match value {
             "prompt" => Ok(Self::Prompt),
+            "steering" => Ok(Self::Steering),
             "assistant" => Ok(Self::Assistant),
             "tool_call" => Ok(Self::ToolCall),
             "tool_result" => Ok(Self::ToolResult),
@@ -102,6 +107,21 @@ pub struct Unit {
     pub role: String,
     /// What this row is.
     pub kind: UnitKind,
+    /// The run this unit came from, when it was produced inside one.
+    pub run_id: Option<String>,
+    /// The turn this unit belongs to, when the run reported one.
+    pub turn_id: Option<String>,
+    /// Who produced the content: `user`, `model`, `tool`, or `system`.
+    pub source_kind: String,
+    /// For `tool_result` rows: the tool call this result answers.
+    pub tool_call_id: Option<String>,
+    /// Position-derived idempotency key (run + message + block index).
+    /// `run_id:message_seq:block` for run-tagged appends; `None` when the
+    /// append carries no run provenance (dedupe is run-scoped by design).
+    pub idempotency_key: Option<String>,
+    /// sha256 over the fixed index+content field list (excluding the parent
+    /// edge — ferrite's known P1 limitation).
+    pub integrity_hash: String,
     /// The unit this one continues, or `None` at the root of the scope.
     pub parent_event_id: Option<String>,
     /// Creation timestamp.
@@ -117,7 +137,7 @@ pub struct StoredUnit {
 
 /// The scope a new append lands in, read from `session_heads`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HeadState {
+pub struct HeadState {
     pub session_id: SessionId,
     pub branch_id: String,
     pub epoch: i64,
@@ -134,59 +154,117 @@ pub(crate) fn event_id(session_id: &SessionId, branch_id: &str, epoch: i64, orde
 /// Split one message into ledger units, chained in order.
 ///
 /// The head supplies the scope, the next message sequence, the first free
-/// `event_order`, and the parent the first block continues. Each returned
-/// payload is the JSON stored in `payload_json`.
+/// `event_order`, and the parent the first block continues. `run_id` records
+/// provenance when the append happens inside a run; `kind_override` labels a
+/// whole message as one `steering` unit instead of its default split. Each
+/// returned payload is the JSON stored in `payload_json`.
 pub(crate) fn split_message(
     head: &HeadState,
+    run_id: Option<&str>,
+    kind_override: Option<UnitKind>,
     message: &Message,
     now_ms: i64,
 ) -> Result<Vec<(Unit, String)>, SessionStoreError> {
-    let blocks = message_blocks(message)?;
+    let mut blocks = message_blocks(message)?;
+    if let Some(UnitKind::Steering) = kind_override {
+        // A steering unit carries the whole user content: it is one decision,
+        // not a conversation turn.
+        blocks = vec![(
+            UnitKind::Steering,
+            "user",
+            "user",
+            serde_json::to_string(&message_user_content(message)?)
+                .map_err(SessionStoreError::Serialization)?,
+        )];
+    }
     let message_seq = head.last_message_seq + 1;
     let start_order = head.last_event_order + 1;
     let mut units = Vec::with_capacity(blocks.len());
     let mut parent = head.head_event_id.clone();
-    for (index, (kind, role, payload)) in blocks.into_iter().enumerate() {
+    for (index, (kind, role, source_kind, payload)) in blocks.into_iter().enumerate() {
         let order = start_order + index as u64;
         let id = event_id(&head.session_id, &head.branch_id, head.epoch, order);
-        units.push((
-            Unit {
-                event_id: id.clone(),
-                session_id: head.session_id.clone(),
-                branch_id: head.branch_id.clone(),
-                epoch: head.epoch,
-                event_order: order,
-                message_seq,
-                role: role.to_string(),
-                kind,
-                parent_event_id: parent.clone(),
-                created_at_ms: now_ms,
-            },
-            payload,
-        ));
+        let mut unit = Unit {
+            event_id: id.clone(),
+            session_id: head.session_id.clone(),
+            branch_id: head.branch_id.clone(),
+            epoch: head.epoch,
+            event_order: order,
+            message_seq,
+            role: role.to_string(),
+            kind,
+            run_id: run_id.map(str::to_string),
+            turn_id: None,
+            source_kind: source_kind.to_string(),
+            tool_call_id: None,
+            idempotency_key: run_id.map(|run| format!("{run}:m{message_seq}:b{index}")),
+            integrity_hash: String::new(),
+            parent_event_id: parent.clone(),
+            created_at_ms: now_ms,
+        };
+        if let UnitKind::ToolCall = kind {
+            let call: ToolCall =
+                serde_json::from_str(&payload).map_err(SessionStoreError::Serialization)?;
+            unit.tool_call_id = Some(call.id);
+        }
+        unit.integrity_hash = integrity_hash(&unit, &payload)?;
+        units.push((unit, payload));
         parent = Some(id);
     }
     Ok(units)
 }
 
+/// The user content of a message, for whole-message unit overrides.
+fn message_user_content(message: &Message) -> Result<Vec<Content>, SessionStoreError> {
+    match message {
+        Message::User { content } => Ok(content.clone()),
+        other => Err(SessionStoreError::Internal(format!(
+            "steering override requires a user message, got {other:?}"
+        ))),
+    }
+}
+
+/// sha256 over the fixed index+content field list, `U+001F`-joined. The
+/// parent edge is excluded — ferrite's known P1 limitation.
+pub(crate) fn integrity_hash(unit: &Unit, payload: &str) -> Result<String, SessionStoreError> {
+    let mut hasher = Sha256::new();
+    for field in [
+        unit.session_id.0.as_str(),
+        unit.branch_id.as_str(),
+        &unit.epoch.to_string(),
+        &unit.event_order.to_string(),
+        &unit.message_seq.to_string(),
+        unit.role.as_str(),
+        unit.kind.as_str(),
+        payload,
+    ] {
+        hasher.update(field.as_bytes());
+        hasher.update([0x1f]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// The blocks one message contributes, each with its payload JSON.
 fn message_blocks(
     message: &Message,
-) -> Result<Vec<(UnitKind, &'static str, String)>, SessionStoreError> {
+) -> Result<Vec<(UnitKind, &'static str, &'static str, String)>, SessionStoreError> {
     match message {
         Message::System { sections } => Ok(vec![(
             UnitKind::System,
+            "system",
             "system",
             serde_json::to_string(sections).map_err(SessionStoreError::Serialization)?,
         )]),
         Message::User { content } => Ok(vec![(
             UnitKind::Prompt,
             "user",
+            "user",
             serde_json::to_string(content).map_err(SessionStoreError::Serialization)?,
         )]),
         Message::Assistant { content } => assistant_blocks(content),
         Message::ToolResult(result) => Ok(vec![(
             UnitKind::ToolResult,
+            "tool",
             "tool",
             serde_json::to_string(result).map_err(SessionStoreError::Serialization)?,
         )]),
@@ -202,9 +280,14 @@ fn message_blocks(
 /// unit so its existence and its message sequence survive.
 fn assistant_blocks(
     content: &[Content],
-) -> Result<Vec<(UnitKind, &'static str, String)>, SessionStoreError> {
+) -> Result<Vec<(UnitKind, &'static str, &'static str, String)>, SessionStoreError> {
     if content.is_empty() {
-        return Ok(vec![(UnitKind::Assistant, "assistant", "null".to_string())]);
+        return Ok(vec![(
+            UnitKind::Assistant,
+            "assistant",
+            "model",
+            "null".to_string(),
+        )]);
     }
     content
         .iter()
@@ -212,11 +295,13 @@ fn assistant_blocks(
             Content::ToolCall(call) => Ok((
                 UnitKind::ToolCall,
                 "assistant",
+                "model",
                 serde_json::to_string(call).map_err(SessionStoreError::Serialization)?,
             )),
             Content::Text(_) | Content::Reasoning(_) => Ok((
                 UnitKind::Assistant,
                 "assistant",
+                "model",
                 serde_json::to_string(block).map_err(SessionStoreError::Serialization)?,
             )),
             // `Content` is `#[non_exhaustive]`; a new block kind must be
@@ -262,6 +347,11 @@ fn assemble_group(group: &[&StoredUnit]) -> Result<MessageEntry, SessionStoreErr
             sections: decode(&first.payload_json)?,
         },
         UnitKind::Prompt => Message::User {
+            content: decode(&first.payload_json)?,
+        },
+        // A steering unit replays as a user turn: the model treats it like
+        // any other instruction; the ledger keeps the injection point visible.
+        UnitKind::Steering => Message::User {
             content: decode(&first.payload_json)?,
         },
         UnitKind::ToolResult => {

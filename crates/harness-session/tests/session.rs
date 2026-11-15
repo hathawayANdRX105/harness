@@ -16,7 +16,7 @@ use std::ops::Deref;
 use harness_core::event::{RunEvent, RunEventKind};
 use harness_core::message::{Content, Message};
 use harness_core::run::{RunId, RunStopReason, SessionId};
-use harness_session::store::replay_messages;
+use harness_session::store::{RewindBoundary, replay_messages};
 use harness_session::{
     MessageEntry, RecallStore, SessionStoreError, Unit, UnitKind, graph::GraphIndex,
     recall::RecallScope, store::SessionStore, turso::TursoSessionStore,
@@ -780,6 +780,12 @@ fn unit(session: &SessionId, order: u64, message_seq: u64, parent: Option<&str>)
         message_seq,
         role: "user".into(),
         kind: UnitKind::Prompt,
+        run_id: None,
+        turn_id: None,
+        source_kind: "user".into(),
+        tool_call_id: None,
+        idempotency_key: Some(format!("{event_id}:key")),
+        integrity_hash: format!("{event_id}:hash"),
         parent_event_id: parent.map(str::to_string),
         created_at_ms: 0,
     }
@@ -1303,4 +1309,322 @@ async fn latest_event_for_run_returns_tail() -> Result<(), SessionStoreError> {
         "an unknown run has no tail"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Provenance columns (PR-1: turn/run source, idempotency key, integrity hash)
+// ---------------------------------------------------------------------------
+
+/// Purpose: run-tagged appends record provenance on every unit row.
+/// Scenario: one user message and one assistant message with a tool call,
+/// appended through `append_message_for_run` with a run id.
+/// Acceptance: every unit carries the run id, a `source_kind` matching its
+/// role family, the tool call's id, a run-scoped idempotency key, and a
+/// sha256-length integrity hash; `load_messages` still assembles the round
+/// trip.
+#[tokio::test]
+async fn run_tagged_appends_record_provenance() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    let rid = make_run_id();
+    store.create_session(&sid).await?;
+
+    let assistant = Message::Assistant {
+        content: vec![
+            Content::Text("thinking".into()),
+            Content::ToolCall(crate_style_tool_call("call-1")),
+        ],
+    };
+    store
+        .append_message_for_run(&sid, Some(&rid), None, &user_msg("tagged"))
+        .await?;
+    store
+        .append_message_for_run(&sid, Some(&rid), None, &assistant)
+        .await?;
+
+    let units = store.load_units(&sid).await?;
+    assert_eq!(units.len(), 3, "user + text + tool call = three units");
+    for stored in &units {
+        assert_eq!(
+            stored.unit.run_id.as_deref(),
+            Some(rid.0.as_str()),
+            "unit {} carries the run id",
+            stored.unit.event_id
+        );
+        assert!(
+            stored.unit.idempotency_key.is_some(),
+            "run-tagged units carry an idempotency key"
+        );
+        assert_eq!(
+            stored.unit.integrity_hash.len(),
+            64,
+            "integrity hash is sha256 hex"
+        );
+    }
+    assert_eq!(units[0].unit.source_kind, "user");
+    assert_eq!(units[1].unit.source_kind, "model");
+    assert_eq!(units[2].unit.source_kind, "model");
+    assert_eq!(
+        units[2].unit.tool_call_id.as_deref(),
+        Some("call-1"),
+        "the tool call unit records its call id"
+    );
+
+    let entries = store.load_messages(&sid).await?;
+    assert_eq!(entries.len(), 2, "both messages reassemble");
+    Ok(())
+}
+
+/// Purpose: steering appends are recorded with their own unit kind.
+/// Scenario: one run-tagged steering message, then a replay.
+/// Acceptance: the stored unit has `kind = steering` with `source_kind =
+/// user`; replay surfaces it as a user turn so the model treats it like any
+/// instruction.
+#[tokio::test]
+async fn steering_appends_record_kind_and_replay_as_user() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    let rid = make_run_id();
+    store.create_session(&sid).await?;
+    store
+        .append_message_for_run(&sid, Some(&rid), None, &user_msg("task"))
+        .await?;
+    store
+        .append_steering_message(&sid, Some(&rid), &user_msg("steer: stop"))
+        .await?;
+
+    let units = store.load_units(&sid).await?;
+    assert_eq!(units.len(), 2);
+    assert_eq!(units[1].unit.kind, UnitKind::Steering);
+    assert_eq!(units[1].unit.source_kind, "user");
+    assert_eq!(
+        units[1].unit.run_id.as_deref(),
+        Some(rid.0.as_str()),
+        "steering carries the run id too"
+    );
+
+    let replay = store.replay_ledger(&sid).await?;
+    assert_eq!(replay.len(), 2, "steering replays as a user turn");
+    assert_eq!(replay[1], user_msg("steer: stop"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// History rewind (PR-2: markers, retained-prefix replay, clear)
+// ---------------------------------------------------------------------------
+
+/// Purpose: rewinding to a unit keeps only the retained prefix in replay.
+/// Scenario: three user messages; rewind to the second message's unit.
+/// Acceptance: the epoch advances, a marker with the cutoff is recorded, the
+/// head points at the cutoff unit, and replay yields exactly messages one and
+/// two.
+#[tokio::test]
+async fn rewind_to_unit_keeps_retained_prefix() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    for label in ["one", "two", "three"] {
+        store.append_message(&sid, &user_msg(label)).await?;
+    }
+    let units = store.load_units(&sid).await?;
+    let cutoff = units[1].unit.event_id.clone();
+
+    let new_epoch = store
+        .rewind_to_unit(&sid, &cutoff, RewindBoundary::Clean)
+        .await?;
+    assert_eq!(new_epoch, 2, "rewind opens epoch 2");
+
+    let head = store.load_head(&sid).await?;
+    assert_eq!(head.epoch, 2);
+    assert_eq!(
+        head.head_event_id.as_deref(),
+        Some(cutoff.as_str()),
+        "the head continues from the cutoff unit"
+    );
+
+    let replay = store.replay_ledger(&sid).await?;
+    assert_eq!(
+        replay,
+        vec![user_msg("one"), user_msg("two")],
+        "replay keeps the retained prefix only"
+    );
+
+    let markers = store.history_markers(&sid).await?;
+    assert_eq!(markers.len(), 1, "one marker recorded");
+    assert_eq!(markers[0].from_epoch, 1);
+    assert_eq!(markers[0].to_epoch, 2);
+    assert_eq!(markers[0].cutoff_event_id.as_deref(), Some(cutoff.as_str()));
+    assert_eq!(markers[0].boundary, RewindBoundary::Clean);
+    Ok(())
+}
+
+/// Purpose: appends after a rewind continue from the cutoff.
+/// Scenario: rewind to the second message, then append a new message.
+/// Acceptance: the new unit lands in the new epoch, chains from the cutoff
+/// unit, its message sequence continues the old numbering, and replay shows
+/// old prefix + new message.
+#[tokio::test]
+async fn append_after_rewind_chains_from_cutoff() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    for label in ["one", "two", "three"] {
+        store.append_message(&sid, &user_msg(label)).await?;
+    }
+    let cutoff = store.load_units(&sid).await?[1].unit.event_id.clone();
+    store
+        .rewind_to_unit(&sid, &cutoff, RewindBoundary::Clean)
+        .await?;
+
+    store.append_message(&sid, &user_msg("fresh")).await?;
+    let units = store.load_units(&sid).await?;
+    let fresh = units
+        .iter()
+        .find(|stored| stored.unit.epoch == 2)
+        .ok_or_else(|| SessionStoreError::Internal("new message not in epoch 2".into()))?;
+    assert_eq!(
+        fresh.unit.parent_event_id.as_deref(),
+        Some(cutoff.as_str()),
+        "the new unit chains from the cutoff"
+    );
+    assert_eq!(
+        fresh.unit.message_seq, 3,
+        "message numbering continues from the cutoff"
+    );
+
+    let replay = store.replay_ledger(&sid).await?;
+    assert_eq!(
+        replay,
+        vec![user_msg("one"), user_msg("two"), user_msg("fresh")],
+        "replay is retained prefix plus the new turn"
+    );
+    Ok(())
+}
+
+/// Purpose: rewinding to the current head is a no-op.
+/// Scenario: rewind to the head unit of a two-message session.
+/// Acceptance: the epoch does not move and no marker is written.
+#[tokio::test]
+async fn rewind_to_head_is_a_noop() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    store.append_message(&sid, &user_msg("one")).await?;
+    store.append_message(&sid, &user_msg("two")).await?;
+    let head_unit = store
+        .load_head(&sid)
+        .await?
+        .head_event_id
+        .ok_or_else(|| SessionStoreError::Internal("head has no unit".into()))?;
+
+    let epoch = store
+        .rewind_to_unit(&sid, &head_unit, RewindBoundary::Clean)
+        .await?;
+    assert_eq!(epoch, 1, "no rewind happened");
+    assert!(
+        store.history_markers(&sid).await?.is_empty(),
+        "a no-op writes no marker"
+    );
+    Ok(())
+}
+
+/// Purpose: rewinding outside the head scope is rejected.
+/// Scenario: rewind to a unit of a different session.
+/// Acceptance: the call errors and no marker is written.
+#[tokio::test]
+async fn rewind_rejects_foreign_units() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    store.append_message(&sid, &user_msg("one")).await?;
+
+    let other = SessionId("elsewhere".into());
+    let mut foreign = unit(&other, 1, 1, None);
+    foreign.event_id = "elsewhere:main:1:1".into();
+    let result = store
+        .rewind_to_unit(&sid, &foreign.event_id, RewindBoundary::Clean)
+        .await;
+    assert!(
+        result.is_err(),
+        "a unit outside the session cannot be a cutoff"
+    );
+    assert!(store.history_markers(&sid).await?.is_empty());
+    Ok(())
+}
+
+/// Purpose: clear empties replay but keeps stored units for audit.
+/// Scenario: two messages, rewind_clear, then inspect replay and the ledger.
+/// Acceptance: replay is empty, a ClearEmpty marker exists, the old units
+/// remain stored, and a fresh append starts a parentless chain whose replay
+/// contains only the new message.
+#[tokio::test]
+async fn rewind_clear_empties_replay_keeps_audit() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    store.append_message(&sid, &user_msg("one")).await?;
+    store.append_message(&sid, &user_msg("two")).await?;
+
+    let epoch = store.rewind_clear(&sid).await?;
+    assert_eq!(epoch, 2);
+
+    let replay = store.replay_ledger(&sid).await?;
+    assert!(replay.is_empty(), "clear yields an empty transcript");
+
+    let markers = store.history_markers(&sid).await?;
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].boundary, RewindBoundary::ClearEmpty);
+    assert_eq!(markers[0].cutoff_event_id, None);
+
+    let units = store.load_units(&sid).await?;
+    assert_eq!(units.len(), 2, "old units stay stored for audit");
+
+    store.append_message(&sid, &user_msg("after clear")).await?;
+    let units = store.load_units(&sid).await?;
+    let fresh = units
+        .iter()
+        .find(|stored| stored.unit.epoch == 2)
+        .ok_or_else(|| SessionStoreError::Internal("post-clear append not in epoch 2".into()))?;
+    assert!(
+        fresh.unit.parent_event_id.is_none(),
+        "a cleared epoch starts a parentless chain"
+    );
+    let replay = store.replay_ledger(&sid).await?;
+    assert_eq!(
+        replay,
+        vec![user_msg("after clear")],
+        "replay shows only the post-clear turn"
+    );
+    Ok(())
+}
+
+/// Purpose: delete_session removes markers with the rest of the session.
+/// Scenario: rewind, then delete the session.
+/// Acceptance: markers are gone and a fresh session with the same id can be
+/// created.
+#[tokio::test]
+async fn delete_session_removes_markers() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    store.append_message(&sid, &user_msg("one")).await?;
+    store.rewind_clear(&sid).await?;
+    assert_eq!(store.history_markers(&sid).await?.len(), 1);
+
+    store.delete_session(&sid).await?;
+    assert!(
+        store.history_markers(&sid).await?.is_empty(),
+        "markers die with the session"
+    );
+    store.create_session(&sid).await?;
+    Ok(())
+}
+
+/// A minimal tool call for provenance assertions.
+fn crate_style_tool_call(id: &str) -> harness_core::message::ToolCall {
+    harness_core::message::ToolCall {
+        id: id.to_string(),
+        name: "read".into(),
+        args: serde_json::json!({"path": "/tmp/x"}),
+    }
 }

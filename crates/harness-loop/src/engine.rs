@@ -136,7 +136,7 @@ async fn turn_boundary(
                 message: msg.clone(),
             },
         );
-        transcript::push(
+        transcript::push_steering(
             transcript,
             deps.transcript_sink.as_deref(),
             &ctx.session_id,
