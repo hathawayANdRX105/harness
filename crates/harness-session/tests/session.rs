@@ -7,8 +7,8 @@
 //! each test in its own process, so serialization is unnecessary.
 //!
 //! The graph index (`GraphIndex`) is covered alongside the store: rebuilt
-//! from the ledger must equal incremental appends, and `chain_from` covers
-//! prompt/response pairs.
+//! from the ledger must equal incremental appends, ancestors cover the unit
+//! chain, and the graph replay path matches direct message assembly.
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -18,8 +18,8 @@ use harness_core::message::{Content, Message};
 use harness_core::run::{RunId, RunStopReason, SessionId};
 use harness_session::store::replay_messages;
 use harness_session::{
-    MessageEntry, RecallStore, SessionStoreError, graph::GraphIndex, recall::RecallScope,
-    store::SessionStore, turso::TursoSessionStore,
+    MessageEntry, RecallStore, SessionStoreError, Unit, UnitKind, graph::GraphIndex,
+    recall::RecallScope, store::SessionStore, turso::TursoSessionStore,
 };
 
 /// A test store backed by a private temp database file. The `_dir` guard
@@ -90,19 +90,6 @@ fn run_finished_event(run_id: &RunId, session_id: &SessionId, seq: u64) -> RunEv
         timestamp_ms: 1_700_000_000_001,
         kind: RunEventKind::RunFinished {
             reason: RunStopReason::Completed,
-        },
-    }
-}
-
-/// A `TextDelta` event (assistant content) for graph unit tests.
-fn text_delta_event(run_id: &RunId, session_id: &SessionId, seq: u64, text: &str) -> RunEvent {
-    RunEvent {
-        run_id: run_id.clone(),
-        session_id: session_id.clone(),
-        seq,
-        timestamp_ms: 1_700_000_000_000 + seq as i64,
-        kind: RunEventKind::TextDelta {
-            text: text.to_string(),
         },
     }
 }
@@ -778,133 +765,140 @@ async fn persistence_through_file_reopen() -> Result<(), SessionStoreError> {
 }
 
 // ---------------------------------------------------------------------------
-// Graph index
+// Unit graph
 // ---------------------------------------------------------------------------
 
-/// Purpose: rebuilding the graph from the ledger equals incremental appends.
-/// Scenario: append several events for one run, rebuild `GraphIndex` from
-/// `events_for_run`, then compare `units_for_run` against units added one at
-/// a time via `append_event`.
-/// Acceptance: both graphs report the same units in the same seq order for
-/// the run.
-#[tokio::test]
-async fn graph_rebuild_equals_incremental_appends() -> Result<(), SessionStoreError> {
-    let store = test_store().await;
-    let sid = make_session_id();
-    let rid = make_run_id();
-    store.create_session(&sid).await?;
-
-    store
-        .append_event(&run_started_event(&rid, &sid, 1))
-        .await?;
-    store
-        .append_event(&text_delta_event(&rid, &sid, 2, "prompt"))
-        .await?;
-    store
-        .append_event(&text_delta_event(&rid, &sid, 3, "response"))
-        .await?;
-
-    let events = store.events_for_run(&rid).await?;
-
-    // Rebuilt graph.
-    let rebuilt = GraphIndex::new();
-    rebuilt.rebuild_from_ledger(&events);
-
-    // Incremental graph.
-    let incremental = GraphIndex::new();
-    for event in &events {
-        incremental.append_event(event);
+/// Build one unit of `session` at `order`, parented to `parent`.
+fn unit(session: &SessionId, order: u64, message_seq: u64, parent: Option<&str>) -> Unit {
+    let event_id = format!("{}:main:1:{order}", session.0);
+    Unit {
+        event_id: event_id.clone(),
+        session_id: session.clone(),
+        branch_id: "main".into(),
+        epoch: 1,
+        event_order: order,
+        message_seq,
+        role: "user".into(),
+        kind: UnitKind::Prompt,
+        parent_event_id: parent.map(str::to_string),
+        created_at_ms: 0,
     }
-
-    let rebuilt_units = rebuilt.units_for_run(&rid);
-    let incremental_units = incremental.units_for_run(&rid);
-    assert_eq!(
-        rebuilt_units, incremental_units,
-        "rebuilt graph must equal incremental appends"
-    );
-    assert_eq!(rebuilt_units.len(), 3, "run has three units");
-
-    Ok(())
 }
 
-/// Purpose: `chain_from` covers prompt/response pairs in seq order.
-/// Scenario: append a run-start, a prompt delta, and a response delta;
-/// `chain_from(run, run_start_seq)` returns the run start, then the prompt,
-/// then the response, in seq order.
-/// Acceptance: the chain's units are exactly run-start → prompt → response,
-/// with roles `system`, `assistant`, `assistant`.
+/// Purpose: rebuilding the graph from the ledger equals incremental appends.
+/// Scenario: three chained units, rebuilt in one pass vs appended one by one.
+/// Acceptance: both graphs report the same units in the same order and the
+/// same root→head ancestor chain.
 #[tokio::test]
-async fn graph_chain_covers_prompt_response_pairs() -> Result<(), SessionStoreError> {
-    let store = test_store().await;
-    let sid = make_session_id();
-    let rid = make_run_id();
-    store.create_session(&sid).await?;
+async fn graph_rebuild_equals_incremental_appends() {
+    let session = SessionId("graph".into());
+    let first = unit(&session, 1, 1, None);
+    let second = unit(&session, 2, 2, Some(&first.event_id));
+    let third = unit(&session, 3, 3, Some(&second.event_id));
+    let units = vec![first.clone(), second.clone(), third.clone()];
 
-    store
-        .append_event(&run_started_event(&rid, &sid, 1))
-        .await?;
-    store
-        .append_event(&text_delta_event(&rid, &sid, 2, "prompt"))
-        .await?;
-    store
-        .append_event(&text_delta_event(&rid, &sid, 3, "response"))
-        .await?;
+    let rebuilt = GraphIndex::new();
+    rebuilt.rebuild(&units);
 
-    let graph = GraphIndex::new();
-    let events = store.events_for_run(&rid).await?;
-    graph.rebuild_from_ledger(&events);
+    let incremental = GraphIndex::new();
+    incremental.rebuild(&[first]);
+    incremental.append(&[second, third], &units[2].event_id);
 
-    let chain = graph.chain_from(&rid, 1);
     assert_eq!(
-        chain.len(),
-        3,
-        "chain from run start covers start + prompt + response"
+        rebuilt.units_for_session(&session),
+        incremental.units_for_session(&session),
+        "rebuild and incremental appends must agree"
     );
-    assert_eq!(chain[0].seq, 1, "chain starts at the run-start seq");
-    assert_eq!(chain[0].role, "system", "run-start unit is system");
-    assert_eq!(chain[1].seq, 2, "chain continues to the prompt");
-    assert_eq!(chain[1].role, "assistant", "prompt delta is assistant");
-    assert_eq!(chain[2].seq, 3, "chain ends at the response");
-    assert_eq!(chain[2].role, "assistant", "response delta is assistant");
-
-    // A seq with no unit yields an empty chain, not a panic.
-    let empty = graph.chain_from(&rid, 99);
-    assert!(empty.is_empty(), "unknown seq → empty chain");
-
-    Ok(())
+    assert_eq!(
+        rebuilt.ancestors(&units[2].event_id),
+        vec![
+            units[0].event_id.clone(),
+            units[1].event_id.clone(),
+            units[2].event_id.clone()
+        ],
+        "the ancestor chain runs root -> head"
+    );
+    assert!(
+        rebuilt.ancestors("missing-unit").is_empty(),
+        "an unknown unit has no chain"
+    );
 }
 
-/// Purpose: units of different runs are isolated in the graph.
-/// Scenario: append events for two runs; `units_for_run` for one run never
-/// includes the other's units.
-/// Acceptance: each run reports only its own units.
+/// Purpose: units of different sessions are isolated in the graph.
+/// Scenario: two sessions, each with its own chain.
+/// Acceptance: each session reports only its own units.
 #[tokio::test]
-async fn graph_units_isolated_per_run() -> Result<(), SessionStoreError> {
-    let store = test_store().await;
-    let sid = make_session_id();
-    let rid_a = RunId("run-a".into());
-    let rid_b = RunId("run-b".into());
-    store.create_session(&sid).await?;
-
-    store
-        .append_event(&text_delta_event(&rid_a, &sid, 1, "a-one"))
-        .await?;
-    store
-        .append_event(&text_delta_event(&rid_a, &sid, 2, "a-two"))
-        .await?;
-    store
-        .append_event(&text_delta_event(&rid_b, &sid, 1, "b-one"))
-        .await?;
+async fn graph_units_isolated_per_session() {
+    let a = SessionId("graph-a".into());
+    let b = SessionId("graph-b".into());
+    let a1 = unit(&a, 1, 1, None);
+    let a2 = unit(&a, 2, 2, Some(&a1.event_id));
+    let b1 = unit(&b, 1, 1, None);
 
     let graph = GraphIndex::new();
-    let events = store.events_for_run(&rid_a).await?;
-    graph.rebuild_from_ledger(&events);
+    graph.rebuild(&[a1, a2, b1]);
 
-    let units_a = graph.units_for_run(&rid_a);
-    let units_b = graph.units_for_run(&rid_b);
-    assert_eq!(units_a.len(), 2, "run-a has two units");
-    assert_eq!(units_b.len(), 0, "run-b has no units (not yet indexed)");
+    assert_eq!(graph.units_for_session(&a).len(), 2, "session a keeps two");
+    assert_eq!(graph.units_for_session(&b).len(), 1, "session b keeps one");
+}
 
+/// Purpose: the ledger splits an assistant message into blocks and reassembles
+/// them in order, so the graph's unit granularity does not change the model
+/// transcript.
+/// Scenario: append a user prompt, an assistant message carrying text plus a
+/// tool call, and a tool result; load and replay.
+/// Acceptance: `load_messages` returns three messages with the assistant's two
+/// blocks in declaration order, and `replay_ledger` (graph path) equals
+/// `replay_messages(load_messages)`.
+#[tokio::test]
+async fn unit_blocks_reassemble_and_graph_replay_matches() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+
+    store.append_message(&sid, &user_msg("question")).await?;
+    store
+        .append_message(
+            &sid,
+            &Message::Assistant {
+                content: vec![
+                    Content::Text("looking".into()),
+                    Content::ToolCall(harness_core::message::ToolCall {
+                        id: "call-1".into(),
+                        name: "grep".into(),
+                        args: serde_json::json!({"q": "x"}),
+                    }),
+                ],
+            },
+        )
+        .await?;
+    store
+        .append_message(
+            &sid,
+            &Message::ToolResult(harness_core::message::ToolResultMessage {
+                tool_call_id: "call-1".into(),
+                tool_name: "grep".into(),
+                content: "found".into(),
+                is_error: false,
+            }),
+        )
+        .await?;
+
+    let entries = store.load_messages(&sid).await?;
+    assert_eq!(entries.len(), 3, "three messages");
+    let Message::Assistant { content } = &entries[1].message else {
+        panic!("second message must be the assistant reply");
+    };
+    assert_eq!(content.len(), 2, "text plus tool call");
+    assert!(matches!(content[0], Content::Text(_)), "text first");
+    assert!(matches!(content[1], Content::ToolCall(_)), "call second");
+
+    let replayed = store.replay_ledger(&sid).await?;
+    assert_eq!(
+        replayed,
+        replay_messages(&entries),
+        "the graph replay path must match the direct assembly"
+    );
     Ok(())
 }
 
@@ -1083,4 +1077,230 @@ async fn recall_search_sql_round_trip() {
         hits.iter().all(|hit| hit.score.is_finite()),
         "scores must be finite"
     );
+}
+
+/// Purpose: the search query is bound, not interpolated, so quotes and
+/// injection-shaped input cannot break or reshape the statement.
+/// Scenario: search for an apostrophe-containing term and for a string that
+/// would close the literal and add `OR 1=1`.
+/// Acceptance: the quoted search succeeds without a storage error; the
+/// injection-shaped search returns no hits instead of every event.
+#[tokio::test]
+async fn recall_search_binds_quotes_and_injection_shaped_input()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = recall_fixture().await;
+    let recall = store.recall();
+
+    let quoted = recall.search("it's", &RecallScope::all(10)).await?;
+    assert!(quoted.is_empty(), "no event contains the quoted term");
+
+    let injected = recall
+        .search("zzz') OR 1=1 OR ('z'=", &RecallScope::all(10))
+        .await;
+    match injected {
+        Ok(hits) => assert!(
+            hits.is_empty(),
+            "injection-shaped input must not return every row: {hits:?}"
+        ),
+        Err(error) => assert!(
+            matches!(error, SessionStoreError::Storage(_)),
+            "the FTS parser may reject the expression, but not as a successful match: {error}"
+        ),
+    }
+    Ok(())
+}
+
+/// Purpose: an oversized query is rejected before it reaches the FTS engine.
+/// Scenario: 17 KiB of text against the 16 KiB cap.
+/// Acceptance: `InvalidQuery`, and the search does not hit the database.
+#[tokio::test]
+async fn recall_search_rejects_oversized_queries() -> Result<(), Box<dyn std::error::Error>> {
+    let store = recall_fixture().await;
+    let recall = store.recall();
+    let query = "x".repeat(17 * 1024);
+    let result = recall.search(&query, &RecallScope::all(10)).await;
+    assert!(
+        matches!(result, Err(SessionStoreError::InvalidQuery(_))),
+        "oversized queries must be rejected: {result:?}"
+    );
+    Ok(())
+}
+
+/// Purpose: a corrupt parent cycle cannot hang the ancestor walk.
+/// Scenario: two units point at each other as parents.
+/// Acceptance: `ancestors` returns an empty chain instead of looping.
+#[tokio::test]
+async fn graph_ancestors_bounded_on_cycle() {
+    let session = SessionId("cycle".into());
+    let mut first = unit(&session, 1, 1, Some("cycle:main:1:2"));
+    let second = unit(&session, 2, 2, Some("cycle:main:1:1"));
+    first.parent_event_id = Some(second.event_id.clone());
+    let graph = GraphIndex::new();
+    graph.rebuild(&[first.clone(), second]);
+    assert!(
+        graph.ancestors(&first.event_id).is_empty(),
+        "a cycle yields no provable chain"
+    );
+}
+
+/// Purpose: an assistant message with no content blocks still occupies one
+/// message sequence and survives the unit split/assemble round trip.
+/// Scenario: user prompt, empty assistant, user prompt.
+/// Acceptance: three entries with seq 1,2,3; the empty assistant is present
+/// with an empty content vector.
+#[tokio::test]
+async fn assistant_empty_content_round_trip() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+
+    store.append_message(&sid, &user_msg("one")).await?;
+    store
+        .append_message(
+            &sid,
+            &Message::Assistant {
+                content: Vec::new(),
+            },
+        )
+        .await?;
+    store.append_message(&sid, &user_msg("two")).await?;
+
+    let entries = store.load_messages(&sid).await?;
+    let seqs: Vec<u64> = entries.iter().map(|entry| entry.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3], "the empty assistant keeps its slot");
+    let Message::Assistant { content } = &entries[1].message else {
+        panic!("second entry must be the assistant message");
+    };
+    assert!(content.is_empty(), "no blocks were invented");
+    Ok(())
+}
+
+/// Purpose: multiple tool calls in one assistant message stay one message and
+/// keep their declaration order after the unit round trip.
+/// Scenario: assistant with two ToolCall blocks and no text.
+/// Acceptance: one assistant entry whose content is two ToolCalls in order.
+#[tokio::test]
+async fn assistant_multiple_tool_calls_reassemble() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    let call = |id: &str, name: &str| harness_core::message::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        args: serde_json::json!({}),
+    };
+    store
+        .append_message(
+            &sid,
+            &Message::Assistant {
+                content: vec![
+                    Content::ToolCall(call("c1", "read")),
+                    Content::ToolCall(call("c2", "grep")),
+                ],
+            },
+        )
+        .await?;
+
+    let entries = store.load_messages(&sid).await?;
+    assert_eq!(entries.len(), 1, "one message, two units");
+    let Message::Assistant { content } = &entries[0].message else {
+        panic!("expected an assistant message");
+    };
+    assert_eq!(content.len(), 2, "both calls survive");
+    assert!(matches!(&content[0], Content::ToolCall(c) if c.id == "c1"));
+    assert!(matches!(&content[1], Content::ToolCall(c) if c.id == "c2"));
+    Ok(())
+}
+
+/// Purpose: replay after closing and reopening the store returns the same
+/// transcript (the graph is rebuilt from the ledger, not cached across).
+/// Scenario: append user/assistant messages, drop the store, reopen the same
+/// database file, replay.
+/// Acceptance: the replay equals the pre-restart replay.
+#[tokio::test]
+async fn replay_survives_store_reopen() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("sessions.db");
+    let sid = make_session_id();
+    let before = {
+        let store = TursoSessionStore::open(&path).await?;
+        store.create_session(&sid).await?;
+        store.append_message(&sid, &user_msg("remember me")).await?;
+        store
+            .append_message(
+                &sid,
+                &Message::Assistant {
+                    content: vec![Content::Text("noted".into())],
+                },
+            )
+            .await?;
+        store.replay_ledger(&sid).await?
+    };
+    let store = TursoSessionStore::open(&path).await?;
+    let after = store.replay_ledger(&sid).await?;
+    assert_eq!(before, after, "replay is rebuilt from the ledger");
+    assert_eq!(after.len(), 2, "both messages survived the reopen");
+    Ok(())
+}
+
+/// Purpose: a system section removed and later re-added replays with the final
+/// value, matching the prompt-ledger contract.
+/// Scenario: role=coder, role=None, role=coder again, then a user turn.
+/// Acceptance: the replay starts with role=coder and keeps the user message.
+#[tokio::test]
+async fn replay_system_section_readded() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    store
+        .append_message(&sid, &system_msg("role", Some("coder")))
+        .await?;
+    store
+        .append_message(&sid, &system_msg("role", None))
+        .await?;
+    store
+        .append_message(&sid, &system_msg("role", Some("coder")))
+        .await?;
+    store.append_message(&sid, &user_msg("hello")).await?;
+
+    let replay = store.replay_ledger(&sid).await?;
+    let Message::System { sections } = &replay[0] else {
+        panic!("replay must lead with the accumulated system ledger");
+    };
+    assert_eq!(
+        sections.get("role").map(|value| value.as_deref()),
+        Some(Some("coder")),
+        "the re-added section wins"
+    );
+    assert_eq!(replay.len(), 2, "system ledger plus the user turn");
+    Ok(())
+}
+
+/// Purpose: `latest_event_for_run` point-reads the tail of a run.
+/// Scenario: two events appended to one run.
+/// Acceptance: the method returns the higher-seq event, and `None` for an
+/// unknown run.
+#[tokio::test]
+async fn latest_event_for_run_returns_tail() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    let rid = make_run_id();
+    store.create_session(&sid).await?;
+    store
+        .append_event(&run_started_event(&rid, &sid, 1))
+        .await?;
+    store
+        .append_event(&run_finished_event(&rid, &sid, 2))
+        .await?;
+
+    let latest = store.latest_event_for_run(&rid).await?;
+    assert_eq!(latest.map(|event| event.seq), Some(2), "tail is seq 2");
+    assert!(
+        store
+            .latest_event_for_run(&RunId("missing".into()))
+            .await?
+            .is_none(),
+        "an unknown run has no tail"
+    );
+    Ok(())
 }

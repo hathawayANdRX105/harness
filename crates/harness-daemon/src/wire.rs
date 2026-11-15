@@ -45,6 +45,27 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Drive one store future from the sync [`CommandHandler`] seam.
+///
+/// The handler is sync but the store is async. `block_in_place` is only legal
+/// on a multi-thread Tokio runtime; a current-thread runtime gets a typed
+/// error instead of a panic, and a missing runtime is equally explicit.
+fn block_on_store<F: std::future::Future>(future: F) -> Result<F::Output, TransportError> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| TransportError::Internal("harness-daemon requires a Tokio runtime".into()))?;
+    if !matches!(
+        handle.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    ) {
+        return Err(TransportError::Internal(
+            "harness-daemon requires a multi-thread Tokio runtime".into(),
+        ));
+    }
+    Ok(tokio::task::block_in_place(|| {
+        futures::executor::block_on(future)
+    }))
+}
+
 /// Unix epoch milliseconds.
 fn unix_millis() -> i64 {
     SystemTime::now()
@@ -222,9 +243,7 @@ impl DaemonHandler {
         // the run's durable anchor across restarts; re-creation is idempotent.
         // The CommandHandler seam is sync, so drive the async store call on
         // the current thread without a tokio reactor (block_in_place).
-        match tokio::task::block_in_place(|| {
-            futures::executor::block_on(self.store.create_session(&session_id))
-        }) {
+        match block_on_store(self.store.create_session(&session_id))? {
             Ok(()) => {}
             Err(SessionStoreError::SessionAlreadyExists(_)) => {}
             Err(e) => {
@@ -237,10 +256,8 @@ impl DaemonHandler {
         // session continues the conversation instead of starting blank. The
         // read is part of the command, so a storage failure fails the request
         // rather than silently dropping history.
-        let seed = tokio::task::block_in_place(|| {
-            futures::executor::block_on(self.store.replay_ledger(&session_id))
-        })
-        .map_err(|e| TransportError::Internal(format!("load session history failed: {e}")))?;
+        let seed = block_on_store(self.store.replay_ledger(&session_id))?
+            .map_err(|e| TransportError::Internal(format!("load session history failed: {e}")))?;
         // The session's active tool subset is borrowed from the catalog
         // before `session_id` is moved into the run context below.
         let active_tools = self.catalog.active(&session_id);
@@ -370,19 +387,15 @@ impl DaemonHandler {
         }
         // Not known to the scheduler (e.g. after a restart): a finished run's
         // events survive in the store, so report its last recorded status.
-        let events = match tokio::task::block_in_place(|| {
-            futures::executor::block_on(self.store.events_for_run(&run_id))
-        }) {
-            Ok(events) => events,
+        // Point-read the tail instead of loading and decoding the whole log.
+        let event = match block_on_store(self.store.latest_event_for_run(&run_id))? {
+            Ok(Some(event)) => event,
+            Ok(None) => return Err(TransportError::NoActiveRun(run_id.0)),
             Err(e) => {
                 return Err(TransportError::Internal(format!(
                     "load run events failed: {e}"
                 )));
             }
-        };
-        let event = match events.last() {
-            Some(event) => event.clone(),
-            None => return Err(TransportError::NoActiveRun(run_id.0)),
         };
         Ok(serde_json::json!({
             "run_id": run_id.0,
@@ -391,7 +404,10 @@ impl DaemonHandler {
     }
 
     fn list(&self) -> serde_json::Value {
-        let runs = lock(&self.runs);
+        // Copy the tracked ids and release the bookkeeping mutex before any
+        // store call: the pump, cancel and shutdown all take the same mutex,
+        // and `/list` must not hold it across blocking I/O.
+        let runs = lock(&self.runs).clone();
         let mut items: Vec<serde_json::Value> = runs
             .iter()
             .filter_map(|id| {
@@ -403,11 +419,12 @@ impl DaemonHandler {
         // Historical runs: runs whose events survived in the store but are no
         // longer tracked in memory (after a restart, for example).  Merge
         // them in so `list` shows past runs across restarts.
-        let historical =
-            tokio::task::block_in_place(|| futures::executor::block_on(self.store.run_ids()))
-                .unwrap_or_default();
+        let historical = match block_on_store(self.store.run_ids()) {
+            Ok(Ok(ids)) => ids,
+            _ => Vec::new(),
+        };
         for id in historical {
-            if runs.iter().any(|active| active == &id) {
+            if runs.contains(&id) {
                 continue;
             }
             items.push(serde_json::json!({
@@ -429,12 +446,10 @@ impl DaemonHandler {
     /// from [`DEFAULT_SEARCH_LIMIT`] so a broad query cannot blow up the
     /// response.
     fn search(&self, query: &str) -> Result<serde_json::Value, TransportError> {
-        let hits = tokio::task::block_in_place(|| {
-            futures::executor::block_on(
-                self.recall
-                    .search(query, &RecallScope::all(DEFAULT_SEARCH_LIMIT)),
-            )
-        })
+        let hits = block_on_store(
+            self.recall
+                .search(query, &RecallScope::all(DEFAULT_SEARCH_LIMIT)),
+        )?
         .map_err(|e| TransportError::Internal(format!("search failed: {e}")))?;
         // WHY: lower fts_score = more relevant, so ascending order puts the
         // best hit first regardless of how the backend ranked the rows.
@@ -563,14 +578,10 @@ async fn persist_event(store: &Arc<dyn SessionStore>, run_id: &RunId, event: &Ru
 /// path, so a run present in the store but no longer scheduled is reported
 /// as finished; an unreachable run is reported as unknown.
 fn historical_status(store: &Arc<dyn SessionStore>, run_id: &RunId) -> String {
-    let event = match tokio::task::block_in_place(|| {
-        futures::executor::block_on(store.events_for_run(run_id))
-    }) {
-        Ok(events) => match events.last() {
-            Some(event) => event.clone(),
-            None => return "finished:unknown".into(),
-        },
-        Err(_) => return "finished:unknown".into(),
+    // A point read of the tail: loading and decoding the whole run just to
+    // keep its last event makes `/list` scale with history, not run count.
+    let Ok(Ok(Some(event))) = block_on_store(store.latest_event_for_run(run_id)) else {
+        return "finished:unknown".into();
     };
     event_status_label(&event.kind)
 }
