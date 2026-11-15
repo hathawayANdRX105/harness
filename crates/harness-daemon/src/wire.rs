@@ -342,8 +342,10 @@ impl DaemonHandler {
     /// Queue a steering message on an active run.
     ///
     /// The loop drains the mailbox at its next turn boundary and replays the
-    /// message as a user turn. Steering a queued, finished, or unknown run is
-    /// rejected: there is no live transcript to read it.
+    /// message as a user turn; a run that has already passed its last
+    /// boundary finishes without reading it (best-effort, like the mailbox
+    /// itself). Steering a queued, finished, or unknown run is rejected:
+    /// there is no live transcript to read it.
     fn steer(&self, run_id: &str, message: String) -> Result<serde_json::Value, TransportError> {
         if !self.scheduler.steer(&RunId(run_id.to_string()), message) {
             return Err(TransportError::NoActiveRun(format!(

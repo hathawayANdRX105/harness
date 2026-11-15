@@ -186,11 +186,13 @@ impl Scheduler {
 
     /// Queue a steering message on an active run.
     ///
-    /// Returns `true` only when a live transcript will read the message: the
-    /// run must own an active slot. A queued run has not started, and a
-    /// finished or unknown run has no mailbox left — both return `false`
-    /// rather than accepting a message nothing will drain. Empty messages are
-    /// rejected here for the same reason [`RunControl::steer`] drops them.
+    /// Returns `true` when the message was queued on an active run. Delivery
+    /// is best-effort: the loop drains the mailbox at its next turn boundary,
+    /// so a run that has already passed its last boundary finishes without
+    /// reading it. A queued run has not started, and a finished or unknown
+    /// run has no mailbox left — both return `false` rather than accepting a
+    /// message nothing will drain. Empty messages are rejected here for the
+    /// same reason [`RunControl::steer`] drops them.
     pub fn steer(&self, run_id: &RunId, message: impl Into<String>) -> bool {
         let text = message.into();
         if text.trim().is_empty() {
