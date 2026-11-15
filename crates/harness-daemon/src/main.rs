@@ -14,9 +14,11 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use harness_builder::{
-    AssembledRuntime, BUILTIN_TOOLS, HarnessBuilder, HarnessSpec, ModelSpec, ToolSpec,
+    AssembledRuntime, BUILTIN_TOOLS, CompactionStageSpec, HarnessBuilder, HarnessSpec, ModelSpec,
+    ToolSpec, compaction_stages_from_spec,
 };
 use harness_config::{Config, SubagentProfile};
+use harness_context::{DefaultCompactor, default_stages};
 use harness_core::model::ModelInfo;
 use harness_core::tool::Tool;
 use harness_core::{EventSink, Model, RunEvent};
@@ -122,8 +124,27 @@ fn build_runtime(
             .as_ref()
             .map(|_| ToolSpec::external("subagent")),
     );
+    // Compaction: the harness-rs five-stage ladder, executed by the structural
+    // DefaultCompactor — local, deterministic edits, never a model call. The
+    // ladder is declared in the spec so the recorded plan and the executing
+    // compactor stay in sync; without declared stages the builder drops the
+    // plan and the loop never compacts.
+    let ladder = default_stages();
+    spec.compaction.stages = ladder
+        .iter()
+        .map(|stage| CompactionStageSpec {
+            threshold: stage.threshold,
+            target_ratio: stage.target_ratio,
+            label: stage.label.clone(),
+        })
+        .collect();
     let cwd =
         std::env::current_dir().context("resolving the current directory for tool execution")?;
+    // The executing compactor is built from the same ladder the spec
+    // records, so the plan and the runtime agree on the stages.
+    let compactor = Arc::new(DefaultCompactor::with_stages(compaction_stages_from_spec(
+        &spec.compaction,
+    )));
     let mut builder = HarnessBuilder::new(spec)
         .with_model(Arc::clone(&model))
         .with_policy(Arc::new(harness_daemon::wire::DaemonPolicy))
@@ -135,6 +156,7 @@ fn build_runtime(
     if let Some(tool) = subagent_tool {
         builder = builder.with_tool(tool);
     }
+    builder = builder.with_compactor(compactor);
     builder.build().context("assembling the runtime")
 }
 
