@@ -38,6 +38,7 @@
 //! - The slash command vocabulary is modelled on nanoharness's CLI
 //!   (`core/cli.py`) and pi's run-control interface.
 
+pub mod cors;
 pub mod frame;
 pub mod http;
 pub mod slash;
