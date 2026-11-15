@@ -17,7 +17,7 @@
   <rect width="1440" height="1180" fill="#f8fafc" rx="18"/>
 
   <text x="720" y="34" text-anchor="middle" font-size="21" font-weight="700" fill="#0f172a">Harness Daemon 运行时现状（2026-11-15 审计）</text>
-  <text x="720" y="56" text-anchor="middle" font-size="12.5" fill="#64748b">绿 = 已接线并可用 · 灰 = 库能力存在但运行时未接线 · 红 = 审计缺陷 D#（详见 docs/daemon-runtime-wiring-audit.md）</text>
+  <text x="720" y="56" text-anchor="middle" font-size="12.5" fill="#64748b">绿 = 已接线并可用 · 灰 = 库能力存在但运行时未接线 · 红 = 审计缺陷 D#（2026-11-15：D2–D7 已关闭）</text>
 
   <!-- ============ 装配层 ============ -->
   <rect x="40" y="80" width="1360" height="150" rx="14" fill="#faf5ff" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6 4"/>
@@ -42,7 +42,7 @@
   <text x="1105" y="166" text-anchor="middle" font-size="10.5" fill="#475569">JSON-RPC / stdio / HTTP</text>
 
   <text x="580" y="204" text-anchor="middle" font-size="10.5" fill="#475569">daemon spec = 模型 aliases + 7 个内建工具 + 可选 subagent</text>
-  <text x="1080" y="204" text-anchor="middle" font-size="10.5" font-weight="600" fill="#dc2626">prompt sections / skills / MCP servers 未声明 → ⛔ D2</text>
+  <text x="1080" y="204" text-anchor="middle" font-size="10.5" font-weight="600" fill="#15803d">prompt sections / skills / MCP servers ← config ✅</text>
 
   <!-- ============ 传输层 ============ -->
   <rect x="40" y="250" width="1360" height="110" rx="14" fill="#f0f9ff" stroke="#0284c7" stroke-width="1.5" stroke-dasharray="6 4"/>
@@ -96,8 +96,8 @@
   <line x1="800" y1="468" x2="800" y2="476" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
   <rect x="700" y="478" width="200" height="28" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
   <text x="800" y="496" text-anchor="middle" font-size="10" font-weight="600" fill="#166534">policy → approval → 工具</text>
-  <text x="560" y="536" font-size="10.5" fill="#dc2626">· 起始 transcript 为空 → ⛔ D4 历史不重放</text>
-  <text x="560" y="556" font-size="10.5" fill="#dc2626">· steering 邮箱已实现；daemon 未接 ⛔ D6</text>
+  <text x="560" y="536" font-size="10.5" fill="#15803d">· 起始 transcript = 图重放 ✅（跨 run 连续）</text>
+  <text x="560" y="556" font-size="10.5" fill="#15803d">· steering 已接线 ✅（/steer → 下一 turn 边界）</text>
   <text x="560" y="576" font-size="10.5" fill="#475569">· RunEvent seq 单调（发射侧赋值）</text>
   <rect x="560" y="592" width="340" height="52" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-dasharray="5 3"/>
   <text x="730" y="612" text-anchor="middle" font-size="10" font-weight="600" fill="#64748b">budget gate：需要 Compactor</text>
@@ -119,9 +119,9 @@
   <rect x="970" y="530" width="200" height="26" rx="6" fill="#f0fdf4" stroke="#16a34a"/>
   <text x="1070" y="547" text-anchor="middle" font-size="10" fill="#166534">subagent（按配置注入）</text>
   <rect x="970" y="566" width="300" height="26" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-dasharray="4 3"/>
-  <text x="1120" y="583" text-anchor="middle" font-size="10" fill="#64748b">skill：spec 未声明 ⛔ D2</text>
+  <text x="1120" y="583" text-anchor="middle" font-size="10" fill="#15803d">skill：config 声明即安装 ✅</text>
   <rect x="970" y="602" width="300" height="26" rx="6" fill="#f1f5f9" stroke="#94a3b8" stroke-dasharray="4 3"/>
-  <text x="1120" y="619" text-anchor="middle" font-size="10" fill="#64748b">MCP 桥 mcp__*：spec 无声明，池为空 ⛔ D2</text>
+  <text x="1120" y="619" text-anchor="middle" font-size="10" fill="#15803d">MCP 桥：config 声明即装配 ✅</text>
   <text x="1160" y="652" text-anchor="middle" font-size="10" fill="#15803d">ToolCatalog：per-session allowlist 已生效</text>
 
   <line x1="500" y1="520" x2="538" y2="520" stroke="#16a34a" stroke-width="2" marker-end="url(#arr-green)"/>
@@ -138,15 +138,15 @@
 
   <rect x="170" y="754" width="720" height="130" rx="10" fill="#ffffff" stroke="#d97706" stroke-width="1.5"/>
   <text x="530" y="780" text-anchor="middle" font-size="13.5" font-weight="700" fill="#b45309">harness-session（Turso / libsql 嵌入式）</text>
-  <text x="530" y="804" text-anchor="middle" font-size="10.5" fill="#475569">sessions ✅ · run_events ✅（pump 异步落盘）· messages ⛔ D4 无写入者</text>
-  <text x="530" y="826" text-anchor="middle" font-size="10.5" fill="#475569">幂等键 UNIQUE ✅ · recall FTS（ngram）✅ · GraphIndex ⛔ D5 无消费者</text>
-  <text x="530" y="848" text-anchor="middle" font-size="10.5" fill="#dc2626">重启重放水合 ⛔ 未实现：start_run 不调用 replay_ledger</text>
+  <text x="530" y="804" text-anchor="middle" font-size="10.5" fill="#475569">units（索引 + payload + parent）✅ · session_heads ✅ · run_events ✅</text>
+  <text x="530" y="826" text-anchor="middle" font-size="10.5" fill="#475569">petgraph 单元图 ✅（HEAD → ancestors）· recall FTS（ngram）✅</text>
+  <text x="530" y="848" text-anchor="middle" font-size="10.5" fill="#15803d">重启水合 ✅：replay_ledger 走图 → 批量取 payload → 组装</text>
   <text x="530" y="866" text-anchor="middle" font-size="9.5" fill="#64748b">单连接 + tokio::Mutex 门；append_message 独立连接 + BEGIN IMMEDIATE</text>
 
   <rect x="920" y="754" width="440" height="130" rx="10" fill="#ffffff" stroke="#d97706" stroke-width="1.5"/>
   <text x="1140" y="780" text-anchor="middle" font-size="13.5" font-weight="700" fill="#b45309">harness-context</text>
   <text x="1140" y="804" text-anchor="middle" font-size="10.5" fill="#475569">Budget ✅ · 五级阈值 60/70/80/90/95%</text>
-  <text x="1140" y="826" text-anchor="middle" font-size="10.5" fill="#dc2626">Compactor ⛔ D3 无具体实现 → 门不触发</text>
+  <text x="1140" y="826" text-anchor="middle" font-size="10.5" fill="#15803d">DefaultCompactor ✅ 五级阈值 → 预算门生效</text>
   <text x="1140" y="848" text-anchor="middle" font-size="10.5" fill="#475569">checkpoint / BudgetBlocked 已定义</text>
   <text x="1140" y="870" text-anchor="middle" font-size="10" fill="#64748b">待接：DefaultCompactor → with_compactor</text>
 
