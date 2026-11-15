@@ -51,6 +51,10 @@ pub enum SessionStoreError {
     #[error("run {0} already has an event at seq {1}")]
     DuplicateSeq(RunId, u64),
 
+    /// A caller-supplied query is malformed or too large to search safely.
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
     /// An internal invariant was violated (e.g. corrupt data).
     #[error("internal error: {0}")]
     Internal(String),
@@ -135,6 +139,14 @@ pub trait SessionStore: Send + Sync + 'static {
 
     /// Load every event for a run, ordered by sequence number.
     async fn events_for_run(&self, run_id: &RunId) -> Result<Vec<RunEvent>, SessionStoreError>;
+
+    /// The last event of `run_id`, by sequence; `None` when the run has no
+    /// events. Point read for status derivation, instead of loading and
+    /// decoding the whole log to keep its tail.
+    async fn latest_event_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<RunEvent>, SessionStoreError>;
 
     /// Find gaps in a run's event sequence.
     ///

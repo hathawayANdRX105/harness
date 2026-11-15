@@ -30,6 +30,11 @@ enum EdgeKind {
     Parent,
 }
 
+/// Bound on one ancestor walk. A corrupt parent pointer that forms a cycle
+/// must not hang the replay path; ferrite uses the same cap and treats a hit
+/// as "no provable chain".
+const MAX_CHAIN_DEPTH: usize = 1024;
+
 /// The scope a head pointer belongs to.
 type Scope = (SessionId, String, i64);
 
@@ -169,7 +174,9 @@ impl GraphIndex {
     /// root→head order.
     ///
     /// An unknown id yields an empty chain — the same "no proof" answer the
-    /// assembler treats as an empty context.
+    /// assembler treats as an empty context. A parent chain longer than
+    /// [`MAX_CHAIN_DEPTH`] (a corrupt cycle) also yields an empty chain
+    /// instead of hanging the caller.
     pub fn ancestors(&self, event_id: &str) -> Vec<String> {
         let inner = self.inner();
         if !inner.by_id.contains_key(event_id) {
@@ -178,14 +185,19 @@ impl GraphIndex {
         let mut chain = Vec::new();
         let mut current = Some(event_id.to_string());
         while let Some(id) = current {
-            if !inner.by_id.contains_key(&id) {
-                break;
+            if !inner.by_id.contains_key(&id) || chain.len() > MAX_CHAIN_DEPTH {
+                return Vec::new();
             }
             chain.push(id.clone());
             current = inner.parents.get(&id).cloned();
         }
         chain.reverse();
         chain
+    }
+
+    /// Whether `event_id` is a node of this graph.
+    pub fn contains(&self, event_id: &str) -> bool {
+        self.inner().by_id.contains_key(event_id)
     }
 
     /// Every unit of `session_id`, in `event_order` order.

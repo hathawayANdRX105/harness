@@ -14,6 +14,11 @@
 //!   from the `units` ledger (never persisted): units are nodes, the parent
 //!   chain is the unit-tree edge, and each scope has a HEAD.
 //!
+//! The read-model types (`Unit`, `StoredUnit`, `UnitKind`, `GraphIndex`,
+//! `assemble_messages`) are public because integration tests drive them and
+//! the daemon-side context assembler will consume the graph directly; the
+//! store internals (head decoding, SQL helpers) stay private.
+//!
 //! # Three persistent stores
 //!
 //! 1. **Unit ledger** (`units`) — one row per conversational block (prompt,

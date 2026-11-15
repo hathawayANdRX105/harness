@@ -110,6 +110,11 @@ use crate::unit::{
 };
 use turso::{Builder, Connection, Database, params};
 
+/// Upper bound on cached per-session graphs. The graph is derived, so
+/// eviction is always safe; the cap keeps a client that opens unbounded
+/// session ids from growing the cache forever.
+const MAX_CACHED_GRAPHS: usize = 64;
+
 /// Turso-backed [`SessionStore`].
 ///
 /// One shared `Connection` (`conn`) serves direct statements, serialized by
@@ -248,11 +253,15 @@ impl TursoSessionStore {
     /// message writer and the event pump are separate connections, so the
     /// loser of the file-level write race must wait instead of failing.
     async fn tx_conn(&self) -> Result<Connection, SessionStoreError> {
-        let conn = self
+        let mut conn = self
             .database
             .connect()
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         Self::set_busy_timeout(&conn).await?;
+        // BEGIN IMMEDIATE: the transaction takes the write lock up front, so
+        // concurrent writers queue on busy_timeout instead of failing at the
+        // first write with SQLITE_BUSY_SNAPSHOT.
+        conn.set_transaction_behavior(turso::transaction::TransactionBehavior::Immediate);
         Ok(conn)
     }
 
@@ -261,6 +270,20 @@ impl TursoSessionStore {
     async fn set_busy_timeout(conn: &Connection) -> Result<(), SessionStoreError> {
         let mut rows = conn
             .query("PRAGMA busy_timeout = 5000", ())
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        while let Some(_row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        {
+            // consume the pragma result row
+        }
+        // SQLite defaults foreign_keys off; the schema's REFERENCES clauses
+        // only enforce integrity when this is on. apply to both the shared
+        // and transaction connections.
+        let mut rows = conn
+            .query("PRAGMA foreign_keys = ON", ())
             .await
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         while let Some(_row) = rows
@@ -287,124 +310,125 @@ impl TursoSessionStore {
         session_id: &SessionId,
     ) -> Result<Vec<StoredUnit>, SessionStoreError> {
         let _guard = self.gate.lock().await;
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT event_id, branch_id, epoch, event_order, message_seq, role, kind,
-                        payload_json, parent_event_id, created_at_ms
-                   FROM units
-                  WHERE session_id = ?1
-                  ORDER BY event_order",
-                params![session_id.0.clone()],
-            )
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        let mut units = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
-        {
-            let event_id: String = row
-                .get(0)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let branch_id: String = row
-                .get(1)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let epoch: i64 = row
-                .get(2)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let event_order: i64 = row
-                .get(3)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let message_seq: i64 = row
-                .get(4)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let role: String = row
-                .get(5)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let kind: String = row
-                .get(6)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let payload_json: String = row
-                .get(7)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let parent_event_id: Option<String> = row
-                .get(8)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            let created_at_ms: i64 = row
-                .get(9)
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            units.push(StoredUnit {
-                unit: Unit {
-                    event_id,
-                    session_id: session_id.clone(),
-                    branch_id,
-                    epoch,
-                    event_order: u64::try_from(event_order).map_err(|_| {
-                        SessionStoreError::Internal("negative unit event_order".into())
-                    })?,
-                    message_seq: u64::try_from(message_seq).map_err(|_| {
-                        SessionStoreError::Internal("negative unit message_seq".into())
-                    })?,
-                    role,
-                    kind: UnitKind::parse(&kind)?,
-                    parent_event_id,
-                    created_at_ms,
-                },
-                payload_json,
-            });
-        }
-        Ok(units)
+        load_units_from(&self.conn, session_id).await
     }
 
     /// The session's head row, creating the default one for a session that
     /// predates the unit ledger.
     async fn load_head(&self, session_id: &SessionId) -> Result<HeadState, SessionStoreError> {
         let _guard = self.gate.lock().await;
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO session_heads
-                     (session_id, branch_id, epoch, head_event_id, last_event_order, last_message_seq)
-                 VALUES (?1, ?2, ?3, NULL, 0, 0)",
-                params![session_id.0.clone(), MAIN_BRANCH, INITIAL_EPOCH],
-            )
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        read_head(&self.conn, session_id).await
+        ensure_head_from(&self.conn, session_id).await
     }
 
-    /// The session's derived graph: cached when warm, rebuilt from the ledger
-    /// otherwise.
+    /// Units and head from one gated snapshot: the graph and its HEAD must be
+    /// read under the same gate, or an append committing between the two
+    /// reads can leave the cached graph pointing at a unit it does not hold.
+    async fn load_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(Vec<StoredUnit>, HeadState), SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        let head = ensure_head_from(&self.conn, session_id).await?;
+        let units = load_units_from(&self.conn, session_id).await?;
+        Ok((units, head))
+    }
+
+    /// The session's derived graph plus, on a cold build, the units it was
+    /// built from (so the replay path does not read them twice), plus the
+    /// head row that names the current scope.
     async fn graph_for(
         &self,
         session_id: &SessionId,
-    ) -> Result<Arc<GraphIndex>, SessionStoreError> {
-        if let Some(graph) = self
-            .graphs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(session_id)
-            .cloned()
-        {
-            return Ok(graph);
+    ) -> Result<(Arc<GraphIndex>, Option<Vec<StoredUnit>>, HeadState), SessionStoreError> {
+        // Clone out of the cache in its own scope: the std guard is not Send,
+        // and the head read below awaits.
+        let cached = {
+            let cache = self
+                .graphs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.get(session_id).cloned()
+        };
+        if let Some(graph) = cached {
+            let head = self.load_head(session_id).await?;
+            return Ok((graph, None, head));
         }
-        let units = self.load_units(session_id).await?;
-        let head = self.load_head(session_id).await?;
+        let (units, head) = self.load_snapshot(session_id).await?;
         let graph = Arc::new(GraphIndex::new());
         let metas: Vec<Unit> = units.iter().map(|stored| stored.unit.clone()).collect();
         graph.rebuild(&metas);
-        if let Some(head_event_id) = head.head_event_id.as_deref() {
+        // Only trust a stored head that the rebuilt graph actually contains.
+        // A ghost head (a unit committed after this snapshot) would make the
+        // ancestor walk empty and silently blank the transcript.
+        if let Some(head_event_id) = head.head_event_id.as_deref()
+            && graph.contains(head_event_id)
+        {
             graph.set_head(session_id, &head.branch_id, head.epoch, head_event_id);
         }
         let mut cache = self
             .graphs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(cache
+        if cache.len() >= MAX_CACHED_GRAPHS && !cache.contains_key(session_id) {
+            // The graph is derived: dropping every entry costs one rebuild per
+            // touched session and bounds memory under a client that opens
+            // unbounded session ids.
+            cache.clear();
+        }
+        let graph = cache
             .entry(session_id.clone())
             .or_insert_with(|| Arc::clone(&graph))
-            .clone())
+            .clone();
+        Ok((graph, Some(units), head))
+    }
+
+    /// Units named by `ids`, read in chunks so the chain, not the whole
+    /// session, pays for its payloads.
+    async fn load_units_by_ids(
+        &self,
+        session_id: &SessionId,
+        ids: &[String],
+    ) -> Result<Vec<StoredUnit>, SessionStoreError> {
+        const CHUNK: usize = 200;
+        let _guard = self.gate.lock().await;
+        let mut by_id: HashMap<String, StoredUnit> = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders: Vec<String> = (0..chunk.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect();
+            let sql = format!(
+                "SELECT event_id, branch_id, epoch, event_order, message_seq, role, kind,
+                        payload_json, parent_event_id, created_at_ms
+                   FROM units
+                  WHERE session_id = ?1 AND event_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut values: Vec<String> = Vec::with_capacity(chunk.len() + 1);
+            values.push(session_id.0.clone());
+            values.extend(chunk.iter().cloned());
+            let mut rows = self
+                .conn
+                .query(&sql, turso::params_from_iter(values))
+                .await
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+            {
+                let stored = decode_unit_row(&row, session_id)?;
+                by_id.insert(stored.unit.event_id.clone(), stored);
+            }
+        }
+        ids.iter()
+            .map(|id| {
+                by_id.remove(id).ok_or_else(|| {
+                    SessionStoreError::Internal(format!(
+                        "graph chain references unit {id} missing from the ledger"
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Fold a committed append into a warm graph; a cold cache is left alone
@@ -422,11 +446,218 @@ impl TursoSessionStore {
     }
 }
 
+/// Every unit of a session, in append order, through an already-gated
+/// connection.
+async fn load_units_from(
+    conn: &Connection,
+    session_id: &SessionId,
+) -> Result<Vec<StoredUnit>, SessionStoreError> {
+    let mut rows = conn
+        .query(
+            "SELECT event_id, branch_id, epoch, event_order, message_seq, role, kind,
+                    payload_json, parent_event_id, created_at_ms
+               FROM units
+              WHERE session_id = ?1
+              ORDER BY branch_id, epoch, event_order",
+            params![session_id.0.clone()],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let mut units = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+    {
+        units.push(decode_unit_row(&row, session_id)?);
+    }
+    Ok(units)
+}
+
+/// Decode one unit row.
+fn decode_unit_row(
+    row: &turso::Row,
+    session_id: &SessionId,
+) -> Result<StoredUnit, SessionStoreError> {
+    let event_id: String = row
+        .get(0)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let branch_id: String = row
+        .get(1)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let epoch: i64 = row
+        .get(2)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let event_order: i64 = row
+        .get(3)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let message_seq: i64 = row
+        .get(4)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let role: String = row
+        .get(5)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let kind: String = row
+        .get(6)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let payload_json: String = row
+        .get(7)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let parent_event_id: Option<String> = row
+        .get(8)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let created_at_ms: i64 = row
+        .get(9)
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    Ok(StoredUnit {
+        unit: Unit {
+            event_id,
+            session_id: session_id.clone(),
+            branch_id,
+            epoch,
+            event_order: u64::try_from(event_order)
+                .map_err(|_| SessionStoreError::Internal("negative unit event_order".into()))?,
+            message_seq: u64::try_from(message_seq)
+                .map_err(|_| SessionStoreError::Internal("negative unit message_seq".into()))?,
+            role,
+            kind: UnitKind::parse(&kind)?,
+            parent_event_id,
+            created_at_ms,
+        },
+        payload_json,
+    })
+}
+
+/// Ensure the session has a head row, then read it; the caller holds the gate.
+async fn ensure_head_from(
+    conn: &Connection,
+    session_id: &SessionId,
+) -> Result<HeadState, SessionStoreError> {
+    // Only write when the row is genuinely absent: replay is otherwise a
+    // read-only path and should not take a write lock.
+    if let Some(head) = read_head(conn, session_id).await? {
+        return Ok(head);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO session_heads
+             (session_id, branch_id, epoch, head_event_id, last_event_order, last_message_seq)
+         VALUES (?1, ?2, ?3, NULL, 0, 0)",
+        params![session_id.0.clone(), MAIN_BRANCH, INITIAL_EPOCH],
+    )
+    .await
+    .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    read_head(conn, session_id).await?.ok_or_else(|| {
+        SessionStoreError::Internal(format!("session {} has no head row", session_id.0))
+    })
+}
+
+/// Ensure a head row exists inside the append transaction and read it.
+async fn ensure_head_tx(
+    conn: &Connection,
+    session_id: &SessionId,
+) -> Result<HeadState, SessionStoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO session_heads
+             (session_id, branch_id, epoch, head_event_id, last_event_order, last_message_seq)
+         VALUES (?1, ?2, ?3, NULL, 0, 0)",
+        params![session_id.0.clone(), MAIN_BRANCH, INITIAL_EPOCH],
+    )
+    .await
+    .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    let mut rows = conn
+        .query(
+            "SELECT branch_id, epoch, head_event_id, last_event_order, last_message_seq
+               FROM session_heads WHERE session_id = ?1",
+            params![session_id.0.clone()],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    decode_head_row(&mut rows, session_id)
+        .await?
+        .ok_or_else(|| {
+            SessionStoreError::Internal(format!("session {} has no head row", session_id.0))
+        })
+}
+
+/// Insert one message's units.
+async fn insert_units_tx(
+    conn: &Connection,
+    units: &[(Unit, String)],
+) -> Result<(), SessionStoreError> {
+    for (unit, payload_json) in units {
+        conn.execute(
+            "INSERT INTO units
+                 (event_id, session_id, branch_id, epoch, event_order, message_seq,
+                  role, kind, payload_json, parent_event_id, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                unit.event_id.clone(),
+                unit.session_id.0.clone(),
+                unit.branch_id.clone(),
+                unit.epoch,
+                unit.event_order as i64,
+                unit.message_seq as i64,
+                unit.role.clone(),
+                unit.kind.as_str(),
+                payload_json.clone(),
+                unit.parent_event_id.clone(),
+                unit.created_at_ms,
+            ],
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Move the session head to the last unit of the message just inserted.
+async fn advance_head_tx(
+    conn: &Connection,
+    session_id: &SessionId,
+    last: &Unit,
+    message_seq: u64,
+) -> Result<(), SessionStoreError> {
+    conn.execute(
+        "UPDATE session_heads
+            SET head_event_id = ?2, last_event_order = ?3, last_message_seq = ?4
+          WHERE session_id = ?1",
+        params![
+            session_id.0.clone(),
+            last.event_id.clone(),
+            last.event_order as i64,
+            message_seq as i64,
+        ],
+    )
+    .await
+    .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Reorder `units` to the ancestor id order, erroring on a missing id.
+fn order_by_ids(
+    units: Vec<StoredUnit>,
+    ids: &[String],
+) -> Result<Vec<StoredUnit>, SessionStoreError> {
+    let mut by_id: HashMap<String, StoredUnit> = units
+        .into_iter()
+        .map(|stored| (stored.unit.event_id.clone(), stored))
+        .collect();
+    ids.iter()
+        .map(|id| {
+            by_id.remove(id).ok_or_else(|| {
+                SessionStoreError::Internal(format!(
+                    "graph chain references unit {id} missing from the ledger"
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Read the head row of a session from the shared connection.
 async fn read_head(
     conn: &Connection,
     session_id: &SessionId,
-) -> Result<HeadState, SessionStoreError> {
+) -> Result<Option<HeadState>, SessionStoreError> {
     let mut rows = conn
         .query(
             "SELECT branch_id, epoch, head_event_id, last_event_order, last_message_seq
@@ -438,18 +669,18 @@ async fn read_head(
     decode_head_row(&mut rows, session_id).await
 }
 
-/// Decode the single head row.
+/// Decode the single head row; `None` when the session has no head row.
 async fn decode_head_row(
     rows: &mut turso::Rows,
     session_id: &SessionId,
-) -> Result<HeadState, SessionStoreError> {
-    let row = rows
+) -> Result<Option<HeadState>, SessionStoreError> {
+    let Some(row) = rows
         .next()
         .await
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?
-        .ok_or_else(|| {
-            SessionStoreError::Internal(format!("session {} has no head row", session_id.0))
-        })?;
+    else {
+        return Ok(None);
+    };
     let branch_id: String = row
         .get(0)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
@@ -465,7 +696,7 @@ async fn decode_head_row(
     let last_message_seq: i64 = row
         .get(4)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    Ok(HeadState {
+    Ok(Some(HeadState {
         session_id: session_id.clone(),
         branch_id,
         epoch,
@@ -474,7 +705,7 @@ async fn decode_head_row(
             .map_err(|_| SessionStoreError::Internal("negative head event_order".into()))?,
         last_message_seq: u64::try_from(last_message_seq)
             .map_err(|_| SessionStoreError::Internal("negative head message_seq".into()))?,
-    })
+    }))
 }
 
 #[async_trait]
@@ -555,70 +786,15 @@ impl SessionStore for TursoSessionStore {
             .transaction()
             .await
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        // A session created before the unit ledger has no head row; create
-        // the default one inside the same transaction so the append can
-        // proceed instead of failing an invariant.
-        tx.execute(
-            "INSERT OR IGNORE INTO session_heads
-                 (session_id, branch_id, epoch, head_event_id, last_event_order, last_message_seq)
-             VALUES (?1, ?2, ?3, NULL, 0, 0)",
-            params![session_id.0.clone(), MAIN_BRANCH, INITIAL_EPOCH],
-        )
-        .await
-        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        let head = {
-            let mut rows = tx
-                .query(
-                    "SELECT branch_id, epoch, head_event_id, last_event_order, last_message_seq
-                       FROM session_heads WHERE session_id = ?1",
-                    params![session_id.0.clone()],
-                )
-                .await
-                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            decode_head_row(&mut rows, session_id).await?
-        };
+        let head = ensure_head_tx(&tx, session_id).await?;
         let message_seq = head.last_message_seq + 1;
         let units = split_message(&head, message, Self::now_ms())?;
-        for (unit, payload_json) in &units {
-            tx.execute(
-                "INSERT INTO units
-                     (event_id, session_id, branch_id, epoch, event_order, message_seq,
-                      role, kind, payload_json, parent_event_id, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    unit.event_id.clone(),
-                    unit.session_id.0.clone(),
-                    unit.branch_id.clone(),
-                    unit.epoch,
-                    unit.event_order as i64,
-                    unit.message_seq as i64,
-                    unit.role.clone(),
-                    unit.kind.as_str(),
-                    payload_json.clone(),
-                    unit.parent_event_id.clone(),
-                    unit.created_at_ms,
-                ],
-            )
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        }
+        insert_units_tx(&tx, &units).await?;
         let last = units
             .last()
             .map(|(unit, _)| unit)
             .ok_or_else(|| SessionStoreError::Internal("a message produced no units".into()))?;
-        tx.execute(
-            "UPDATE session_heads
-                SET head_event_id = ?2, last_event_order = ?3, last_message_seq = ?4
-              WHERE session_id = ?1",
-            params![
-                session_id.0.clone(),
-                last.event_id.clone(),
-                last.event_order as i64,
-                message_seq as i64,
-            ],
-        )
-        .await
-        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        advance_head_tx(&tx, session_id, last, message_seq).await?;
         tx.commit()
             .await
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
@@ -644,28 +820,31 @@ impl SessionStore for TursoSessionStore {
         // The graph names the retained chain (HEAD -> root); Turso supplies
         // the payloads by id. This is the ferrite split: graph = topology,
         // ledger = content.
-        let graph = self.graph_for(session_id).await?;
-        let Some(head) = graph.head(session_id, MAIN_BRANCH, INITIAL_EPOCH) else {
-            return Ok(Vec::new());
+        let (graph, cold_units, head) = self.graph_for(session_id).await?;
+        let Some(head_id) = graph.head(session_id, &head.branch_id, head.epoch) else {
+            // A session with units but no resolvable head is corrupt, not
+            // empty: fail loudly instead of seeding an empty transcript.
+            let empty = cold_units.as_ref().is_none_or(Vec::is_empty);
+            return if empty {
+                Ok(Vec::new())
+            } else {
+                Err(SessionStoreError::Internal(format!(
+                    "session {} has units but no resolvable head",
+                    session_id.0
+                )))
+            };
         };
-        let ancestors = graph.ancestors(&head);
+        let ancestors = graph.ancestors(&head_id);
         if ancestors.is_empty() {
-            return Ok(Vec::new());
+            return Err(SessionStoreError::Internal(format!(
+                "session {} head {head_id} has no provable chain",
+                session_id.0
+            )));
         }
-        let units = self.load_units(session_id).await?;
-        let by_id: HashMap<&str, &StoredUnit> = units
-            .iter()
-            .map(|stored| (stored.unit.event_id.as_str(), stored))
-            .collect();
-        let chain: Vec<StoredUnit> = ancestors
-            .iter()
-            .filter_map(|id| by_id.get(id.as_str()).map(|stored| (*stored).clone()))
-            .collect();
-        if chain.len() != ancestors.len() {
-            return Err(SessionStoreError::Internal(
-                "graph chain references units missing from the ledger".into(),
-            ));
-        }
+        let chain = match cold_units {
+            Some(units) => order_by_ids(units, &ancestors)?,
+            None => self.load_units_by_ids(session_id, &ancestors).await?,
+        };
         let entries = assemble_messages(&chain)?;
         Ok(replay_messages(&entries))
     }
@@ -800,13 +979,47 @@ impl SessionStore for TursoSessionStore {
         Ok(Some(RunId(id)))
     }
 
+    async fn latest_event_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<RunEvent>, SessionStoreError> {
+        let _guard = self.gate.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT event_json FROM run_events
+                  WHERE run_id = ?1
+                  ORDER BY seq DESC
+                  LIMIT 1",
+                params![run_id.0.clone()],
+            )
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let json_str: String = row
+            .get(0)
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let event: RunEvent =
+            serde_json::from_str(&json_str).map_err(SessionStoreError::Serialization)?;
+        Ok(Some(event))
+    }
+
     async fn delete_session(&self, id: &SessionId) -> Result<(), SessionStoreError> {
         let _guard = self.gate.lock().await;
-        // Check existence within this same gate-held section: calling
-        // `session_exists` here would re-acquire the gate and deadlock
-        // (tokio::Mutex is not reentrant).
-        let exists: bool = self
-            .conn
+        // Children first, all in one transaction: a crash mid-delete must not
+        // leave a visible sessions row with no ledger behind it.
+        let mut conn = self.tx_conn().await?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let exists: bool = tx
             .query(
                 "SELECT COUNT(*) > 0 FROM sessions WHERE session_id = ?1",
                 params![id.0.clone()],
@@ -820,38 +1033,25 @@ impl SessionStore for TursoSessionStore {
         if !exists {
             return Err(SessionStoreError::SessionNotFound(id.clone()));
         }
-        self.conn
-            .execute(
-                "DELETE FROM units WHERE session_id = ?1",
-                params![id.0.clone()],
-            )
+        for statement in [
+            "DELETE FROM units WHERE session_id = ?1",
+            "DELETE FROM session_heads WHERE session_id = ?1",
+            "DELETE FROM run_events WHERE session_id = ?1",
+            "DELETE FROM sessions WHERE session_id = ?1",
+        ] {
+            tx.execute(statement, params![id.0.clone()])
+                .await
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        }
+        tx.commit()
             .await
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        self.conn
-            .execute(
-                "DELETE FROM session_heads WHERE session_id = ?1",
-                params![id.0.clone()],
-            )
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        // The cache is derived: evict after the commit, and a crash between
+        // them self-heals on the next replay from the now-empty ledger.
         self.graphs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(id);
-        self.conn
-            .execute(
-                "DELETE FROM run_events WHERE session_id = ?1",
-                params![id.0.clone()],
-            )
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        self.conn
-            .execute(
-                "DELETE FROM sessions WHERE session_id = ?1",
-                params![id.0.clone()],
-            )
-            .await
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         Ok(())
     }
 }
@@ -895,29 +1095,32 @@ impl RecallStore for TursoFtsRecall {
         query: &str,
         scope: &RecallScope,
     ) -> Result<Vec<RecallHit>, SessionStoreError> {
+        // The query is client-controlled: bind it, never interpolate. The FTS
+        // functions are ordinary scalar functions, so placeholders work as
+        // their arguments; `?2 IS NULL` keeps the global/targeted scope in one
+        // statement. A cap avoids handing an unbounded FTS expression to the
+        // engine (its parser rejects oversized queries deep inside the scan).
+        const MAX_QUERY_BYTES: usize = 16 * 1024;
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(SessionStoreError::InvalidQuery(format!(
+                "search query is {} bytes; the limit is {MAX_QUERY_BYTES}",
+                query.len()
+            )));
+        }
         let _guard = self.gate.lock().await;
-        let limit = scope.limit.max(1);
-        // The FTS index is on the serialized event payload; matches are
-        // ranked by the engine's BM25 score and highlighted for display.
-        let sql = format!(
-            "SELECT run_id, session_id, seq, \
-                    fts_highlight(event_json, '≫', '≪', '{query}') AS snippet, \
-                    fts_score(event_json, '{query}') AS score \
-             FROM run_events \
-             WHERE fts_match(event_json, '{query}') {} \
-             ORDER BY score DESC \
-             LIMIT {limit}",
-            scope
-                .session_id
-                .as_ref()
-                .map_or(String::new(), |id| format!(
-                    "AND session_id = '{}'",
-                    id.0.replace('\'', "''")
-                )),
-        );
+        let limit = i64::from(scope.limit.clamp(1, 1_000));
+        let session = scope.session_id.as_ref().map(|id| id.0.clone());
+        let sql = "SELECT run_id, session_id, seq, \
+                          fts_highlight(event_json, '≫', '≪', ?1) AS snippet, \
+                          fts_score(event_json, ?1) AS score \
+                   FROM run_events \
+                   WHERE fts_match(event_json, ?1) \
+                     AND (?2 IS NULL OR session_id = ?2) \
+                   ORDER BY score DESC \
+                   LIMIT ?3";
         let mut rows = self
             .conn
-            .query(&sql, ())
+            .query(sql, params![query.to_string(), session, limit])
             .await
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         let mut hits = Vec::new();

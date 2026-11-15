@@ -1078,3 +1078,229 @@ async fn recall_search_sql_round_trip() {
         "scores must be finite"
     );
 }
+
+/// Purpose: the search query is bound, not interpolated, so quotes and
+/// injection-shaped input cannot break or reshape the statement.
+/// Scenario: search for an apostrophe-containing term and for a string that
+/// would close the literal and add `OR 1=1`.
+/// Acceptance: the quoted search succeeds without a storage error; the
+/// injection-shaped search returns no hits instead of every event.
+#[tokio::test]
+async fn recall_search_binds_quotes_and_injection_shaped_input()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = recall_fixture().await;
+    let recall = store.recall();
+
+    let quoted = recall.search("it's", &RecallScope::all(10)).await?;
+    assert!(quoted.is_empty(), "no event contains the quoted term");
+
+    let injected = recall
+        .search("zzz') OR 1=1 OR ('z'=", &RecallScope::all(10))
+        .await;
+    match injected {
+        Ok(hits) => assert!(
+            hits.is_empty(),
+            "injection-shaped input must not return every row: {hits:?}"
+        ),
+        Err(error) => assert!(
+            matches!(error, SessionStoreError::Storage(_)),
+            "the FTS parser may reject the expression, but not as a successful match: {error}"
+        ),
+    }
+    Ok(())
+}
+
+/// Purpose: an oversized query is rejected before it reaches the FTS engine.
+/// Scenario: 17 KiB of text against the 16 KiB cap.
+/// Acceptance: `InvalidQuery`, and the search does not hit the database.
+#[tokio::test]
+async fn recall_search_rejects_oversized_queries() -> Result<(), Box<dyn std::error::Error>> {
+    let store = recall_fixture().await;
+    let recall = store.recall();
+    let query = "x".repeat(17 * 1024);
+    let result = recall.search(&query, &RecallScope::all(10)).await;
+    assert!(
+        matches!(result, Err(SessionStoreError::InvalidQuery(_))),
+        "oversized queries must be rejected: {result:?}"
+    );
+    Ok(())
+}
+
+/// Purpose: a corrupt parent cycle cannot hang the ancestor walk.
+/// Scenario: two units point at each other as parents.
+/// Acceptance: `ancestors` returns an empty chain instead of looping.
+#[tokio::test]
+async fn graph_ancestors_bounded_on_cycle() {
+    let session = SessionId("cycle".into());
+    let mut first = unit(&session, 1, 1, Some("cycle:main:1:2"));
+    let second = unit(&session, 2, 2, Some("cycle:main:1:1"));
+    first.parent_event_id = Some(second.event_id.clone());
+    let graph = GraphIndex::new();
+    graph.rebuild(&[first.clone(), second]);
+    assert!(
+        graph.ancestors(&first.event_id).is_empty(),
+        "a cycle yields no provable chain"
+    );
+}
+
+/// Purpose: an assistant message with no content blocks still occupies one
+/// message sequence and survives the unit split/assemble round trip.
+/// Scenario: user prompt, empty assistant, user prompt.
+/// Acceptance: three entries with seq 1,2,3; the empty assistant is present
+/// with an empty content vector.
+#[tokio::test]
+async fn assistant_empty_content_round_trip() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+
+    store.append_message(&sid, &user_msg("one")).await?;
+    store
+        .append_message(
+            &sid,
+            &Message::Assistant {
+                content: Vec::new(),
+            },
+        )
+        .await?;
+    store.append_message(&sid, &user_msg("two")).await?;
+
+    let entries = store.load_messages(&sid).await?;
+    let seqs: Vec<u64> = entries.iter().map(|entry| entry.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3], "the empty assistant keeps its slot");
+    let Message::Assistant { content } = &entries[1].message else {
+        panic!("second entry must be the assistant message");
+    };
+    assert!(content.is_empty(), "no blocks were invented");
+    Ok(())
+}
+
+/// Purpose: multiple tool calls in one assistant message stay one message and
+/// keep their declaration order after the unit round trip.
+/// Scenario: assistant with two ToolCall blocks and no text.
+/// Acceptance: one assistant entry whose content is two ToolCalls in order.
+#[tokio::test]
+async fn assistant_multiple_tool_calls_reassemble() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    let call = |id: &str, name: &str| harness_core::message::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        args: serde_json::json!({}),
+    };
+    store
+        .append_message(
+            &sid,
+            &Message::Assistant {
+                content: vec![
+                    Content::ToolCall(call("c1", "read")),
+                    Content::ToolCall(call("c2", "grep")),
+                ],
+            },
+        )
+        .await?;
+
+    let entries = store.load_messages(&sid).await?;
+    assert_eq!(entries.len(), 1, "one message, two units");
+    let Message::Assistant { content } = &entries[0].message else {
+        panic!("expected an assistant message");
+    };
+    assert_eq!(content.len(), 2, "both calls survive");
+    assert!(matches!(&content[0], Content::ToolCall(c) if c.id == "c1"));
+    assert!(matches!(&content[1], Content::ToolCall(c) if c.id == "c2"));
+    Ok(())
+}
+
+/// Purpose: replay after closing and reopening the store returns the same
+/// transcript (the graph is rebuilt from the ledger, not cached across).
+/// Scenario: append user/assistant messages, drop the store, reopen the same
+/// database file, replay.
+/// Acceptance: the replay equals the pre-restart replay.
+#[tokio::test]
+async fn replay_survives_store_reopen() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("sessions.db");
+    let sid = make_session_id();
+    let before = {
+        let store = TursoSessionStore::open(&path).await?;
+        store.create_session(&sid).await?;
+        store.append_message(&sid, &user_msg("remember me")).await?;
+        store
+            .append_message(
+                &sid,
+                &Message::Assistant {
+                    content: vec![Content::Text("noted".into())],
+                },
+            )
+            .await?;
+        store.replay_ledger(&sid).await?
+    };
+    let store = TursoSessionStore::open(&path).await?;
+    let after = store.replay_ledger(&sid).await?;
+    assert_eq!(before, after, "replay is rebuilt from the ledger");
+    assert_eq!(after.len(), 2, "both messages survived the reopen");
+    Ok(())
+}
+
+/// Purpose: a system section removed and later re-added replays with the final
+/// value, matching the prompt-ledger contract.
+/// Scenario: role=coder, role=None, role=coder again, then a user turn.
+/// Acceptance: the replay starts with role=coder and keeps the user message.
+#[tokio::test]
+async fn replay_system_section_readded() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    store.create_session(&sid).await?;
+    store
+        .append_message(&sid, &system_msg("role", Some("coder")))
+        .await?;
+    store
+        .append_message(&sid, &system_msg("role", None))
+        .await?;
+    store
+        .append_message(&sid, &system_msg("role", Some("coder")))
+        .await?;
+    store.append_message(&sid, &user_msg("hello")).await?;
+
+    let replay = store.replay_ledger(&sid).await?;
+    let Message::System { sections } = &replay[0] else {
+        panic!("replay must lead with the accumulated system ledger");
+    };
+    assert_eq!(
+        sections.get("role").map(|value| value.as_deref()),
+        Some(Some("coder")),
+        "the re-added section wins"
+    );
+    assert_eq!(replay.len(), 2, "system ledger plus the user turn");
+    Ok(())
+}
+
+/// Purpose: `latest_event_for_run` point-reads the tail of a run.
+/// Scenario: two events appended to one run.
+/// Acceptance: the method returns the higher-seq event, and `None` for an
+/// unknown run.
+#[tokio::test]
+async fn latest_event_for_run_returns_tail() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    let rid = make_run_id();
+    store.create_session(&sid).await?;
+    store
+        .append_event(&run_started_event(&rid, &sid, 1))
+        .await?;
+    store
+        .append_event(&run_finished_event(&rid, &sid, 2))
+        .await?;
+
+    let latest = store.latest_event_for_run(&rid).await?;
+    assert_eq!(latest.map(|event| event.seq), Some(2), "tail is seq 2");
+    assert!(
+        store
+            .latest_event_for_run(&RunId("missing".into()))
+            .await?
+            .is_none(),
+        "an unknown run has no tail"
+    );
+    Ok(())
+}
