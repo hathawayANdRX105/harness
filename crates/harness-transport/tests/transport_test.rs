@@ -1030,26 +1030,24 @@ async fn ws_upgrade_with_origin_echoes_origin() -> TestResult {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     poll_until(
-        || {
-            async move {
-                let origin = format!("http://localhost:{}", addr.port());
-                let mut request = format!("ws://{addr}/ws")
-                    .into_client_request()
-                    .map_err(|e| e.to_string())?;
-                request.headers_mut().insert(
-                    header::ORIGIN,
-                    header::HeaderValue::from_str(&origin).map_err(|e| e.to_string())?,
-                );
-                let (_stream, response) = tokio_tungstenite::connect_async(request)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let acao = response
-                    .headers()
-                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                    .ok_or("missing Access-Control-Allow-Origin on WS upgrade")?;
-                assert_eq!(acao.to_str().map_err(|e| e.to_string())?, origin);
-                Ok(())
-            }
+        || async move {
+            let origin = format!("http://localhost:{}", addr.port());
+            let mut request = format!("ws://{addr}/ws")
+                .into_client_request()
+                .map_err(|e| e.to_string())?;
+            request.headers_mut().insert(
+                header::ORIGIN,
+                header::HeaderValue::from_str(&origin).map_err(|e| e.to_string())?,
+            );
+            let (_stream, response) = tokio_tungstenite::connect_async(request)
+                .await
+                .map_err(|e| e.to_string())?;
+            let acao = response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .ok_or("missing Access-Control-Allow-Origin on WS upgrade")?;
+            assert_eq!(acao.to_str().map_err(|e| e.to_string())?, origin);
+            Ok(())
         },
         deadline,
     )
