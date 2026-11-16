@@ -202,6 +202,13 @@ pub trait SessionStore: Send + Sync + 'static {
     /// after the cutoff is superseded. The head moves to a fresh epoch that
     /// continues from the cutoff unit.
     ///
+    /// The cutoff may live in an older epoch of the same branch (ferrite's
+    /// stale-cutoff rule); the marker's `from_epoch` then names the head's
+    /// epoch — the one being superseded — not the cutoff's. Message
+    /// sequence numbers stay monotonic across rewinds: appends in the new
+    /// epoch continue after the highest sequence written so far, never
+    /// reusing a superseded tail's numbers.
+    ///
     /// Returns the new epoch. Rewinding to the current head is a no-op that
     /// returns the current epoch without writing a marker.
     async fn rewind_to_unit(

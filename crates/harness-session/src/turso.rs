@@ -108,7 +108,7 @@ use crate::store::{
 };
 use crate::unit::{
     HeadState, INITIAL_EPOCH, MAIN_BRANCH, StoredUnit, Unit, UnitKind, assemble_messages,
-    split_message,
+    integrity_hash, split_message,
 };
 use turso::{Builder, Connection, Database, params};
 
@@ -149,7 +149,7 @@ struct Migration {
 
 const MIGRATION_1_SQL: &str = "CREATE TABLE IF NOT EXISTS sessions (     session_id   TEXT PRIMARY KEY,     created_at_ms INTEGER NOT NULL ); CREATE TABLE IF NOT EXISTS units (     event_id        TEXT PRIMARY KEY,     session_id      TEXT NOT NULL,     branch_id       TEXT NOT NULL,     epoch           INTEGER NOT NULL,     event_order     INTEGER NOT NULL,     message_seq     INTEGER NOT NULL,     role            TEXT NOT NULL,     kind            TEXT NOT NULL,     payload_json    TEXT NOT NULL,     parent_event_id TEXT,     created_at_ms   INTEGER NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id),     UNIQUE(session_id, branch_id, epoch, event_order) ); CREATE TABLE IF NOT EXISTS session_heads (     session_id        TEXT PRIMARY KEY,     branch_id         TEXT NOT NULL,     epoch             INTEGER NOT NULL,     head_event_id     TEXT,     last_event_order  INTEGER NOT NULL,     last_message_seq  INTEGER NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ); CREATE TABLE IF NOT EXISTS run_events (     id           INTEGER PRIMARY KEY AUTOINCREMENT,     run_id       TEXT NOT NULL,     session_id   TEXT NOT NULL,     seq          INTEGER NOT NULL,     event_json   TEXT NOT NULL,     timestamp_ms INTEGER NOT NULL,     idempotency_key TEXT UNIQUE NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id),     UNIQUE(run_id, seq) ); CREATE INDEX IF NOT EXISTS idx_units_session_order     ON units(session_id, event_order); CREATE INDEX IF NOT EXISTS idx_run_events_run_seq     ON run_events(run_id, seq); CREATE INDEX IF NOT EXISTS idx_run_events_fts     ON run_events USING fts (event_json)     WITH (tokenizer = 'ngram');";
 
-const MIGRATION_2_SQL: &str = "ALTER TABLE units ADD COLUMN turn_id TEXT; ALTER TABLE units ADD COLUMN run_id TEXT; ALTER TABLE units ADD COLUMN source_kind TEXT; ALTER TABLE units ADD COLUMN tool_call_id TEXT; ALTER TABLE units ADD COLUMN idempotency_key TEXT; ALTER TABLE units ADD COLUMN integrity_hash TEXT; CREATE INDEX IF NOT EXISTS idx_units_run ON units(run_id); CREATE UNIQUE INDEX IF NOT EXISTS idx_units_idempotency     ON units(idempotency_key) WHERE idempotency_key IS NOT NULL;";
+const MIGRATION_2_SQL: &str = "ALTER TABLE units ADD COLUMN run_id TEXT; ALTER TABLE units ADD COLUMN source_kind TEXT; ALTER TABLE units ADD COLUMN tool_call_id TEXT; ALTER TABLE units ADD COLUMN idempotency_key TEXT; ALTER TABLE units ADD COLUMN integrity_hash TEXT; CREATE INDEX IF NOT EXISTS idx_units_run ON units(run_id); CREATE UNIQUE INDEX IF NOT EXISTS idx_units_idempotency     ON units(idempotency_key) WHERE idempotency_key IS NOT NULL;";
 
 const MIGRATION_3_SQL: &str = "CREATE TABLE IF NOT EXISTS history_markers (     session_id         TEXT NOT NULL,     branch_id          TEXT NOT NULL,     from_epoch         INTEGER NOT NULL,     to_epoch           INTEGER NOT NULL,     cutoff_event_id    TEXT,     cutoff_event_order INTEGER,     boundary           TEXT NOT NULL,     occurred_at_ms     INTEGER NOT NULL,     PRIMARY KEY (session_id, branch_id, to_epoch),     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ); CREATE INDEX IF NOT EXISTS idx_history_markers_session     ON history_markers(session_id, branch_id);";
 
@@ -221,15 +221,26 @@ impl TursoSessionStore {
             if applied.contains(&migration.version) {
                 continue;
             }
-            self.conn
-                .execute_batch(migration.sql)
+            // One transaction per migration: the DDL and its ledger row commit
+            // together, so a crash between them cannot leave the schema
+            // applied but unrecorded (a re-run would then fail on duplicate
+            // ALTERs and lock the database shut). execute_batch + INSERT share
+            // the gate but must NOT run autocommitted here.
+            let mut conn = self.tx_conn().await?;
+            let tx = conn
+                .transaction()
                 .await
                 .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-            self.conn
-                .execute(
-                    "INSERT INTO _session_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
-                    params![migration.version, migration.name, Self::now_ms()],
-                )
+            tx.execute_batch(migration.sql)
+                .await
+                .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO _session_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+                params![migration.version, migration.name, Self::now_ms()],
+            )
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+            tx.commit()
                 .await
                 .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
         }
@@ -434,7 +445,7 @@ impl TursoSessionStore {
             let sql = format!(
                 "SELECT event_id, branch_id, epoch, event_order, message_seq, role, kind,
                         payload_json, parent_event_id, created_at_ms,
-                        turn_id, run_id, source_kind, tool_call_id, idempotency_key,
+                        run_id, source_kind, tool_call_id, idempotency_key,
                         integrity_hash
                    FROM units
                   WHERE session_id = ?1 AND event_id IN ({})",
@@ -493,7 +504,7 @@ async fn load_units_from(
         .query(
             "SELECT event_id, branch_id, epoch, event_order, message_seq, role, kind,
                     payload_json, parent_event_id, created_at_ms,
-                    turn_id, run_id, source_kind, tool_call_id, idempotency_key,
+                    run_id, source_kind, tool_call_id, idempotency_key,
                     integrity_hash
                FROM units
               WHERE session_id = ?1
@@ -548,47 +559,64 @@ fn decode_unit_row(
     let created_at_ms: i64 = row
         .get(9)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    let turn_id: Option<String> = row
+    let run_id: Option<String> = row
         .get(10)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    let run_id: Option<String> = row
+    // Pre-v2 rows carry NULL provenance: source_kind falls back to the role
+    // family, integrity_hash stays empty (verification skips it).
+    let source_kind: Option<String> = row
         .get(11)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    let source_kind: String = row
+    let tool_call_id: Option<String> = row
         .get(12)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    let tool_call_id: Option<String> = row
+    let idempotency_key: Option<String> = row
         .get(13)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    let idempotency_key: Option<String> = row
+    let integrity_hash: Option<String> = row
         .get(14)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    let integrity_hash: String = row
-        .get(15)
-        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    Ok(StoredUnit {
-        unit: Unit {
-            event_id,
-            session_id: session_id.clone(),
-            branch_id,
-            epoch,
-            event_order: u64::try_from(event_order)
-                .map_err(|_| SessionStoreError::Internal("negative unit event_order".into()))?,
-            message_seq: u64::try_from(message_seq)
-                .map_err(|_| SessionStoreError::Internal("negative unit message_seq".into()))?,
-            role,
-            kind: UnitKind::parse(&kind)?,
-            run_id,
-            turn_id,
-            source_kind,
-            tool_call_id,
-            idempotency_key,
-            integrity_hash,
-            parent_event_id,
-            created_at_ms,
-        },
-        payload_json,
-    })
+    let unit = Unit {
+        event_id,
+        session_id: session_id.clone(),
+        branch_id,
+        epoch,
+        event_order: u64::try_from(event_order)
+            .map_err(|_| SessionStoreError::Internal("negative unit event_order".into()))?,
+        message_seq: u64::try_from(message_seq)
+            .map_err(|_| SessionStoreError::Internal("negative unit message_seq".into()))?,
+        source_kind: source_kind.unwrap_or_else(|| role.clone()),
+        role,
+        kind: UnitKind::parse(&kind)?,
+        run_id,
+        tool_call_id,
+        idempotency_key,
+        // An empty hash marks a pre-v2 legacy row: the migration adds the
+        // columns as NULL and nothing backfills them, so verification is
+        // skipped instead of failing every read of an upgraded database.
+        integrity_hash: integrity_hash.unwrap_or_default(),
+        parent_event_id,
+        created_at_ms,
+    };
+    verify_integrity(&unit, &payload_json)?;
+    Ok(StoredUnit { unit, payload_json })
+}
+
+/// Recompute a unit's integrity hash over its stored fields and compare it
+/// against the recorded one. Legacy rows (empty recorded hash) pass: their
+/// hash was never written, and there is nothing to compare against.
+fn verify_integrity(unit: &Unit, payload_json: &str) -> Result<(), SessionStoreError> {
+    if unit.integrity_hash.is_empty() {
+        return Ok(());
+    }
+    let recomputed = integrity_hash(unit, payload_json)?;
+    if recomputed == unit.integrity_hash {
+        return Ok(());
+    }
+    Err(SessionStoreError::Internal(format!(
+        "integrity hash mismatch for unit {} (recorded {}, recomputed {recomputed})",
+        unit.event_id, unit.integrity_hash
+    )))
 }
 
 /// Ensure the session has a head row, then read it; the caller holds the gate.
@@ -652,9 +680,9 @@ async fn insert_units_tx(
             "INSERT INTO units
                  (event_id, session_id, branch_id, epoch, event_order, message_seq,
                   role, kind, payload_json, parent_event_id, created_at_ms,
-                  turn_id, run_id, source_kind, tool_call_id, idempotency_key,
+                  run_id, source_kind, tool_call_id, idempotency_key,
                   integrity_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 unit.event_id.clone(),
                 unit.session_id.0.clone(),
@@ -667,7 +695,6 @@ async fn insert_units_tx(
                 payload_json.clone(),
                 unit.parent_event_id.clone(),
                 unit.created_at_ms,
-                unit.turn_id.clone(),
                 unit.run_id.clone(),
                 unit.source_kind.clone(),
                 unit.tool_call_id.clone(),
@@ -1135,7 +1162,7 @@ impl SessionStore for TursoSessionStore {
             .ok_or_else(|| SessionStoreError::SessionNotFound(session_id.clone()))?;
         let mut rows = tx
             .query(
-                "SELECT branch_id, epoch, event_order, message_seq FROM units
+                "SELECT branch_id, epoch, event_order FROM units
                   WHERE event_id = ?1 AND session_id = ?2",
                 params![unit_id.to_string(), session_id.0.clone()],
             )
@@ -1160,11 +1187,12 @@ impl SessionStore for TursoSessionStore {
         let unit_order: i64 = row
             .get(2)
             .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        let unit_message_seq: i64 = row
-            .get(3)
-            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        // The cutoff must live in the head's branch and not in the future:
-        // rewinding into another branch or past the head is a caller bug.
+        // The cutoff must live in the head's branch and not in the future.
+        // An OLDER epoch is allowed (ferrite's stale-cutoff rule): a rewind
+        // into a previously superseded epoch re-anchors the chain at that
+        // unit, and the parent graph resolves the retained prefix. The
+        // marker's from_epoch names the head's epoch (the one being
+        // superseded), never the cutoff's.
         if unit_branch != head.branch_id || unit_epoch > head.epoch {
             return Err(SessionStoreError::InvalidQuery(format!(
                 "unit {unit_id} is outside the head scope (branch {}, epoch {})",
@@ -1195,19 +1223,17 @@ impl SessionStore for TursoSessionStore {
         )
         .await
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-        // Message numbering continues from the cutoff so the retained prefix
-        // and the new epoch assemble into a dense sequence.
+        // last_message_seq is deliberately NOT reset: sequence numbers stay
+        // monotonic across rewinds. Resetting to the cutoff's seq would make
+        // post-rewind appends reuse sequence values of the superseded tail,
+        // colliding with its idempotency keys (run-tagged appends would fail
+        // the unique index) and merging adjacent equal-seq units in
+        // load_messages (silent message loss). rewind_clear keeps it too.
         tx.execute(
             "UPDATE session_heads
-                SET epoch = ?2, head_event_id = ?3, last_event_order = 0,
-                    last_message_seq = ?4
+                SET epoch = ?2, head_event_id = ?3, last_event_order = 0
               WHERE session_id = ?1",
-            params![
-                session_id.0.clone(),
-                to_epoch,
-                Some(unit_id.to_string()),
-                unit_message_seq,
-            ],
+            params![session_id.0.clone(), to_epoch, Some(unit_id.to_string())],
         )
         .await
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;

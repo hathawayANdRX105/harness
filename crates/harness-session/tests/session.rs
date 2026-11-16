@@ -781,7 +781,6 @@ fn unit(session: &SessionId, order: u64, message_seq: u64, parent: Option<&str>)
         role: "user".into(),
         kind: UnitKind::Prompt,
         run_id: None,
-        turn_id: None,
         source_kind: "user".into(),
         tool_call_id: None,
         idempotency_key: Some(format!("{event_id}:key")),
@@ -1488,8 +1487,9 @@ async fn append_after_rewind_chains_from_cutoff() -> Result<(), SessionStoreErro
         "the new unit chains from the cutoff"
     );
     assert_eq!(
-        fresh.unit.message_seq, 3,
-        "message numbering continues from the cutoff"
+        fresh.unit.message_seq, 4,
+        "sequence numbers stay monotonic across rewinds: the superseded tail's
+         numbers are never reused"
     );
 
     let replay = store.replay_ledger(&sid).await?;
@@ -1627,4 +1627,140 @@ fn crate_style_tool_call(id: &str) -> harness_core::message::ToolCall {
         name: "read".into(),
         args: serde_json::json!({"path": "/tmp/x"}),
     }
+}
+
+/// Purpose: run-tagged appends keep working after a rewind.
+/// Scenario: three run-tagged messages, rewind to the second message's unit,
+/// then append a fourth message with the same run id.
+/// Acceptance: the append succeeds (its idempotency key continues at seq 4
+/// and does not collide with the superseded tail's keys) and both
+/// load_messages and replay_ledger return every turn: prefix plus the new
+/// message, with the discarded third message gone.
+#[tokio::test]
+async fn run_tagged_append_after_rewind_does_not_collide() -> Result<(), SessionStoreError> {
+    let store = test_store().await;
+    let sid = make_session_id();
+    let rid = make_run_id();
+    store.create_session(&sid).await?;
+    for label in ["one", "two", "three"] {
+        store
+            .append_message_for_run(&sid, Some(&rid), None, &user_msg(label))
+            .await?;
+    }
+    let cutoff = store.load_units(&sid).await?[1].unit.event_id.clone();
+    store
+        .rewind_to_unit(&sid, &cutoff, RewindBoundary::Clean)
+        .await?;
+
+    store
+        .append_message_for_run(&sid, Some(&rid), None, &user_msg("fresh"))
+        .await?;
+
+    let units = store.load_units(&sid).await?;
+    assert_eq!(
+        units.len(),
+        4,
+        "prefix (2 units) + discarded tail (1) + new message (1)"
+    );
+    // load_messages reads the full ledger: the superseded tail stays visible
+    // for audit, and monotonic sequences keep the cross-epoch rows from
+    // merging into one message.
+    let loaded = store.load_messages(&sid).await?;
+    let loaded: Vec<Message> = loaded.into_iter().map(|entry| entry.message).collect();
+    assert_eq!(
+        loaded,
+        vec![
+            user_msg("one"),
+            user_msg("two"),
+            user_msg("three"),
+            user_msg("fresh"),
+        ],
+        "the full ledger keeps every turn, none merged away"
+    );
+    // replay_ledger reads the retained history: prefix plus the new turn.
+    let replay = store.replay_ledger(&sid).await?;
+    assert_eq!(
+        replay,
+        vec![user_msg("one"), user_msg("two"), user_msg("fresh")]
+    );
+    Ok(())
+}
+
+/// Purpose: a database written before the provenance migration stays
+/// readable after the upgrade.
+/// Scenario: build a v1-schema database file by hand (no provenance
+/// columns), insert legacy unit rows the old writer would have written, then
+/// open the store on it so migrations run.
+/// Acceptance: open + migrations succeed, legacy rows decode (source_kind
+/// derived from role, integrity verification skipped for the empty legacy
+/// hash), load_messages assembles them, and a fresh append writes full
+/// provenance.
+#[tokio::test]
+async fn pre_upgrade_rows_stay_readable_after_migration() -> Result<(), SessionStoreError> {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("must create temp dir: {e}"));
+    let path = dir.path().join("legacy.db");
+
+    // v1 schema exactly as the pre-provenance writer left it: units with the
+    // ten original columns and no markers table.
+    let v1_sql = "CREATE TABLE sessions ( session_id TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL ); CREATE TABLE units ( event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, branch_id TEXT NOT NULL, epoch INTEGER NOT NULL, event_order INTEGER NOT NULL, message_seq INTEGER NOT NULL, role TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, parent_event_id TEXT, created_at_ms INTEGER NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(session_id), UNIQUE(session_id, branch_id, epoch, event_order) ); CREATE TABLE session_heads ( session_id TEXT PRIMARY KEY, branch_id TEXT NOT NULL, epoch INTEGER NOT NULL, head_event_id TEXT, last_event_order INTEGER NOT NULL, last_message_seq INTEGER NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(session_id) ); CREATE TABLE run_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL, timestamp_ms INTEGER NOT NULL, idempotency_key TEXT UNIQUE NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(session_id), UNIQUE(run_id, seq) ); CREATE INDEX idx_units_session_order ON units(session_id, event_order); CREATE INDEX idx_run_events_run_seq ON run_events(run_id, seq);";
+    {
+        let db = turso::Builder::new_local(
+            path.to_str()
+                .ok_or_else(|| SessionStoreError::Storage("bad path".into()))?,
+        )
+        .build()
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        let conn = db
+            .connect()
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        conn.execute_batch(v1_sql)
+            .await
+            .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+        conn.execute_batch(
+            "INSERT INTO sessions VALUES ('legacy', 1);
+             INSERT INTO session_heads VALUES ('legacy', 'main', 1, 'legacy:main:1:1', 1, 1);
+             INSERT INTO units VALUES ('legacy:main:1:1', 'legacy', 'main', 1, 1, 1, 'user', 'prompt', '[{\"Text\":\"old turn\"}]', NULL, 1);",
+        )
+        .await
+        .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
+    }
+
+    // Opening runs the migrations over the legacy file.
+    let store = TursoSessionStore::open(&path).await?;
+    let sid = SessionId("legacy".into());
+    assert!(store.session_exists(&sid).await?);
+
+    let entries = store.load_messages(&sid).await?;
+    assert_eq!(entries.len(), 1, "the legacy turn survives the upgrade");
+    assert_eq!(
+        entries[0].message,
+        Message::User {
+            content: vec![Content::Text("old turn".into())],
+        },
+    );
+    let units = store.load_units(&sid).await?;
+    assert_eq!(
+        units[0].unit.source_kind, "user",
+        "legacy source_kind is derived from the role"
+    );
+    assert!(
+        units[0].unit.integrity_hash.is_empty(),
+        "legacy rows carry no hash and verification skips them"
+    );
+
+    // New appends land with full provenance on the upgraded schema.
+    store
+        .append_message(&sid, &user_msg("after upgrade"))
+        .await?;
+    let units = store.load_units(&sid).await?;
+    let fresh = units
+        .iter()
+        .find(|stored| stored.unit.created_at_ms > 1)
+        .ok_or_else(|| SessionStoreError::Internal("post-upgrade append not found".into()))?;
+    assert!(
+        !fresh.unit.integrity_hash.is_empty(),
+        "post-upgrade rows carry a verifiable hash"
+    );
+    Ok(())
 }

@@ -110,7 +110,6 @@ pub struct Unit {
     /// The run this unit came from, when it was produced inside one.
     pub run_id: Option<String>,
     /// The turn this unit belongs to, when the run reported one.
-    pub turn_id: Option<String>,
     /// Who produced the content: `user`, `model`, `tool`, or `system`.
     pub source_kind: String,
     /// For `tool_result` rows: the tool call this result answers.
@@ -194,7 +193,6 @@ pub(crate) fn split_message(
             role: role.to_string(),
             kind,
             run_id: run_id.map(str::to_string),
-            turn_id: None,
             source_kind: source_kind.to_string(),
             tool_call_id: None,
             idempotency_key: run_id.map(|run| format!("{run}:m{message_seq}:b{index}")),
