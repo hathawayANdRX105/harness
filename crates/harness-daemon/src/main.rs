@@ -24,7 +24,8 @@ use harness_core::tool::Tool;
 use harness_core::{EventSink, Model, RunEvent};
 use harness_model::OpenAIModel;
 use harness_scheduler::Scheduler;
-use harness_session::{RecallStore, SessionStore, turso::TursoSessionStore};
+use harness_session::{RecallStore, SessionStore};
+use harness_storage::open;
 use harness_transport::http;
 use harness_transport::ws;
 use harness_transport::{EventLog, TransportState, uds::UdsConfig};
@@ -247,11 +248,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let store_path = PathBuf::from(&session_dir).join("sessions.db");
     // Build the recall seam from the concrete store so it shares the store's
     // connection and FTS gate, then hand both trait objects to the handler.
-    let store_inner = TursoSessionStore::open(&store_path)
+    let handles = open(&store_path)
         .await
         .with_context(|| format!("open session store at {session_dir}"))?;
-    let recall: Arc<dyn RecallStore> = Arc::new(store_inner.recall());
-    let store: Arc<dyn SessionStore> = Arc::new(store_inner);
+    let store: Arc<dyn SessionStore> = handles.session;
+    let recall: Arc<dyn RecallStore> = handles.recall;
     let event_log: Arc<dyn EventLog> = Arc::new(StoreEventLog::new(store.clone()));
     // The broadcast channel is created up front so the runtime's event sink
     // and the transport state share one `tx`; it also doubles as the event

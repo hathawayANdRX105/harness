@@ -27,8 +27,8 @@ use harness_core::tool::ToolRequest;
 use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::DaemonHandler;
 use harness_scheduler::{RunStatus, Scheduler};
-use harness_session::turso::TursoSessionStore;
 use harness_session::{RecallStore, SessionStore};
+use harness_storage::open;
 use harness_transport::{CommandHandler, SlashCommand};
 
 /// Model that records every request and answers with a scripted reply.
@@ -162,7 +162,7 @@ async fn second_run_replays_first_run_history() {
     let dir = env::temp_dir().join(format!("harness-history-{}", id()));
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create temp dir: {e}"));
     let store = Arc::new(
-        TursoSessionStore::open(dir.join("sessions.db"))
+        open(dir.join("sessions.db"))
             .await
             .unwrap_or_else(|e| panic!("open store: {e}")),
     );
@@ -187,8 +187,8 @@ async fn second_run_replays_first_run_history() {
         .unwrap_or_else(|e| panic!("build runtime: {e}"));
 
     let scheduler = Scheduler::new(4, 4);
-    let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
-    let session_store: Arc<dyn SessionStore> = Arc::clone(&store) as Arc<dyn SessionStore>;
+    let recall: Arc<dyn RecallStore> = store.recall.clone();
+    let session_store: Arc<dyn SessionStore> = store.session.clone();
     let handler = DaemonHandler::new(
         scheduler.clone(),
         session_store,
@@ -242,6 +242,8 @@ async fn second_run_replays_first_run_history() {
     );
 
     let ledger = store
+        .session
+        .clone()
         .replay_ledger(&SessionId("history".into()))
         .await
         .unwrap_or_else(|e| panic!("replay ledger: {e}"));

@@ -1,73 +1,88 @@
-//! Session persistence for the harness: the `SessionStore` port trait and its
-//! Turso (libsql) default implementation.
+//! The session persistence **port** for the harness: the `SessionStore`
+//! and `RecallStore` traits plus the unit-ledger domain model. This crate
+//! declares *what* the harness needs from storage — replay, rewind, run
+//! provenance, steering kinds, keyword search — without naming any storage
+//! engine. Concrete implementations live in adapter crates
+//! (`harness-storage` is the Turso-backed one).
 //!
 //! # Crate structure
 //!
-//! - [`store`] — the [`SessionStore`] trait, [`SessionStoreError`], and the
+//! - [`store`] — the [`SessionStore`] trait, [`SessionStoreError`], the
+//!   rewind surface ([`HistoryMarker`], [`RewindBoundary`]), and the
 //!   canonical [`replay_messages`] function that applies `None`-section
 //!   removal to reconstruct a full transcript.
-//! - [`turso`] — [`TursoSessionStore`], the default Turso-backed
-//!   implementation (ferrite's proven connection model, idempotent ledger).
 //! - [`unit`] — [`Unit`], [`StoredUnit`], the block ledger row, and the
-//!   split/assemble functions that map a `Message` onto units and back.
-//! - [`graph`] — [`GraphIndex`], the in-memory petgraph read model derived
-//!   from the `units` ledger (never persisted): units are nodes, the parent
-//!   chain is the unit-tree edge, and each scope has a HEAD.
-//!
-//! The read-model types (`Unit`, `StoredUnit`, `UnitKind`, `GraphIndex`,
-//! `assemble_messages`) are public because integration tests drive them and
-//! the daemon-side context assembler will consume the graph directly; the
-//! store internals (head decoding, SQL helpers) stay private.
-//!
-//! # Three persistent stores
-//!
-//! 1. **Unit ledger** (`units`) — one row per conversational block (prompt,
-//!    assistant text/reasoning, tool call, tool result, system section delta).
-//!    The index columns (ids, branch, epoch, order, role, kind, parent) and
-//!    the content (`payload_json`) live in the same Turso row; the graph holds
-//!    only the index columns.
-//! 2. **Session heads** (`session_heads`) — the HEAD pointer and the last
-//!    order/message sequence per session scope. Appends move it in the same
-//!    transaction that inserts units.
-//! 3. **RunEvent log** (`run_events`) — ordered events keyed by `run_id` with
-//!    a monotonic `seq`. Recovery detects gaps from missing seqs; recall's
-//!    full-text index is built on it.
+//!   split/assemble functions that map a `Message` onto units and back,
+//!   with the [`integrity_hash`] the adapter verifies on read.
+//! - [`recall`] — the [`RecallStore`] search port, [`RecallHit`]/
+//!   [`RecallScope`], and [`NoRecall`], the zero-cost default.
 //!
 //! # Recovery
 //!
 //! ```text
 //! SessionStore::replay_ledger(id)
-//!   -> graph HEAD -> ancestors() gives unit ids root..head
-//!   -> load the payload rows for those ids from Turso
+//!   -> the adapter's read model names the retained unit chain
 //!   -> assemble_messages() groups blocks back into messages
 //!   -> replay_messages() applies system-section accumulation
 //!   -> full transcript ready for the model
 //!
 //! SessionStore::load_messages(id)
-//!   -> read every unit ordered by event_order
-//!   -> assemble_messages() (the direct, graph-free path)
-//!
-//! SessionStore::events_for_run(id) + check_event_gaps(id)
-//!   -> load events ordered by seq
-//!   -> find missing seqs -> consumer re-emits them
+//!   -> every unit ordered by event_order, grouped by message_seq
 //! ```
 //!
 //! # Design provenance
 //!
 //! pi's `durable/src/harness/` committed-ledger pattern: every mutation is
-//! append-only, the ledger is the source of truth for recovery. NanoHarness's
-//! `RunContext`/`RunCheckpoint` split (`core/schema.py:193-204`): identity
-//! is immutable and carried by core types; the store holds only the data that
-//! a crashed daemon re-reads.
+//! append-only, the ledger is the source of truth for recovery.
+//! NanoHarness's `RunContext`/`RunCheckpoint` split (`core/schema.py:193`):
+//! identity is immutable and carried by core types; the store holds only the
+//! data a crashed daemon re-reads.
 
-pub mod graph;
+/// Errors from session storage operations (the crate-wide result error).
+///
+/// Lives at the crate root: the port traits, the unit ledger, and the
+/// recall seam all return it, so no layer imports another layer's error.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionStoreError {
+    /// The named session does not exist.
+    #[error("session {0} not found")]
+    SessionNotFound(SessionId),
+
+    /// A session with this id already exists.
+    #[error("session {0} already exists")]
+    SessionAlreadyExists(SessionId),
+
+    /// The underlying storage backend reported an error.
+    #[error("storage backend error: {0}")]
+    Storage(String),
+
+    /// Message or event serialization to/from JSON failed.
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// The run already carries an event with this seq (append-only log:
+    /// re-applying an already-persisted event is a no-op, not an error).
+    #[error("run {0} already has an event at seq {1}")]
+    DuplicateSeq(RunId, u64),
+
+    /// A caller-supplied query is malformed or too large to search safely.
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
+    /// An internal invariant was violated (e.g. corrupt data).
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+use harness_core::run::{RunId, SessionId};
+
 pub mod recall;
 pub mod store;
-pub mod turso;
 pub mod unit;
 
-pub use graph::GraphIndex;
 pub use recall::{NoRecall, RecallHit, RecallScope, RecallStore};
-pub use store::{MessageEntry, SessionStore, SessionStoreError, replay_messages};
-pub use turso::{TursoFtsRecall, TursoSessionStore};
-pub use unit::{HeadState, StoredUnit, Unit, UnitKind, assemble_messages};
+pub use store::{HistoryMarker, RewindBoundary, SessionStore, replay_messages};
+pub use unit::{
+    HeadState, MessageEntry, StoredUnit, Unit, UnitKind, assemble_messages, event_id,
+    integrity_hash, split_message,
+};
