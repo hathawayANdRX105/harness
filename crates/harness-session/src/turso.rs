@@ -25,54 +25,21 @@
 //!
 //! ## Schema
 //!
-//! Four tables, all `CREATE TABLE IF NOT EXISTS` so `open` is idempotent and
-//! safe on both fresh and existing database files:
+//! The authoritative DDL lives in `sql/001_baseline.sql` (one file per
+//! schema version, applied by the migration runner below — the baseline
+//! squashes all pre-release schema). Four tables:
 //!
-//! ```sql
-//! CREATE TABLE sessions (
-//!     session_id   TEXT PRIMARY KEY,
-//!     created_at_ms INTEGER NOT NULL
-//! );
-//!
-//! -- One row per conversational block: index columns + content, like
-//! -- ferrite's context_events. `parent_event_id` is the graph edge.
-//! CREATE TABLE units (
-//!     event_id        TEXT PRIMARY KEY,
-//!     session_id      TEXT NOT NULL,
-//!     branch_id       TEXT NOT NULL,
-//!     epoch           INTEGER NOT NULL,
-//!     event_order     INTEGER NOT NULL,
-//!     message_seq     INTEGER NOT NULL,
-//!     role            TEXT NOT NULL,
-//!     kind            TEXT NOT NULL,
-//!     payload_json    TEXT NOT NULL,
-//!     parent_event_id TEXT,
-//!     created_at_ms   INTEGER NOT NULL,
-//!     FOREIGN KEY (session_id) REFERENCES sessions(session_id),
-//!     UNIQUE(session_id, branch_id, epoch, event_order)
-//! );
-//!
-//! CREATE TABLE session_heads (
-//!     session_id       TEXT PRIMARY KEY,
-//!     branch_id        TEXT NOT NULL,
-//!     epoch            INTEGER NOT NULL,
-//!     head_event_id    TEXT,
-//!     last_event_order INTEGER NOT NULL,
-//!     last_message_seq INTEGER NOT NULL
-//! );
-//!
-//! CREATE TABLE run_events (
-//!     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-//!     run_id       TEXT NOT NULL,
-//!     session_id   TEXT NOT NULL,
-//!     seq          INTEGER NOT NULL,
-//!     event_json   TEXT NOT NULL,
-//!     timestamp_ms INTEGER NOT NULL,
-//!     idempotency_key TEXT UNIQUE NOT NULL,
-//!     FOREIGN KEY (session_id) REFERENCES sessions(session_id),
-//!     UNIQUE(run_id, seq)
-//! );
-//! ```
+//! - **`sessions`** — session identity.
+//! - **`units`** — one row per conversational block: index columns + content,
+//!   like ferrite's context_events. `parent_event_id` is the graph edge;
+//!   `run_id`/`source_kind`/`tool_call_id`/`idempotency_key`/`integrity_hash`
+//!   carry run provenance (untagged appends leave `run_id` and
+//!   `idempotency_key` NULL).
+//! - **`session_heads`** — each session's head pointer (branch, epoch, head
+//!   unit, next order/sequence).
+//! - **`run_events`** — the append-only run event wire log, with the
+//!   tantivy-backed FTS index powering the recall store.
+//! - **`history_markers`** — the rewind audit trail.
 //!
 //! `idempotency_key` is `run_id:seq`. Appends use `INSERT ... ON CONFLICT
 //! DO NOTHING` so re-applying an already-persisted event (for example after a
@@ -137,39 +104,26 @@ pub struct TursoSessionStore {
     graphs: StdMutex<HashMap<SessionId, Arc<GraphIndex>>>,
 }
 
-/// Versioned schema migrations, applied oldest-first by
-/// [`TursoSessionStore::migrate`]. Each entry's SQL must be idempotent under
-/// its own version check (the runner only runs a migration once, keyed by
-/// version).
+/// Versioned SQL migrations, oldest first — one `.sql` file per version
+/// under `sql/`, registered here with `include_str!`. The runner is generic:
+/// it applies each pending file inside one transaction (DDL + its
+/// `_session_migrations` ledger row commit together) and skips versions the
+/// ledger already recorded.
+///
+/// Policy: the baseline squashes all pre-release schema. Before release,
+/// schema changes rewrite `001_baseline.sql`; after release, never edit a
+/// shipped file — add a new versioned file and register it.
 struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
 }
 
-const MIGRATION_1_SQL: &str = "CREATE TABLE IF NOT EXISTS sessions (     session_id   TEXT PRIMARY KEY,     created_at_ms INTEGER NOT NULL ); CREATE TABLE IF NOT EXISTS units (     event_id        TEXT PRIMARY KEY,     session_id      TEXT NOT NULL,     branch_id       TEXT NOT NULL,     epoch           INTEGER NOT NULL,     event_order     INTEGER NOT NULL,     message_seq     INTEGER NOT NULL,     role            TEXT NOT NULL,     kind            TEXT NOT NULL,     payload_json    TEXT NOT NULL,     parent_event_id TEXT,     created_at_ms   INTEGER NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id),     UNIQUE(session_id, branch_id, epoch, event_order) ); CREATE TABLE IF NOT EXISTS session_heads (     session_id        TEXT PRIMARY KEY,     branch_id         TEXT NOT NULL,     epoch             INTEGER NOT NULL,     head_event_id     TEXT,     last_event_order  INTEGER NOT NULL,     last_message_seq  INTEGER NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ); CREATE TABLE IF NOT EXISTS run_events (     id           INTEGER PRIMARY KEY AUTOINCREMENT,     run_id       TEXT NOT NULL,     session_id   TEXT NOT NULL,     seq          INTEGER NOT NULL,     event_json   TEXT NOT NULL,     timestamp_ms INTEGER NOT NULL,     idempotency_key TEXT UNIQUE NOT NULL,     FOREIGN KEY (session_id) REFERENCES sessions(session_id),     UNIQUE(run_id, seq) ); CREATE INDEX IF NOT EXISTS idx_units_session_order     ON units(session_id, event_order); CREATE INDEX IF NOT EXISTS idx_run_events_run_seq     ON run_events(run_id, seq); CREATE INDEX IF NOT EXISTS idx_run_events_fts     ON run_events USING fts (event_json)     WITH (tokenizer = 'ngram');";
-
-const MIGRATION_2_SQL: &str = "ALTER TABLE units ADD COLUMN run_id TEXT; ALTER TABLE units ADD COLUMN source_kind TEXT; ALTER TABLE units ADD COLUMN tool_call_id TEXT; ALTER TABLE units ADD COLUMN idempotency_key TEXT; ALTER TABLE units ADD COLUMN integrity_hash TEXT; CREATE INDEX IF NOT EXISTS idx_units_run ON units(run_id); CREATE UNIQUE INDEX IF NOT EXISTS idx_units_idempotency     ON units(idempotency_key) WHERE idempotency_key IS NOT NULL;";
-
-const MIGRATION_3_SQL: &str = "CREATE TABLE IF NOT EXISTS history_markers (     session_id         TEXT NOT NULL,     branch_id          TEXT NOT NULL,     from_epoch         INTEGER NOT NULL,     to_epoch           INTEGER NOT NULL,     cutoff_event_id    TEXT,     cutoff_event_order INTEGER,     boundary           TEXT NOT NULL,     occurred_at_ms     INTEGER NOT NULL,     PRIMARY KEY (session_id, branch_id, to_epoch),     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ); CREATE INDEX IF NOT EXISTS idx_history_markers_session     ON history_markers(session_id, branch_id);";
-
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "base_tables",
-        sql: MIGRATION_1_SQL,
-    },
-    Migration {
-        version: 2,
-        name: "unit_integrity_columns",
-        sql: MIGRATION_2_SQL,
-    },
-    Migration {
-        version: 3,
-        name: "history_markers",
-        sql: MIGRATION_3_SQL,
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "baseline",
+    sql: include_str!("../sql/001_baseline.sql"),
+}];
 
 impl TursoSessionStore {
     /// Drop the cached graph so the next replay rebuilds from the committed
@@ -183,9 +137,8 @@ impl TursoSessionStore {
 
     /// Apply pending schema migrations, oldest first.
     ///
-    /// Each migration runs once, recorded in `_session_migrations`; the
-    /// `execute_batch` + ledger insert share the gate but run autocommitted
-    /// (every migration is written so the version check is the only guard).
+    /// Each migration runs once, recorded in `_session_migrations`; the DDL
+    /// and its ledger row commit together in one transaction.
     async fn migrate(&self) -> Result<(), SessionStoreError> {
         let _guard = self.gate.lock().await;
         self.conn
@@ -562,9 +515,7 @@ fn decode_unit_row(
     let run_id: Option<String> = row
         .get(10)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    // Pre-v2 rows carry NULL provenance: source_kind falls back to the role
-    // family, integrity_hash stays empty (verification skips it).
-    let source_kind: Option<String> = row
+    let source_kind: String = row
         .get(11)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
     let tool_call_id: Option<String> = row
@@ -573,7 +524,7 @@ fn decode_unit_row(
     let idempotency_key: Option<String> = row
         .get(13)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
-    let integrity_hash: Option<String> = row
+    let integrity_hash: String = row
         .get(14)
         .map_err(|e| SessionStoreError::Storage(e.to_string()))?;
     let unit = Unit {
@@ -585,16 +536,13 @@ fn decode_unit_row(
             .map_err(|_| SessionStoreError::Internal("negative unit event_order".into()))?,
         message_seq: u64::try_from(message_seq)
             .map_err(|_| SessionStoreError::Internal("negative unit message_seq".into()))?,
-        source_kind: source_kind.unwrap_or_else(|| role.clone()),
+        source_kind,
         role,
         kind: UnitKind::parse(&kind)?,
         run_id,
         tool_call_id,
         idempotency_key,
-        // An empty hash marks a pre-v2 legacy row: the migration adds the
-        // columns as NULL and nothing backfills them, so verification is
-        // skipped instead of failing every read of an upgraded database.
-        integrity_hash: integrity_hash.unwrap_or_default(),
+        integrity_hash,
         parent_event_id,
         created_at_ms,
     };
@@ -603,12 +551,10 @@ fn decode_unit_row(
 }
 
 /// Recompute a unit's integrity hash over its stored fields and compare it
-/// against the recorded one. Legacy rows (empty recorded hash) pass: their
-/// hash was never written, and there is nothing to compare against.
+/// against the recorded one. The baseline schema declares the column
+/// `NOT NULL` and every writer fills it, so a mismatch is corruption and
+/// fails the read loudly.
 fn verify_integrity(unit: &Unit, payload_json: &str) -> Result<(), SessionStoreError> {
-    if unit.integrity_hash.is_empty() {
-        return Ok(());
-    }
     let recomputed = integrity_hash(unit, payload_json)?;
     if recomputed == unit.integrity_hash {
         return Ok(());
