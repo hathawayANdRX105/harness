@@ -22,6 +22,61 @@
 //! across task boundaries. All port methods are `async` — the daemon pump
 //! awaits them directly; no `spawn_blocking` wrappers are needed.
 
+// --- History rewind surface ---
+
+/// How a rewind epoch boundary treats the discarded tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindBoundary {
+    /// The discarded tail is superseded but kept for audit; the new epoch
+    /// continues from the cutoff unit.
+    Clean,
+    /// The new epoch starts empty: every prior unit is superseded.
+    ClearEmpty,
+}
+
+impl RewindBoundary {
+    /// The stored representation of the boundary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RewindBoundary::Clean => "clean",
+            RewindBoundary::ClearEmpty => "clear_empty",
+        }
+    }
+
+    /// Decode a stored boundary string.
+    pub fn parse(raw: &str) -> Result<Self, SessionStoreError> {
+        match raw {
+            "clean" => Ok(RewindBoundary::Clean),
+            "clear_empty" => Ok(RewindBoundary::ClearEmpty),
+            other => Err(SessionStoreError::Internal(format!(
+                "unknown rewind boundary {other:?}"
+            ))),
+        }
+    }
+}
+
+/// One recorded rewind: why the session head moved from `from_epoch` to
+/// `to_epoch`, and where the old epoch was cut.
+///
+/// Markers are the audit trail of history edits; `replay_ledger` consults
+/// them only to distinguish a cleared epoch from a corrupt head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryMarker {
+    pub session_id: SessionId,
+    pub branch_id: String,
+    /// The epoch the head was on when the rewind happened.
+    pub from_epoch: i64,
+    /// The epoch opened by the rewind (`from_epoch + 1`).
+    pub to_epoch: i64,
+    /// The unit the new epoch continues from (`Clean` rewinds only).
+    pub cutoff_event_id: Option<String>,
+    /// The cutoff unit's order inside the old epoch.
+    pub cutoff_event_order: Option<u64>,
+    pub boundary: RewindBoundary,
+    pub occurred_at_ms: i64,
+}
+
+use crate::unit::UnitKind;
 use async_trait::async_trait;
 use harness_core::event::RunEvent;
 use harness_core::message::Message;
@@ -86,6 +141,7 @@ pub struct MessageEntry {
 /// Every method returns `Result` with [`SessionStoreError`]. Storage
 /// backends are expected to be reachable; a missing database is a hard
 /// error, not a degraded-path skip.
+
 #[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
     /// Create a new, empty session.
@@ -101,11 +157,78 @@ pub trait SessionStore: Send + Sync + 'static {
     ///
     /// The store assigns the next monotonic sequence number. Returns the
     /// assigned seq.
+    ///
+    /// Default: routes to [`append_message_for_run`] without run provenance
+    /// and with the default block split.
     async fn append_message(
         &self,
         session_id: &SessionId,
         message: &Message,
+    ) -> Result<u64, SessionStoreError> {
+        self.append_message_for_run(session_id, None, None, message)
+            .await
+    }
+
+    /// Append one message tagged to `run_id` (provenance) and optionally
+    /// carrying a kind override (steering units).
+    ///
+    /// Implementations must keep the unit ledger's block split and record the
+    /// run/turn provenance the caller supplies.
+    async fn append_message_for_run(
+        &self,
+        session_id: &SessionId,
+        run_id: Option<&RunId>,
+        kind_override: Option<UnitKind>,
+        message: &Message,
     ) -> Result<u64, SessionStoreError>;
+
+    /// Queue a steering message. The loop replays it as a user turn; the
+    /// ledger records it with its own unit kind so the injection point stays
+    /// visible in history.
+    ///
+    /// Default: treated as a plain message.
+    async fn append_steering_message(
+        &self,
+        session_id: &SessionId,
+        run_id: Option<&RunId>,
+        message: &Message,
+    ) -> Result<u64, SessionStoreError> {
+        self.append_message_for_run(session_id, run_id, Some(UnitKind::Steering), message)
+            .await
+    }
+
+    /// Rewind the session head to `unit_id`: the retained prefix
+    /// (root..cutoff, inclusive) stays the replayable history, everything
+    /// after the cutoff is superseded. The head moves to a fresh epoch that
+    /// continues from the cutoff unit.
+    ///
+    /// The cutoff may live in an older epoch of the same branch (ferrite's
+    /// stale-cutoff rule); the marker's `from_epoch` then names the head's
+    /// epoch — the one being superseded — not the cutoff's. Message
+    /// sequence numbers stay monotonic across rewinds: appends in the new
+    /// epoch continue after the highest sequence written so far, never
+    /// reusing a superseded tail's numbers.
+    ///
+    /// Returns the new epoch. Rewinding to the current head is a no-op that
+    /// returns the current epoch without writing a marker.
+    async fn rewind_to_unit(
+        &self,
+        session_id: &SessionId,
+        unit_id: &str,
+        boundary: RewindBoundary,
+    ) -> Result<u64, SessionStoreError>;
+
+    /// Clear the session history: the head moves to a fresh empty epoch and
+    /// replay yields an empty transcript. Prior units stay stored for audit.
+    ///
+    /// Returns the new epoch.
+    async fn rewind_clear(&self, session_id: &SessionId) -> Result<u64, SessionStoreError>;
+
+    /// The session's rewind markers, oldest first.
+    async fn history_markers(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<HistoryMarker>, SessionStoreError>;
 
     /// Load every message for a session, ordered by sequence number.
     async fn load_messages(

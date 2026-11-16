@@ -28,6 +28,14 @@ pub trait TranscriptSink: Send + Sync {
     /// loop has no recovery action and keeps the in-memory transcript
     /// authoritative for the current run.
     async fn append(&self, session_id: &SessionId, message: &Message);
+
+    /// Record one steering message: replayed as a user turn, but recorded
+    /// with its own unit kind so history shows the injection point.
+    ///
+    /// Default: treated as a plain message append.
+    async fn append_steering(&self, session_id: &SessionId, message: &Message) {
+        self.append(session_id, message).await;
+    }
 }
 
 /// Append `message` to the in-memory transcript, mirroring it to the sink
@@ -44,6 +52,20 @@ pub(crate) async fn push(
 ) {
     if let Some(sink) = sink {
         sink.append(session_id, &message).await;
+    }
+    transcript.push(message);
+}
+
+/// Append a steering message: replayed as a user turn, but recorded with its
+/// own unit kind so history shows the injection point.
+pub(crate) async fn push_steering(
+    transcript: &mut Vec<Message>,
+    sink: Option<&dyn TranscriptSink>,
+    session_id: &SessionId,
+    message: Message,
+) {
+    if let Some(sink) = sink {
+        sink.append_steering(session_id, &message).await;
     }
     transcript.push(message);
 }

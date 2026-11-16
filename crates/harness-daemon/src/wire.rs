@@ -276,8 +276,10 @@ impl DaemonHandler {
         // Every message this run appends is persisted through the session
         // ledger. The loop awaits each append, so the next run replays a
         // complete transcript without a background writer.
-        let transcript_sink: Arc<dyn TranscriptSink> =
-            Arc::new(SessionMessageSink::new(Arc::clone(&self.store)));
+        let transcript_sink: Arc<dyn TranscriptSink> = Arc::new(SessionMessageSink::new(
+            Arc::clone(&self.store),
+            run_id.clone(),
+        ));
         deps.seed = seed;
         deps.transcript_sink = Some(transcript_sink);
         // A session's run sees only its active tool subset: the catalog's

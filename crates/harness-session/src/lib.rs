@@ -70,4 +70,4 @@ pub use graph::GraphIndex;
 pub use recall::{NoRecall, RecallHit, RecallScope, RecallStore};
 pub use store::{MessageEntry, SessionStore, SessionStoreError, replay_messages};
 pub use turso::{TursoFtsRecall, TursoSessionStore};
-pub use unit::{StoredUnit, Unit, UnitKind, assemble_messages};
+pub use unit::{HeadState, StoredUnit, Unit, UnitKind, assemble_messages};
