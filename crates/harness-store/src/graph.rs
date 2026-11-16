@@ -22,7 +22,7 @@ use std::sync::{Mutex, PoisonError};
 use harness_core::run::SessionId;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 
-use crate::unit::Unit;
+use harness_session::unit::Unit;
 
 /// One edge: `child -> parent`, the unit-tree relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

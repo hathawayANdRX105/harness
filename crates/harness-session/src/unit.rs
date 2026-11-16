@@ -35,10 +35,10 @@ use crate::store::{MessageEntry, SessionStoreError};
 
 /// The branch new units are appended to. Branching arrives with the fork
 /// feature; every session starts on this one.
-pub(crate) const MAIN_BRANCH: &str = "main";
+pub const MAIN_BRANCH: &str = "main";
 /// The epoch new units are appended to. Rewinds advance it; a fresh session
 /// starts here.
-pub(crate) const INITIAL_EPOCH: i64 = 1;
+pub const INITIAL_EPOCH: i64 = 1;
 
 /// What one ledger row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,7 +146,7 @@ pub struct HeadState {
 }
 
 /// The unit id for one append slot.
-pub(crate) fn event_id(session_id: &SessionId, branch_id: &str, epoch: i64, order: u64) -> String {
+pub fn event_id(session_id: &SessionId, branch_id: &str, epoch: i64, order: u64) -> String {
     format!("{}:{branch_id}:{epoch}:{order}", session_id.0)
 }
 
@@ -157,7 +157,7 @@ pub(crate) fn event_id(session_id: &SessionId, branch_id: &str, epoch: i64, orde
 /// provenance when the append happens inside a run; `kind_override` labels a
 /// whole message as one `steering` unit instead of its default split. Each
 /// returned payload is the JSON stored in `payload_json`.
-pub(crate) fn split_message(
+pub fn split_message(
     head: &HeadState,
     run_id: Option<&str>,
     kind_override: Option<UnitKind>,
@@ -224,7 +224,7 @@ fn message_user_content(message: &Message) -> Result<Vec<Content>, SessionStoreE
 
 /// sha256 over the fixed index+content field list, `U+001F`-joined. The
 /// parent edge is excluded — ferrite's known P1 limitation.
-pub(crate) fn integrity_hash(unit: &Unit, payload: &str) -> Result<String, SessionStoreError> {
+pub fn integrity_hash(unit: &Unit, payload: &str) -> Result<String, SessionStoreError> {
     let mut hasher = Sha256::new();
     for field in [
         unit.session_id.0.as_str(),

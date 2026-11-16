@@ -1153,6 +1153,7 @@ dependencies = [
  "harness-model",
  "harness-scheduler",
  "harness-session",
+ "harness-store",
  "harness-transport",
  "libc",
  "serde",
@@ -1230,12 +1231,22 @@ dependencies = [
  "async-trait",
  "harness-core",
  "hex",
- "petgraph",
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "harness-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "harness-core",
+ "harness-session",
+ "petgraph",
+ "serde_json",
+ "tempfile",
  "tokio",
  "turso",
 ]

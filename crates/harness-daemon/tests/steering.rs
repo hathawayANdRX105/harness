@@ -33,8 +33,8 @@ use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::DaemonHandler;
 use harness_scheduler::RunStatus;
 use harness_scheduler::Scheduler;
-use harness_session::turso::TursoSessionStore;
 use harness_session::{RecallStore, SessionStore};
+use harness_store::open;
 use harness_transport::{CommandHandler, SlashCommand, TransportError};
 
 /// Model that records every request and replays a scripted turn list.
@@ -176,7 +176,7 @@ async fn steer_reaches_the_next_turn_and_rejects_unknown_runs() {
     let dir = env::temp_dir().join(format!("harness-steer-{}", id()));
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create temp dir: {e}"));
     let store = Arc::new(
-        TursoSessionStore::open(dir.join("sessions.db"))
+        open(dir.join("sessions.db"))
             .await
             .unwrap_or_else(|e| panic!("open store: {e}")),
     );
@@ -223,8 +223,8 @@ async fn steer_reaches_the_next_turn_and_rejects_unknown_runs() {
         .unwrap_or_else(|e| panic!("build runtime: {e}"));
 
     let scheduler = Scheduler::new(4, 4);
-    let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
-    let session_store: Arc<dyn SessionStore> = Arc::clone(&store) as Arc<dyn SessionStore>;
+    let recall: Arc<dyn RecallStore> = store.recall.clone();
+    let session_store: Arc<dyn SessionStore> = store.session.clone();
     // The catalog is the per-session tool source: start_run replaces the
     // runtime's tool list with its active subset, so an empty catalog would
     // hide the slow tool and finish the run before the steer arrives.

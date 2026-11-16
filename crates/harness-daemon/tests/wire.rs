@@ -17,8 +17,8 @@ use harness_core::{RunEvent, Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
 use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::{DaemonHandler, StoreEventLog};
 use harness_scheduler::Scheduler;
-use harness_session::turso::TursoSessionStore;
 use harness_session::{RecallStore, SessionStore};
+use harness_store::open;
 use harness_transport::{CommandHandler, EventLog, SlashCommand, TransportError};
 
 static SEARCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -26,13 +26,14 @@ static SEARCH_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Open a temp store with one session and two runs' events, each carrying
 /// a unique marker text in its payload.  A unique temp dir per call keeps
 /// parallel tests from contending on one turso file lock.
-async fn search_fixture() -> std::sync::Arc<TursoSessionStore> {
+async fn search_fixture() -> harness_store::StoreHandles {
     let seq = SEARCH_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = env::temp_dir().join(format!("harness-search-{}-{seq}", id()));
     let _ = fs::create_dir_all(&dir);
-    let store = TursoSessionStore::open(dir.join("search.db"))
+    let handles = open(dir.join("search.db"))
         .await
         .unwrap_or_else(|e| panic!("open store: {e}"));
+    let store = handles.session.clone();
     let session = SessionId("search-session".into());
     store
         .create_session(&session)
@@ -59,7 +60,7 @@ async fn search_fixture() -> std::sync::Arc<TursoSessionStore> {
                 .unwrap_or_else(|e| panic!("append event: {e}"));
         }
     }
-    std::sync::Arc::new(store)
+    handles
 }
 
 /// Stub tool with a fixed name and no behaviour: enough for the catalog to
@@ -111,11 +112,11 @@ impl Tool for StubTool {
 async fn store_and_recall() -> (Arc<dyn SessionStore>, Arc<dyn RecallStore>) {
     let dir = env::temp_dir().join(format!("harness-wire-tools-{}", id()));
     let _ = fs::create_dir_all(&dir);
-    let store_inner = TursoSessionStore::open(dir.join("tools.db"))
+    let store_inner = open(dir.join("tools.db"))
         .await
         .unwrap_or_else(|e| panic!("open store: {e}"));
-    let recall: Arc<dyn RecallStore> = Arc::new(store_inner.recall());
-    let store: Arc<dyn SessionStore> = Arc::new(store_inner);
+    let recall: Arc<dyn RecallStore> = store_inner.recall;
+    let store: Arc<dyn SessionStore> = store_inner.session;
     (store, recall)
 }
 
@@ -130,11 +131,11 @@ async fn store_and_recall() -> (Arc<dyn SessionStore>, Arc<dyn RecallStore>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_search_returns_marker_events_as_json_hits() -> Result<(), Box<dyn std::error::Error>>
 {
-    let store = search_fixture().await;
-    let recall: Arc<dyn RecallStore> = Arc::new(store.recall());
+    let handles = search_fixture().await;
+    let recall: Arc<dyn RecallStore> = handles.recall;
     let scheduler = Scheduler::new(4, 4);
     let catalog = Arc::new(ToolCatalog::new(Vec::new()));
-    let handler = DaemonHandler::new(scheduler, store, recall, catalog, None);
+    let handler = DaemonHandler::new(scheduler, handles.session, recall, catalog, None);
 
     let value = match CommandHandler::handle(
         &handler,
@@ -209,7 +210,7 @@ async fn store_event_log_resolves_latest_run_for_session() -> Result<(), Box<dyn
 {
     let dir = env::temp_dir().join(format!("harness-wire-latest-{}", id()));
     let _ = fs::create_dir_all(&dir);
-    let store = TursoSessionStore::open(dir.join("latest.db")).await?;
+    let store = open(dir.join("latest.db")).await?.session;
     let session = SessionId("wire-session".into());
     store.create_session(&session).await?;
     let run_a = RunId("wire-run-a".into());
@@ -231,7 +232,7 @@ async fn store_event_log_resolves_latest_run_for_session() -> Result<(), Box<dyn
             })
             .await?;
     }
-    let log = StoreEventLog::new(Arc::new(store));
+    let log = StoreEventLog::new(store.clone());
     assert_eq!(
         log.latest_run_for_session(&session).await,
         Some(run_b),
@@ -267,7 +268,7 @@ async fn daemon_tools_commands_consult_catalog() {
         Arc::new(StubTool::new("read")) as Arc<dyn Tool>,
         Arc::new(StubTool::new("write")) as Arc<dyn Tool>,
     ]));
-    let handler = DaemonHandler::new(scheduler, store, recall, catalog, None);
+    let handler = DaemonHandler::new(scheduler, store.clone(), recall, catalog, None);
 
     let list = |handler: &DaemonHandler| match CommandHandler::handle(
         handler,
