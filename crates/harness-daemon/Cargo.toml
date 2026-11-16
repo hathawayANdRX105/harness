@@ -15,7 +15,7 @@ harness-model = { path = "../harness-model" }
 harness-loop = { path = "../harness-loop" }
 harness-scheduler = { path = "../harness-scheduler" }
 harness-session = { path = "../harness-session" }
-harness-store = { path = "../harness-store" }
+harness-storage = { path = "../harness-storage" }
 harness-transport = { path = "../harness-transport" }
 # tokio: the daemon owns the runtime — transport servers, signal watchers and
 # the event pump all live on it.

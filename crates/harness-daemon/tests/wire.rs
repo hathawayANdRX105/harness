@@ -18,7 +18,7 @@ use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::{DaemonHandler, StoreEventLog};
 use harness_scheduler::Scheduler;
 use harness_session::{RecallStore, SessionStore};
-use harness_store::open;
+use harness_storage::open;
 use harness_transport::{CommandHandler, EventLog, SlashCommand, TransportError};
 
 static SEARCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -26,7 +26,7 @@ static SEARCH_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Open a temp store with one session and two runs' events, each carrying
 /// a unique marker text in its payload.  A unique temp dir per call keeps
 /// parallel tests from contending on one turso file lock.
-async fn search_fixture() -> harness_store::StoreHandles {
+async fn search_fixture() -> harness_storage::StoreHandles {
     let seq = SEARCH_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = env::temp_dir().join(format!("harness-search-{}-{seq}", id()));
     let _ = fs::create_dir_all(&dir);

@@ -20,7 +20,7 @@ use harness_session::store::{RewindBoundary, replay_messages};
 use harness_session::{
     MessageEntry, RecallScope, RecallStore, SessionStore, SessionStoreError, Unit, UnitKind,
 };
-use harness_store::{GraphIndex, TursoSessionStore};
+use harness_storage::{GraphIndex, TursoSessionStore};
 
 /// A test store backed by a private temp database file. The `_dir` guard
 /// keeps the temp dir (and thus the `.db` file) alive for the store's whole

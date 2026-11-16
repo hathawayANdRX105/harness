@@ -19,7 +19,7 @@
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), harness_session::SessionStoreError> {
-//! let handles = harness_store::open("sessions.db").await?;
+//! let handles = harness_storage::open("sessions.db").await?;
 //! let store: std::sync::Arc<dyn harness_session::SessionStore> = handles.session;
 //! let recall: std::sync::Arc<dyn harness_session::RecallStore> = handles.recall;
 //! # Ok(())
@@ -32,7 +32,7 @@
 //!
 //! # Layout
 //!
-//! - [`store`] — [`TursoSessionStore`]: the connection model, the ledger
+//! - [`turso`] — [`TursoSessionStore`]: the connection model, the ledger
 //!   appends, rewind/markers, the run-event log, and the migration runner.
 //! - [`graph`] — [`GraphIndex`], the derived read model over unit ids
 //!   (never persisted; ferrite's 0106 lesson).
@@ -47,11 +47,11 @@
 
 mod fts;
 pub mod graph;
-mod store;
+mod turso;
 
 pub use fts::TursoFtsRecall;
 pub use graph::GraphIndex;
-pub use store::TursoSessionStore;
+pub use turso::TursoSessionStore;
 
 use std::sync::Arc;
 

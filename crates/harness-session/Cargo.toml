@@ -2,7 +2,7 @@
 name = "harness-session"
 version = "0.1.0"
 edition = "2024"
-description = "The session persistence port: SessionStore and RecallStore traits, the unit-ledger domain model (split/assemble, rewind markers, integrity hash), and replay semantics. Storage engines live in adapter crates (harness-store)."
+description = "The session persistence port: SessionStore and RecallStore traits, the unit-ledger domain model (split/assemble, rewind markers, integrity hash), and replay semantics. Storage engines live in adapter crates (harness-storage)."
 license = "MIT"
 publish = false
 

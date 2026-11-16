@@ -1153,7 +1153,7 @@ dependencies = [
  "harness-model",
  "harness-scheduler",
  "harness-session",
- "harness-store",
+ "harness-storage",
  "harness-transport",
  "libc",
  "serde",
@@ -1238,7 +1238,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "harness-store"
+name = "harness-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",

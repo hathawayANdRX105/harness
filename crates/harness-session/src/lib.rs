@@ -3,7 +3,7 @@
 //! declares *what* the harness needs from storage — replay, rewind, run
 //! provenance, steering kinds, keyword search — without naming any storage
 //! engine. Concrete implementations live in adapter crates
-//! (`harness-store` is the Turso-backed one).
+//! (`harness-storage` is the Turso-backed one).
 //!
 //! # Crate structure
 //!

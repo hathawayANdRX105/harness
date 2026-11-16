@@ -28,7 +28,7 @@ use harness_daemon::tools::ToolCatalog;
 use harness_daemon::wire::DaemonHandler;
 use harness_scheduler::{RunStatus, Scheduler};
 use harness_session::{RecallStore, SessionStore};
-use harness_store::open;
+use harness_storage::open;
 use harness_transport::{CommandHandler, SlashCommand};
 
 /// Model that records every request and answers with a scripted reply.

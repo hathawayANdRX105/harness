@@ -25,7 +25,7 @@ use harness_core::{EventSink, Model, RunEvent};
 use harness_model::OpenAIModel;
 use harness_scheduler::Scheduler;
 use harness_session::{RecallStore, SessionStore};
-use harness_store::open;
+use harness_storage::open;
 use harness_transport::http;
 use harness_transport::ws;
 use harness_transport::{EventLog, TransportState, uds::UdsConfig};

@@ -1,5 +1,5 @@
 [package]
-name = "harness-store"
+name = "harness-storage"
 version = "0.1.0"
 edition = "2024"
 description = "Turso-backed storage adapter for the harness session port: TursoSessionStore, the FTS recall handle, the in-memory graph shadow, and the versioned migration runner — assembled behind the harness-session port traits. No storage-engine type crosses the crate boundary."
