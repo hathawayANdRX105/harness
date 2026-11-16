@@ -38,15 +38,51 @@
 //! identity is immutable and carried by core types; the store holds only the
 //! data a crashed daemon re-reads.
 
+/// Errors from session storage operations (the crate-wide result error).
+///
+/// Lives at the crate root: the port traits, the unit ledger, and the
+/// recall seam all return it, so no layer imports another layer's error.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionStoreError {
+    /// The named session does not exist.
+    #[error("session {0} not found")]
+    SessionNotFound(SessionId),
+
+    /// A session with this id already exists.
+    #[error("session {0} already exists")]
+    SessionAlreadyExists(SessionId),
+
+    /// The underlying storage backend reported an error.
+    #[error("storage backend error: {0}")]
+    Storage(String),
+
+    /// Message or event serialization to/from JSON failed.
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// The run already carries an event with this seq (append-only log:
+    /// re-applying an already-persisted event is a no-op, not an error).
+    #[error("run {0} already has an event at seq {1}")]
+    DuplicateSeq(RunId, u64),
+
+    /// A caller-supplied query is malformed or too large to search safely.
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
+    /// An internal invariant was violated (e.g. corrupt data).
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+use harness_core::run::{RunId, SessionId};
+
 pub mod recall;
 pub mod store;
 pub mod unit;
 
 pub use recall::{NoRecall, RecallHit, RecallScope, RecallStore};
-pub use store::{
-    HistoryMarker, MessageEntry, RewindBoundary, SessionStore, SessionStoreError, replay_messages,
-};
+pub use store::{HistoryMarker, RewindBoundary, SessionStore, replay_messages};
 pub use unit::{
-    HeadState, StoredUnit, Unit, UnitKind, assemble_messages, event_id, integrity_hash,
-    split_message,
+    HeadState, MessageEntry, StoredUnit, Unit, UnitKind, assemble_messages, event_id,
+    integrity_hash, split_message,
 };

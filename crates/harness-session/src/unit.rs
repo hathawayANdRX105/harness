@@ -31,7 +31,7 @@ use harness_core::message::{Content, Message, ToolCall, ToolResultMessage};
 use harness_core::run::SessionId;
 use sha2::{Digest, Sha256};
 
-use crate::store::{MessageEntry, SessionStoreError};
+use crate::SessionStoreError;
 
 /// The branch new units are appended to. Branching arrives with the fork
 /// feature; every session starts on this one.
@@ -309,6 +309,20 @@ fn assistant_blocks(
             )),
         })
         .collect()
+}
+
+/// One persisted message with its assigned sequence number.
+///
+/// `seq` is monotonically increasing per session, assigned by the store on
+/// append. The consumer uses seq to verify the order and integrity of the
+/// ledger during recovery. Defined beside [`assemble_messages`], the
+/// function that produces it.
+#[derive(Debug, Clone)]
+pub struct MessageEntry {
+    /// Monotonic sequence number within the session.
+    pub seq: u64,
+    /// The stored message.
+    pub message: Message,
 }
 
 /// Assemble ordered ledger rows back into messages.

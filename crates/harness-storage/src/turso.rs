@@ -71,11 +71,11 @@ use tokio::sync::Mutex;
 use crate::fts::TursoFtsRecall;
 use crate::graph::GraphIndex;
 use harness_session::store::{
-    HistoryMarker, MessageEntry, RewindBoundary, SessionStore, SessionStoreError, replay_messages,
+    HistoryMarker, RewindBoundary, SessionStore, SessionStoreError, replay_messages,
 };
 use harness_session::unit::{
-    HeadState, INITIAL_EPOCH, MAIN_BRANCH, StoredUnit, Unit, UnitKind, assemble_messages,
-    integrity_hash, split_message,
+    HeadState, INITIAL_EPOCH, MAIN_BRANCH, MessageEntry, StoredUnit, Unit, UnitKind,
+    assemble_messages, integrity_hash, split_message,
 };
 use turso::{Builder, Connection, Database, params};
 

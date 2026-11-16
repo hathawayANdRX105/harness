@@ -8,7 +8,7 @@
 //! default: no index, no hits — recall is an opt-in capability, never a
 //! hidden dependency.
 
-use crate::store::SessionStoreError;
+use crate::SessionStoreError;
 use harness_core::run::{RunId, SessionId};
 
 /// One search hit: where the match lives and a highlighted snippet.

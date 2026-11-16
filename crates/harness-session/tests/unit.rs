@@ -4,7 +4,8 @@
 
 use harness_core::message::{Content, Message, ToolCall};
 use harness_core::run::SessionId;
-use harness_session::store::{MessageEntry, replay_messages};
+use harness_session::store::replay_messages;
+use harness_session::unit::MessageEntry;
 use harness_session::unit::{
     INITIAL_EPOCH, MAIN_BRANCH, UnitKind, assemble_messages, integrity_hash, split_message,
 };

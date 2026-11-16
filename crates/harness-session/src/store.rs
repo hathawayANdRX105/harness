@@ -76,57 +76,13 @@ pub struct HistoryMarker {
     pub occurred_at_ms: i64,
 }
 
-use crate::unit::UnitKind;
+use crate::unit::{MessageEntry, UnitKind};
 use async_trait::async_trait;
 use harness_core::event::RunEvent;
 use harness_core::message::Message;
 use harness_core::run::{RunId, SessionId};
 
-/// Errors from session storage operations.
-#[derive(Debug, thiserror::Error)]
-pub enum SessionStoreError {
-    /// The named session does not exist.
-    #[error("session {0} not found")]
-    SessionNotFound(SessionId),
-
-    /// A session with this id already exists.
-    #[error("session {0} already exists")]
-    SessionAlreadyExists(SessionId),
-
-    /// The underlying storage backend reported an error.
-    #[error("storage backend error: {0}")]
-    Storage(String),
-
-    /// Message or event serialization to/from JSON failed.
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    /// The run already carries an event with this seq (append-only log:
-    /// re-applying an already-persisted event is a no-op, not an error).
-    #[error("run {0} already has an event at seq {1}")]
-    DuplicateSeq(RunId, u64),
-
-    /// A caller-supplied query is malformed or too large to search safely.
-    #[error("invalid query: {0}")]
-    InvalidQuery(String),
-
-    /// An internal invariant was violated (e.g. corrupt data).
-    #[error("internal error: {0}")]
-    Internal(String),
-}
-
-/// One persisted message with its assigned sequence number.
-///
-/// `seq` is monotonically increasing per session, assigned by the store on
-/// append. The consumer uses seq to verify the order and integrity of the
-/// ledger during recovery.
-#[derive(Debug, Clone)]
-pub struct MessageEntry {
-    /// Monotonic sequence number within the session.
-    pub seq: u64,
-    /// The stored message.
-    pub message: Message,
-}
+pub use crate::SessionStoreError;
 
 /// The storage port for session persistence.
 ///
