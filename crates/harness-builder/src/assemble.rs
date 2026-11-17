@@ -50,7 +50,7 @@ use crate::BuildError;
 use crate::analyze;
 use crate::spec::{
     CompactionPolicySpec, HarnessSpec, HookKind, McpServerSpec, ModelSpec, PromptSectionSpec,
-    SkillSpec, ToolKind, ToolSpec,
+    SkillSpec, ToolKind, ToolSpec, UnitManifest,
 };
 
 // ---------------------------------------------------------------------------
@@ -229,7 +229,12 @@ pub fn mcp_server_specs(entries: &[McpServerEntry]) -> Vec<McpServerSpec> {
             url: None,
             tool_call_timeout_ms: None,
             from_config: true,
-            manifest: Default::default(),
+            // The matching `mcp_tool_specs` unit requires this capability so
+            // analysis installs the server before its tools.
+            manifest: UnitManifest {
+                provides: vec![format!("mcp:{}", entry.name)],
+                ..UnitManifest::default()
+            },
         })
         .collect()
 }
