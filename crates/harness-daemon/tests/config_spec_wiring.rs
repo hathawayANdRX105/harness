@@ -105,8 +105,14 @@ impl Model for MockModel {
     }
 }
 
-// The fake MCP server lives in a fixture so this test body stays focused on
-// the config -> spec -> runtime wiring it is meant to verify.
+// WHY Python here: the builder really spawns the configured MCP server as a
+// subprocess and does an initialize + tools/list handshake to discover tool
+// names, so the test needs a runnable stdio server answering JSON-RPC over
+// stdin/stdout. Python's stdlib does that in a few lines with no new Rust dev
+// dependency; a hand-written Rust fake would need its own JSON-RPC framing and
+// process plumbing for the same effect. The script lives in a fixture rather
+// than inline so it can be read on its own, and CI's ubuntu-latest runners
+// ship python3.
 const MCP_SERVER_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/trivial_mcp_server.py"
