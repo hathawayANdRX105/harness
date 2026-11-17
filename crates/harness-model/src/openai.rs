@@ -616,13 +616,17 @@ fn parse_delta(
             ..
         } = choice.delta;
 
-        // Text delta
-        if let Some(text) = content {
+        // Text delta — an empty chunk carries no text and must not produce a
+        // zero-length `TextDelta` event.
+        if let Some(text) = content
+            && !text.is_empty()
+        {
             events.push(ModelEvent::TextDelta(text));
         }
 
-        // Reasoning delta (DeepSeek dialect only)
+        // Reasoning delta (DeepSeek dialect only) — skip empty chunks.
         if let Some(reasoning) = reasoning_content
+            && !reasoning.is_empty()
             && dialect == Dialect::DeepSeek
         {
             events.push(ModelEvent::ReasoningDelta(reasoning));
