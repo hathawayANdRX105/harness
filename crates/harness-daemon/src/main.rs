@@ -6,7 +6,7 @@
 //! [`TransportState`]. Scheduling, the loop, tools and compaction all live in
 //! their own crates; this process only assembles, starts, supervises and ends.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use harness_core::tool::Tool;
 use harness_core::{EventSink, Model, RunEvent};
 use harness_model::OpenAIModel;
 use harness_scheduler::Scheduler;
-use harness_session::{GraphIndex, RecallStore, SessionStore};
+use harness_session::{RecallStore, SessionStore};
 use harness_storage::open;
 use harness_transport::http;
 use harness_transport::ws;
@@ -133,15 +133,11 @@ fn build_runtime(
     spec.prompt_sections = harness_builder::prompt_sections(&config.prompt.sections);
     spec.skills = harness_builder::skill_specs_from_roots(&config.registry.skills);
     spec.mcp_servers = harness_builder::mcp_server_specs(&config.mcp.servers);
-    // MCP tool units are namespaced `mcp-<server>`; they cannot collide with
-    // builtin or injected tool names, but skip any name already present to keep
-    // spec unit ids unique.
-    let mut existing: HashSet<String> = spec.tools.iter().map(|tool| tool.name.clone()).collect();
-    spec.tools.extend(
-        harness_builder::mcp_tool_specs(&config.mcp.servers)
-            .into_iter()
-            .filter(|tool| existing.insert(tool.name.clone())),
-    );
+    // MCP tool units are namespaced `mcp-<server>`; spec validation rejects a
+    // genuine `tool:<name>` collision instead of silently dropping a configured
+    // server's tools.
+    spec.tools
+        .extend(harness_builder::mcp_tool_specs(&config.mcp.servers));
     // Compaction: the harness-rs five-stage ladder, executed by the structural
     // DefaultCompactor — local, deterministic edits, never a model call. The
     // ladder is declared in the spec so the recorded plan and the executing
@@ -317,14 +313,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(tool) = &subagent_tool {
         tool.set_catalog(Arc::clone(&catalog));
     }
-    // The graph is a derived in-memory shadow of the run_events ledger: the
-    // pump appends each persisted event, and the /graph command hydrates a
-    // run from the store on first query (lazily, per run).
-    let graph = Arc::new(GraphIndex::new());
     let handler = Arc::new(DaemonHandler::new(
         scheduler.clone(),
         store,
-        graph,
         recall,
         catalog,
         subagent_tool.clone(),

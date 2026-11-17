@@ -222,15 +222,9 @@ fn config_prompt_skills_mcp_wire_into_runtime() -> Result<(), Box<dyn std::error
     spec.prompt_sections = prompt_sections(&config.prompt.sections);
     spec.skills = skill_specs_from_roots(&config.registry.skills);
     spec.mcp_servers = mcp_server_specs(&config.mcp.servers);
-    // MCP tool units are namespaced `mcp-<server>`; skip any name already
-    // present to keep spec unit ids unique.
-    let mut existing: std::collections::HashSet<String> =
-        spec.tools.iter().map(|tool| tool.name.clone()).collect();
-    spec.tools.extend(
-        mcp_tool_specs(&config.mcp.servers)
-            .into_iter()
-            .filter(|tool| existing.insert(tool.name.clone())),
-    );
+    // MCP tool units are namespaced `mcp-<server>`; spec validation catches
+    // a genuine `tool:<name>` collision.
+    spec.tools.extend(mcp_tool_specs(&config.mcp.servers));
 
     // Spec-level wiring.
     assert_eq!(spec.prompt_sections.len(), 2, "both prompt sections mapped");
