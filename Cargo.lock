@@ -1259,7 +1259,6 @@ dependencies = [
  "axum",
  "glob",
  "harness-core",
- "harness-mcp",
  "regex",
  "reqwest",
  "serde",

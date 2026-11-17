@@ -423,3 +423,42 @@ async fn multiple_tool_calls_in_one_delta() {
         matches!(&events[1], ModelEvent::ToolCallStart { id, name } if id == "call_2" && name == "get_time")
     );
 }
+
+/// An empty `content` chunk produces no `TextDelta` event, and a non-empty
+/// chunk still flows through normally.
+#[tokio::test]
+async fn empty_text_delta_produces_no_event() {
+    let (addr, state) = start_mock().await;
+    let base_url = format!("http://{addr}/v1");
+
+    {
+        let mut s = state.lock().await;
+        s.responses = vec![
+            r#"{"id":"5","object":"chat.completion.chunk","choices":[{"delta":{"content":""},"index":0}]}"#.into(),
+            r#"{"id":"5","object":"chat.completion.chunk","choices":[{"delta":{"content":"real text"},"index":0}]}"#.into(),
+            r#"{"id":"5","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop","index":0}]}"#.into(),
+            "[DONE]".into(),
+        ];
+    }
+
+    let model =
+        OpenAIModel::new(test_model_info(), &base_url, "sk-test").with_retry_policy(fast_retry());
+    let stream = model.stream(&test_request()).await;
+
+    let events: Vec<ModelEvent> = stream.collect().await;
+
+    // No empty TextDelta from the empty-content chunk.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ModelEvent::TextDelta(t) if t.is_empty())),
+        "no empty TextDelta expected, got {events:?}",
+    );
+    // The real text delta still comes through.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ModelEvent::TextDelta(t) if t == "real text")),
+        "expected TextDelta('real text'), got {events:?}",
+    );
+}

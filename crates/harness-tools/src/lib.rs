@@ -19,11 +19,9 @@
 //!
 //! ## Dependency discipline
 //!
-//! This crate depends **only** on `harness-core` (tool trait, types) and
-//! `harness-mcp` (for MCP tool bridge types that consumers may want to
-//! register alongside builtins). No config, loop, or daemon crate is
-//! pulled in — tool configuration arrives through the constructor or
-//! trait parameters.
+//! This crate depends **only** on `harness-core` (tool trait, types). No
+//! config, loop, or daemon crate is pulled in — tool configuration arrives
+//! through the constructor or trait parameters.
 
 pub mod args;
 pub mod builtin;

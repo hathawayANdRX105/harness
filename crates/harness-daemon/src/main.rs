@@ -125,6 +125,19 @@ fn build_runtime(
             .as_ref()
             .map(|_| ToolSpec::external("subagent")),
     );
+    // Prompt sections, skills and MCP servers declared in config are mapped into
+    // the spec so the builder assembles them into the runtime. Hooks are
+    // declarative-only: [registry].hooks is a list of paths with no on-disk
+    // definition contract, so there is no config->HookSpec mapping to apply and
+    // spec.hooks is left empty (no hook file format is invented here).
+    spec.prompt_sections = harness_builder::prompt_sections(&config.prompt.sections);
+    spec.skills = harness_builder::skill_specs_from_roots(&config.registry.skills);
+    spec.mcp_servers = harness_builder::mcp_server_specs(&config.mcp.servers);
+    // MCP tool units are namespaced `mcp-<server>`; spec validation rejects a
+    // genuine `tool:<name>` collision instead of silently dropping a configured
+    // server's tools.
+    spec.tools
+        .extend(harness_builder::mcp_tool_specs(&config.mcp.servers));
     // Compaction: the harness-rs five-stage ladder, executed by the structural
     // DefaultCompactor — local, deterministic edits, never a model call. The
     // ladder is declared in the spec so the recorded plan and the executing
