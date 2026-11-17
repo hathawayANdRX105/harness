@@ -105,53 +105,12 @@ impl Model for MockModel {
     }
 }
 
-/// A trivial stdio MCP server: answers `initialize` and `tools/list`, then
-/// never replies to notifications. Exposed to the daemon as a subprocess
-/// command so `build` can spawn it and advertise `mcp__trivial__echo`.
-const MCP_SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
-import json
-import sys
-
-REPLIES = {
-    "initialize": {
-        "protocolVersion": "2025-06-18",
-        "capabilities": {},
-        "serverInfo": {"name": "trivial", "version": "1.0.0"},
-    },
-    "tools/list": {
-        "tools": [
-            {
-                "name": "echo",
-                "description": "A trivial echo tool.",
-                "inputSchema": {"type": "object", "properties": {}},
-            }
-        ],
-    },
-}
-
-
-def main():
-    out = sys.stdout
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rid = req.get("id")
-        method = req.get("method")
-        if rid is None:
-            # Notification (e.g. notifications/initialized): no reply expected.
-            continue
-        result = REPLIES.get(method, {})
-        out.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}) + "\n")
-        out.flush()
-
-
-main()
-"#;
+// The fake MCP server lives in a fixture so this test body stays focused on
+// the config -> spec -> runtime wiring it is meant to verify.
+const MCP_SERVER_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/trivial_mcp_server.py"
+);
 
 #[test]
 fn config_prompt_skills_mcp_wire_into_runtime() -> Result<(), Box<dyn std::error::Error>> {
@@ -163,9 +122,7 @@ fn config_prompt_skills_mcp_wire_into_runtime() -> Result<(), Box<dyn std::error
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(skill_dir.join("SKILL.md"), "# Greet\nA greeting skill.\n")?;
 
-    // The trivial MCP server script on disk, invoked via python3.
-    let server_script = dir.join("trivial_mcp_server.py");
-    std::fs::write(&server_script, MCP_SERVER_SCRIPT)?;
+    // The fixture is already on disk in the repo; no temp copy needed.
 
     let config = Config {
         version: CURRENT_CONFIG_VERSION,
@@ -180,7 +137,7 @@ fn config_prompt_skills_mcp_wire_into_runtime() -> Result<(), Box<dyn std::error
             servers: vec![McpServerEntry {
                 name: "trivial".into(),
                 command: "python3".into(),
-                args: vec![server_script.display().to_string()],
+                args: vec![MCP_SERVER_FIXTURE.to_string()],
                 env_var: None,
             }],
         },
