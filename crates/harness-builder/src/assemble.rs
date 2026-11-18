@@ -998,13 +998,7 @@ fn deny_tools_hook(hook_name: &str, tools: &[String]) -> BeforeToolCallFn {
     let denied: HashSet<String> = tools.iter().cloned().collect();
     let hook_name = hook_name.to_string();
     Arc::new(move |request| {
-        if denied.contains(&request.name) {
-            Err(format!(
-                "tool `{}` is denied by hook `{hook_name}`",
-                request.name
-            ))
-        } else {
-            Ok(())
-        }
+        (!denied.contains(&request.name))
+            .ok_or_else(|| format!("tool `{}` is denied by hook `{hook_name}`", request.name))
     })
 }

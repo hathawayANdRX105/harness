@@ -610,12 +610,8 @@ fn validate_manifest(unit: &str, manifest: &UnitManifest) -> Result<(), SpecErro
         .chain(&manifest.requires)
         .chain(&manifest.conflicts)
         .try_for_each(|capability| {
-            if capability.trim().is_empty() {
-                Err(SpecError::EmptyCapability {
-                    unit: unit.to_string(),
-                })
-            } else {
-                Ok(())
-            }
+            (!capability.trim().is_empty()).ok_or_else(|| SpecError::EmptyCapability {
+                unit: unit.to_string(),
+            })
         })
 }
