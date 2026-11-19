@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use crate::control::RunControl;
 use crate::message::{Content, Message, ToolCall, ToolResultMessage};
 use crate::model::{Model, Usage};
-use crate::run::RunStopReason;
+use crate::run::{RunContext, RunStopReason};
 use crate::tool::Tool;
 
 /// One turn being machined: the single source of truth a `Processor` reads
@@ -42,6 +42,12 @@ pub struct Turn {
     pub tools: Vec<Arc<dyn Tool>>,
     /// Cancellation plus the steering mailbox, read at every node boundary.
     pub control: RunControl,
+    /// The run's identity and limits — what events and tool requests carry
+    /// so a node never needs a second channel to know which run it serves.
+    pub ctx: RunContext,
+    /// Which turn of the run is being machined (0-based). The driver sets it
+    /// before each topology pass; nodes read it for event correlation.
+    pub turn_idx: u32,
     /// Per-run event sequence counter, incremented whenever a node emits.
     pub seq: AtomicU64,
     /// Response-side intermediate products, filled once the model stream
@@ -56,11 +62,18 @@ impl Turn {
     /// Start a turn from the host's seed ledger — a session replay for a
     /// resumed run, empty for a fresh session. Seed messages are already
     /// persisted upstream, so the run never re-mirrors them.
-    pub fn new(model: Arc<dyn Model>, control: RunControl, seed: Vec<Message>) -> Self {
+    pub fn new(
+        model: Arc<dyn Model>,
+        control: RunControl,
+        ctx: RunContext,
+        seed: Vec<Message>,
+    ) -> Self {
         Self {
             ledger: seed,
             tools: Vec::new(),
             control,
+            ctx,
+            turn_idx: 0,
             seq: AtomicU64::new(0),
             artifacts: TurnArtifacts::default(),
             model,
@@ -96,6 +109,10 @@ pub struct TurnArtifacts {
     pub results: Vec<ToolResultMessage>,
     /// Token accounting, whenever the provider reports it.
     pub usage: Usage,
+    /// The terminal route the model stream folded into: `None` on a clean
+    /// turn, `Some` when `ModelProcessor` saw a terminal event. The driver
+    /// reads it to backfill partials and finish the run.
+    pub stop: Option<RunStopReason>,
 }
 
 /// One machining step in the topology. Implementations hold only the

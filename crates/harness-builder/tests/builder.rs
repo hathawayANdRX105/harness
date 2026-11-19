@@ -854,6 +854,7 @@ async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error
     let mut turn = Turn::new(
         Arc::new(MockModel::new(Vec::new())),
         RunControl::new(),
+        make_ctx(),
         Vec::new(),
     );
     runtime.prompt_topology.step(&mut turn).await;

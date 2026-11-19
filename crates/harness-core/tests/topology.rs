@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use harness_core::control::RunControl;
 use harness_core::message::Message;
 use harness_core::model::{Model, ModelInfo, ModelRequest, ModelStream};
+use harness_core::run::{RunContext, RunId, RunLimits, SessionId, Task};
 use harness_core::topology::{Processor, Route, Topology, Turn};
 
 struct StubModel(ModelInfo);
@@ -57,6 +58,20 @@ fn sample_info() -> ModelInfo {
     }
 }
 
+fn sample_ctx() -> RunContext {
+    RunContext {
+        run_id: RunId("run-shell".into()),
+        session_id: SessionId("session-shell".into()),
+        task: Task {
+            description: "shell probe".into(),
+            source: None,
+            deadline: None,
+        },
+        limits: RunLimits::default(),
+        started_at_ms: 0,
+    }
+}
+
 /// Purpose: the turn's seed ledger is the host's session replay and must
 /// survive construction untouched.
 /// Scenario: two user messages seeded, nothing else wired.
@@ -69,7 +84,7 @@ fn turn_carries_seed_ledger_verbatim() {
         Message::user_text("first user turn"),
         Message::user_text("second user turn"),
     ];
-    let turn = Turn::new(model, RunControl::new(), seed);
+    let turn = Turn::new(model, RunControl::new(), sample_ctx(), seed);
 
     assert_eq!(turn.ledger.len(), 2, "seed messages ride the turn verbatim");
     assert!(
