@@ -219,10 +219,34 @@ ToolDispatchProcessor（事件顺序与旧路径逐字一致），待 per-call �
 - **per-call 状态进 artifacts**：把 ToolDispatchProcessor 拆成 Approval / ToolExec / Output 三节点的前提是 per-call 的 request、decision、execution 状态挂在 `TurnArtifacts` 上而不是闭包里；拆开后「无 tool 调用跳过执行段」才能用 `Goto` 表达。
 - **ToolExecProcessor 的并行**：`join_all` 在节点内部（`dispatch.rs:321-389` 现状），确认这部分不外泄成图分支。
 - **转向（steering）注入点**：当前在 `turn_boundary`（每轮开始）；Topology 化后应是 DAG 源节点的一部分，需确认与 `Route::Goto` 不冲突。
-- **预算门的位置**：ContextProcessor 在 prompt 段末，还是 ModelProcessor 自己做？旧代码在 `prepare_request` 之后、模型调用之前（`engine.rs:369`），倾向保持同样的拓扑位置。
+- **预算门的模块归属**：已落地为独立模块 `src/budget.rs`（`harness-context`
+  的唯一消费者），driver 在两段拓扑之间调用；进一步节点化（prompt 段末的
+  ContextProcessor）仍是后续切片。
+
+## 8.5 模块拆分与能力依赖边界（harness-loop 内部）
+
+参照 gateway-gate（每道 gate 单文件：auth/quota/ratelimit/graylist，共享词汇在
+core，组装在 chain），`processors/` 一个处理器一个文件，共享机制各自归属：
+
+| 文件 | 职责 | 唯一依赖理由 |
+|---|---|---|
+| `processors/system_ledger.rs` | 系统账本归位 | 纯 core 类型 |
+| `processors/instruction.rs` | 注入指令幂等追加 | 纯 core 类型 |
+| `processors/model.rs` | 唯一持流的模型节点 | pump 机制 |
+| `processors/pump.rs` | 流泵（ModelEvent 折叠） | `futures` / `tokio:macros` / `serde_json` 全 crate 唯一消费者 |
+| `processors/append.rs` | assistant 内容落地 + 完成门 | transcript |
+| `processors/tool_dispatch.rs` | 批量调度六步链 | dispatch / hooks |
+| `budget.rs` | 轮次边界预算门 | `harness-context` 全 crate 唯一消费者 |
+| `engine.rs` | driver：`run()` + `LoopDeps` + `response_topology()` 组装面 | — |
+
+**能力依赖原则（回答「mcp/tool/model/context 怎么依赖」）**：loop 只依赖**契约**，
+不依赖**适配器**——`harness-mcp`/`harness-model`/`harness-tools` 不是 loop 的依赖。
+需要具体能力（MCP 检索、某个模型实现）的处理器由**宿主**实现并通过
+`with_processor` 注册（宿主处该能力本来就在）。`LoopDeps::response_topology()`
+是同一理由的响应侧接口：宿主自建 driver 时从默认链起点追加节点，而不是让 loop
+长出适配器依赖。Cargo.toml 里每个依赖都标注唯一消费文件。
 
 ## 9. 参考项目佐证
-
 - **Kafka Streams**：`Processor` 是 topology 中「represents a single processing step」的节点（Confluent 文档）——词汇来源。
 - **LLVM**：pass 原地改写 IR、PassManager 定序——「机器不持有数据、数据是唯一事实源」的权威先例。
 - **LangGraph**：`StateGraph` + 共享 `State` + conditional edge——证明「agent 环用图表达」在 agent 域可行，且 State 单事实源模型成立。

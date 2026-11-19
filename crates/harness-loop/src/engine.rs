@@ -21,20 +21,21 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use harness_context::{Budget, Compactor};
 use harness_core::event::RunEventKind;
 use harness_core::message::{Message, ToolCall, ToolResultMessage};
-use harness_core::model::{Model, ModelInfo};
+use harness_core::model::Model;
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::Tool;
 use harness_core::topology::{Route, Topology, Turn};
 use harness_core::{EventSink, RunControl};
 
-use harness_context::{Budget, BudgetBlocked, Compactor};
-
+use crate::budget::enforce_budget_gate;
 use crate::dispatch::{DispatchCtx, dispatch_batch, emit_event};
 use crate::hooks::{LoopHooks, ToolExecutionMode};
-use crate::processors::ModelProcessor;
-use crate::processors::{AppendProcessor, ToolDispatchProcessor, push_tool_results};
+use crate::processors::{
+    AppendProcessor, ModelProcessor, ToolDispatchProcessor, push_tool_results,
+};
 use crate::transcript::{self, TranscriptSink};
 
 /// Dependencies the loop needs to run one turn-loop.
@@ -102,6 +103,28 @@ impl std::fmt::Debug for LoopDeps {
             .field("prompt_topology", &self.prompt_topology)
             .field("tool_mode", &self.tool_mode)
             .finish()
+    }
+}
+impl LoopDeps {
+    /// The response-phase topology the driver installs: model → append
+    /// (gate) → tool dispatch.
+    ///
+    /// Exposed so a host assembling its own driver starts from the default
+    /// chain and appends nodes (`deps.response_topology().node(...)`) rather
+    /// than rebuilding it — symmetric to the prompt side's `with_processor`.
+    /// `run()` installs exactly this topology.
+    pub fn response_topology(&self) -> Topology {
+        Topology::new()
+            .node(Arc::new(ModelProcessor::new(Arc::clone(&self.event_sink))))
+            .node(Arc::new(AppendProcessor::new(self.transcript_sink.clone())))
+            .node(Arc::new(ToolDispatchProcessor::new(
+                Arc::clone(&self.policy),
+                self.approval_broker.clone(),
+                self.hooks.clone(),
+                Arc::clone(&self.event_sink),
+                self.tool_mode,
+                self.transcript_sink.clone(),
+            )))
     }
 }
 
@@ -240,17 +263,7 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
     // The response topology: model → append (gate) → tool dispatch. The
     // prompt topology (builder-assembled) runs first; the budget gate sits
     // between the two phases where legacy `run()` had it.
-    let response_topology = Topology::new()
-        .node(Arc::new(ModelProcessor::new(Arc::clone(&deps.event_sink))))
-        .node(Arc::new(AppendProcessor::new(deps.transcript_sink.clone())))
-        .node(Arc::new(ToolDispatchProcessor::new(
-            Arc::clone(&deps.policy),
-            deps.approval_broker.clone(),
-            deps.hooks.clone(),
-            Arc::clone(&deps.event_sink),
-            deps.tool_mode,
-            deps.transcript_sink.clone(),
-        )));
+    let response_topology = deps.response_topology();
 
     emit_run_started(&ctx, deps.event_sink.as_ref(), &turn.seq);
 
@@ -341,112 +354,6 @@ async fn backfill_partial_turn(turn: &mut Turn, deps: &LoopDeps) {
     }
 }
 
-/// Turn-boundary budget gate: runs before the provider call so a round is
-/// refused (not failed) when the context cannot fit the next turn.
-///
-/// When both `budget` and `compactor` are configured: refresh the budget
-/// from the current transcript; when a compaction stage is active, run
-/// compaction once -- cancellable via the run's cancel token -- then re-check.
-/// If the budget is still over a stage threshold, emit a
-/// `RunEventKind::Error` carrying [`BudgetBlocked::error_message`] and return
-/// `RunStopReason::Error` carrying the same message. Callers recover the
-/// distinction with [`BudgetBlocked::from_error_message`]; core's
-/// `RunStopReason` is frozen and has no budget-blocked variant.
-///
-/// Returns `None` when the gate passes or is unconfigured (either dep
-/// missing), so the turn proceeds to the provider call.
-/// The gate's view of the budget: the compactor's model-window estimate,
-/// capped by the host's configured per-run input limit.
-///
-/// The two come from different places — the compactor reads
-/// `ModelInfo.context_window`, the host maps `[budget].max_input_tokens` into
-/// `LoopDeps.budget` — so the tighter value wins. Without the cap a configured
-/// limit would never gate anything.
-fn gate_budget(
-    compactor: &dyn Compactor,
-    transcript: &[Message],
-    info: &ModelInfo,
-    configured: Option<&Budget>,
-) -> Budget {
-    let mut budget = compactor.read_budget(transcript, info);
-    if let Some(configured) = configured {
-        budget.available_tokens = budget.available_tokens.min(configured.available_tokens);
-    }
-    budget
-}
-
-async fn enforce_budget_gate(
-    deps: &LoopDeps,
-    transcript: &mut Vec<Message>,
-    ctx: &RunContext,
-    control: &RunControl,
-    seq: &AtomicU64,
-) -> Option<RunStopReason> {
-    let (_, Some(compactor)) = (&deps.budget, &deps.compactor) else {
-        return None;
-    };
-
-    // Cancellation observed at the boundary wins: don't compact a cancelled run.
-    if control.is_cancelled() {
-        return Some(finish(
-            ctx,
-            RunStopReason::Cancelled,
-            deps.event_sink.as_ref(),
-            seq,
-        ));
-    }
-
-    let info = deps.model.info();
-    let budget = gate_budget(compactor.as_ref(), transcript, info, deps.budget.as_ref());
-    let stage = compactor.stages().iter().find(|s| s.is_active(&budget))?;
-
-    // Compaction is the only relief available before refusing the round;
-    // run it once, cancellable via the run's cancel token.
-    let _result = compactor
-        .compact(transcript, &budget, None, &control.cancel_token())
-        .await;
-
-    if control.is_cancelled() {
-        return Some(finish(
-            ctx,
-            RunStopReason::Cancelled,
-            deps.event_sink.as_ref(),
-            seq,
-        ));
-    }
-
-    let budget = gate_budget(compactor.as_ref(), transcript, info, deps.budget.as_ref());
-    let still_blocked = compactor.stages().iter().any(|s| s.is_active(&budget));
-    if !still_blocked {
-        return None;
-    }
-
-    // `stage` names the first stage that was active when the gate ran, not
-    // the deepest one the compactor reached: the applied labels live in the
-    // compaction result's checkpoint, which the gate does not keep.
-    let blocked = BudgetBlocked {
-        needed: budget.used_tokens,
-        available: budget.available_tokens,
-        stage: stage.label.clone(),
-    };
-    let message = blocked.error_message();
-    emit_event(
-        deps.event_sink.as_ref(),
-        &ctx.run_id,
-        &ctx.session_id,
-        seq,
-        RunEventKind::Error {
-            message: message.clone(),
-        },
-    );
-    Some(finish(
-        ctx,
-        RunStopReason::Error { message },
-        deps.event_sink.as_ref(),
-        seq,
-    ))
-}
-
 /// Dispatch tool calls and collect their results, in call order.
 async fn dispatch_and_collect(
     calls: &[ToolCall],
@@ -472,7 +379,7 @@ async fn dispatch_and_collect(
 }
 
 /// Emit `RunFinished` and return the reason.
-fn finish(
+pub(crate) fn finish(
     ctx: &RunContext,
     reason: RunStopReason,
     event_sink: &dyn EventSink,
