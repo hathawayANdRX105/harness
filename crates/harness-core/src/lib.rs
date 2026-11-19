@@ -65,6 +65,7 @@ pub use policy::{
 };
 pub use run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 pub use tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
+pub use topology::{Processor, Route, Topology, Turn, TurnArtifacts};
 
 pub mod control;
 pub mod event;
@@ -73,3 +74,4 @@ pub mod model;
 pub mod policy;
 pub mod run;
 pub mod tool;
+pub mod topology;
