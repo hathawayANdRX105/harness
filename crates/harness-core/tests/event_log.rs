@@ -65,8 +65,8 @@ fn every_kind_round_trips_with_type_tag() -> serde_json::Result<()> {
                 message: "stop".into(),
             },
         ),
-        event(7, RunEventKind::TurnStarted { turn: 1 }),
-        event(8, RunEventKind::TurnFinished { turn: 1 }),
+        event(7, RunEventKind::TurnStarted { turn_idx: 1 }),
+        event(8, RunEventKind::TurnFinished { turn_idx: 1 }),
         event(9, RunEventKind::TextDelta { text: "hi".into() }),
         event(
             10,

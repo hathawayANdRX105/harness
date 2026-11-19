@@ -1335,10 +1335,10 @@ fn record_hook_entry(log: &Arc<Mutex<Vec<String>>>, entry: String) {
 }
 
 /// Records the turn index `finish_turn` ran for.
-fn record_turn_index(log: &Arc<Mutex<Vec<u32>>>, turn: u32) {
+fn record_turn_index(log: &Arc<Mutex<Vec<u32>>>, turn_idx: u32) {
     log.lock()
         .unwrap_or_else(|e| panic!("hook log lock poisoned: {e}"))
-        .push(turn);
+        .push(turn_idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,8 +1559,8 @@ async fn hook_seams_before_after_finish_and_prepare() {
         })),
         finish_turn: Some(Arc::new({
             let log = finish_turns.clone();
-            move |turn: u32, _transcript: &[Message]| {
-                record_turn_index(&log, turn);
+            move |turn_idx: u32, _transcript: &[Message]| {
+                record_turn_index(&log, turn_idx);
             }
         })),
         ..LoopHooks::default()

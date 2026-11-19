@@ -29,7 +29,7 @@ use crate::hooks::{LoopHooks, ToolExecutionMode};
 
 /// Shared context for one dispatch batch, passed to every tool-level call.
 pub(crate) struct DispatchCtx<'a> {
-    pub(crate) turn: u32,
+    pub(crate) turn_idx: u32,
     pub(crate) ctx: &'a RunContext,
     pub(crate) tools: &'a [Arc<dyn Tool>],
     pub(crate) policy: &'a dyn ToolPolicy,
@@ -62,7 +62,7 @@ async fn dispatch_one(call: &ToolCall, tcx: &DispatchCtx<'_>) -> DispatchOutcome
         args: call.args.clone(),
         run_id: tcx.ctx.run_id.clone(),
         session_id: tcx.ctx.session_id.clone(),
-        turn: tcx.turn,
+        turn_idx: tcx.turn_idx,
     };
 
     // --- Hook: before_tool_call ---
@@ -343,7 +343,7 @@ pub(crate) async fn dispatch_batch(
             let broker_owned = tcx.approval_broker.clone();
             let hooks_owned = tcx.hooks.clone();
             let control_owned = tcx.control.clone();
-            let turn = tcx.turn;
+            let turn_idx = tcx.turn_idx;
             let policy: &dyn ToolPolicy = tcx.policy;
             let seq: &AtomicU64 = tcx.seq;
             let sink: &dyn EventSink = tcx.sink;
@@ -359,7 +359,7 @@ pub(crate) async fn dispatch_batch(
                     let control = control_owned.clone();
                     async move {
                         let inner_tcx = DispatchCtx {
-                            turn,
+                            turn_idx,
                             ctx: &ctx,
                             tools: &tools,
                             policy,

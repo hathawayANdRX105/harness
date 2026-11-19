@@ -110,7 +110,7 @@ async fn turn_boundary(
     transcript: &mut Vec<Message>,
     ctx: &RunContext,
     seq: &AtomicU64,
-    turn: u32,
+    turn_idx: u32,
 ) -> Result<(), RunStopReason> {
     // Cancellation observed at the boundary wins: no steering is drained and
     // no new turn starts.
@@ -149,7 +149,7 @@ async fn turn_boundary(
     // an empty `messages` array on the first upstream request. A seeded
     // transcript already holds the previous runs of this session, so the
     // task is appended regardless of whether the transcript is empty.
-    if turn == 0 && !ctx.task.description.is_empty() {
+    if turn_idx == 0 && !ctx.task.description.is_empty() {
         transcript::push(
             transcript,
             deps.transcript_sink.as_deref(),
@@ -160,7 +160,7 @@ async fn turn_boundary(
     }
 
     // Max-turns: refuse to start another turn once the turn budget is spent.
-    if turn >= ctx.limits.max_turns {
+    if turn_idx >= ctx.limits.max_turns {
         return Err(RunStopReason::MaxTurns);
     }
 
@@ -174,7 +174,7 @@ async fn model_turn(
     deps: &LoopDeps,
     control: &RunControl,
     seq: &AtomicU64,
-    turn: u32,
+    turn_idx: u32,
     transcript: &[Message],
 ) -> StreamTurn {
     let tools_schemas: Vec<ToolSchema> = deps.tools.iter().map(|t| t.schema()).collect();
@@ -191,7 +191,7 @@ async fn model_turn(
         &ctx.run_id,
         &ctx.session_id,
         seq,
-        RunEventKind::TurnStarted { turn },
+        RunEventKind::TurnStarted { turn_idx },
     );
 
     let stream = deps.model.stream(&request).await;
@@ -212,13 +212,18 @@ fn emit_run_started(ctx: &RunContext, event_sink: &dyn EventSink, seq: &AtomicU6
 }
 
 /// Emit the `TurnFinished` event that closes one model turn.
-fn emit_turn_finished(ctx: &RunContext, event_sink: &dyn EventSink, seq: &AtomicU64, turn: u32) {
+fn emit_turn_finished(
+    ctx: &RunContext,
+    event_sink: &dyn EventSink,
+    seq: &AtomicU64,
+    turn_idx: u32,
+) {
     emit_event(
         event_sink,
         &ctx.run_id,
         &ctx.session_id,
         seq,
-        RunEventKind::TurnFinished { turn },
+        RunEventKind::TurnFinished { turn_idx },
     );
 }
 
@@ -245,7 +250,7 @@ fn recent_tool_results(transcript: &[Message], n_results: usize) -> Vec<ToolResu
 /// run -- the caller finishes the run with the returned reason.
 async fn dispatch_turn(
     calls: &[ToolCall],
-    turn: u32,
+    turn_idx: u32,
     ctx: &RunContext,
     deps: &LoopDeps,
     control: &RunControl,
@@ -253,7 +258,7 @@ async fn dispatch_turn(
     transcript: &mut Vec<Message>,
 ) -> Result<usize, RunStopReason> {
     let dctx = DispatchCtx {
-        turn,
+        turn_idx,
         ctx,
         tools: &deps.tools,
         policy: &*deps.policy,
@@ -275,7 +280,7 @@ async fn dispatch_turn(
 
     // Hook: finish_turn observes the completed turn.
     if let Some(hook) = &deps.hooks.finish_turn {
-        hook(turn, transcript);
+        hook(turn_idx, transcript);
     }
 
     // Hook: should_terminate_tool_batch short-circuits the tool batch.
@@ -351,11 +356,11 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
 
     emit_run_started(&ctx, deps.event_sink.as_ref(), &seq);
 
-    let mut turn: u32 = 0;
+    let mut turn_idx: u32 = 0;
 
     loop {
         // Turn boundary: cancellation, steering drain, task seed, max-turns.
-        let boundary = turn_boundary(&control, &deps, &mut transcript, &ctx, &seq, turn).await;
+        let boundary = turn_boundary(&control, &deps, &mut transcript, &ctx, &seq, turn_idx).await;
         if let Err(reason) = boundary {
             return finish(&ctx, reason, deps.event_sink.as_ref(), &seq);
         }
@@ -373,14 +378,14 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
             return reason;
         }
 
-        let stream_outcome = model_turn(&ctx, &deps, &control, &seq, turn, &transcript).await;
+        let stream_outcome = model_turn(&ctx, &deps, &control, &seq, turn_idx, &transcript).await;
         let (tool_calls, assistant_content) = match handle_stream_outcome(
             &stream_outcome,
             &ctx,
             &deps,
             &control,
             &seq,
-            turn,
+            turn_idx,
             &mut transcript,
         )
         .await
@@ -411,7 +416,7 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
 
         let dispatched = dispatch_turn(
             &tool_calls,
-            turn,
+            turn_idx,
             &ctx,
             &deps,
             &control,
@@ -424,7 +429,7 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
             return finish(&ctx, reason, deps.event_sink.as_ref(), &seq);
         }
 
-        turn += 1;
+        turn_idx += 1;
     }
 }
 
@@ -546,11 +551,11 @@ async fn handle_stream_outcome(
     deps: &LoopDeps,
     control: &RunControl,
     seq: &AtomicU64,
-    turn: u32,
+    turn_idx: u32,
     transcript: &mut Vec<Message>,
 ) -> Result<(Vec<ToolCall>, Vec<Content>), RunStopReason> {
     if matches!(outcome, StreamTurn::Ok { .. } | StreamTurn::Error { .. }) {
-        emit_turn_finished(ctx, deps.event_sink.as_ref(), seq, turn);
+        emit_turn_finished(ctx, deps.event_sink.as_ref(), seq, turn_idx);
     }
     match outcome {
         StreamTurn::Cancelled => Err(RunStopReason::Cancelled),
@@ -571,7 +576,7 @@ async fn handle_stream_outcome(
             .await;
             if !partial_calls.is_empty() {
                 let results =
-                    dispatch_and_collect(partial_calls, turn, ctx, deps, control, seq).await;
+                    dispatch_and_collect(partial_calls, turn_idx, ctx, deps, control, seq).await;
                 push_tool_results(transcript, deps, ctx, results).await;
             }
             Err(RunStopReason::Error {
@@ -768,14 +773,14 @@ async fn pump_stream(
 /// Dispatch tool calls and collect their results, in call order.
 async fn dispatch_and_collect(
     calls: &[ToolCall],
-    turn: u32,
+    turn_idx: u32,
     ctx: &RunContext,
     deps: &LoopDeps,
     control: &RunControl,
     seq: &AtomicU64,
 ) -> Vec<ToolResultMessage> {
     let dctx = DispatchCtx {
-        turn,
+        turn_idx,
         ctx,
         tools: &deps.tools,
         policy: &*deps.policy,

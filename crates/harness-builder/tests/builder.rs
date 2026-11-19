@@ -875,7 +875,7 @@ fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error::Erro
         args: serde_json::json!({}),
         run_id: RunId("run-1".into()),
         session_id: SessionId("session-1".into()),
-        turn: 0,
+        turn_idx: 0,
     };
     assert!(deny(&denied).is_err(), "the denied tool is blocked");
     let allowed = ToolRequest {

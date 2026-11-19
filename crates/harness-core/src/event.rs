@@ -64,9 +64,9 @@ pub enum RunEventKind {
     /// before the next model call (nanoharness's `STEERING_APPLIED`).
     SteeringApplied { message: String },
     /// One model round-trip begins.
-    TurnStarted { turn: u32 },
+    TurnStarted { turn_idx: u32 },
     /// One model round-trip ended (stop reason at the model level).
-    TurnFinished { turn: u32 },
+    TurnFinished { turn_idx: u32 },
     /// Streaming assistant text fragment (pi's anchoring of provider deltas
     /// onto run-level events).
     TextDelta { text: String },
