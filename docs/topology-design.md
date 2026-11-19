@@ -24,6 +24,34 @@ harness 的一轮工作就是对**一个 `Turn`**做流水线加工：prompt 与
 
 LLVM 的「pass 原地改写唯一事实源」思想保留（这正是本设计面向数据的核心），但词汇用 Kafka 的。
 
+### 1.1 命名审计（jev + 2-governance 判据，2026-11-19）
+
+五个核心槽位各出 6 个候选，用 `jev_rerank` 打分（模型 `decision-model-preview`），再用
+`2-governance/01-expression.md` 的判据对质。**最终拍板的是维护者，不是分数**——记录在此供未来读者追溯。
+
+| 槽位 | jev 前三名 | 最终采用 | 分歧说明 |
+|---|---|---|---|
+| 加工器 trait | Worker 0.88 · **Processor 0.86** · Step 0.81 | `Processor` | Worker 高 0.02 属噪声，且在 Rust/daemon 语境强烈暗示后台线程——与「被调度器顺序调用的加工单元」语义冲突 |
+| trait 方法名 | **run 0.80** · refine 0.78 · process 0.76 | `process` | **见下方豁免记录**：run 分数更高，维护者选择保留 Kafka 原词 |
+| 数据类型 | Frame 0.91 · **Turn 0.88** · TurnState 0.86 | `Turn` | Frame 在流式项目（SSE/ModelStream）已指数据帧；turn 是本领域中心词，配消歧后无冲突 |
+| 拓扑 + 驱动 | **Topology+drive 0.98** · Graph+run 0.97 | `Topology` + `drive()` | drive 与 run 语义分层：drive=反复驱动直到叫停（run 级的环） |
+| 节点返回枚举 | Decision/Signal/Flow 并列 0.92 · Route 0.90 | `Route` | 全槽平局（±0.02），Route 已在用且 `PolicyDecision` 已占用 Decision 一词 |
+
+**`process` 方法的豁免记录（必读）**：`2-governance/01-expression.md` 把 `apply`/`process`/`handle`
+列为函数命名坏信号（「后面要读实现才知道」）。本设计保留 `process` 的理由与补救：
+
+- 理由：Kafka Streams 的 `Processor` 接口方法就叫 `process(Record)`，这是被借词对象的原始契约，
+  保持词根一致比换一个「更生动」的词更能让读过 Kafka 的人迁移。维护者认定借词豁免成立。
+- 补救（必须兑现，否则豁免无效）：表达力由三处承载——① 方法签名本身
+  `process(&self, turn: &mut Turn) -> Route` 让「对谁、结果是什么」可见；② 每个 `Processor` 实现的
+  `//!` 模块头说明该节点加工什么；③ 本文 §6 的映射表。若未来出现「不看文档就误解职责」的事故，
+  这个豁免应被重新评估。
+
+**`Turn` 与 `turn: u32` 的同名不同义（治理硬判据）**：grep 实锤 12+ 处——
+`event.rs:67,69`（TurnStarted/TurnFinished）、`tool.rs:107`（ToolRequest）、`dispatch.rs:32`、
+`engine.rs` 六处参数 + `:354`、测试两处。**结论：数据类型保留短名 `Turn`（中心概念配最短名字），
+现有 `turn: u32` 轮次序号在一并迁移时全改 `turn_idx`**。本分支尚未写实现，迁移代价为零。
+
 ## 2. 两条核心思想
 
 ### 2.1 prompt 与 response 是同一条数据带
@@ -161,9 +189,10 @@ flowchart TB
 
 1. **空壳**：引入 `Turn`/`Processor`/`Route`/`Topology`（无实现），`run()` 内部走旧路径，topology 旁路空跑 → 现有 `crates/*/tests` 全绿，零行为变化。
 2. **prompt 段**：`prepare_request` 迁成 ToolProcessor（行为等价），删 `compose_prepare_hooks` → prompt 顺序测试绿。
-3. **ModelProcessor**：`pump_stream`/`absorb_event` 封装，唯一持流；其余响应 Processor 先空实现 → 流式 tool-call 组装测试绿。
-4. **response 段**：拆 dispatch 六步为三 Processor，激活 `context_injection`/`output_suffix` 消费 → 权限/沙盒/子代理各自成节点。
-5. **开注册面**：builder 增 `Topology::node()` / `with_processor()`，比照 gateway `with_stage_before_forward`（`gateway-facade/src/builder.rs:140`）。
+3. **`turn` 消歧**：把现有 `turn: u32` 轮次序号全改 `turn_idx`（§1.1 治理硬判据）——`event.rs`/`tool.rs`/`dispatch.rs`/`engine.rs` 与测试 12+ 处，纯重命名，编译即验收。
+4. **ModelProcessor**：`pump_stream`/`absorb_event` 封装，唯一持流；其余响应 Processor 先空实现 → 流式 tool-call 组装测试绿。
+5. **response 段**：拆 dispatch 六步为三 Processor，激活 `context_injection`/`output_suffix` 消费 → 权限/沙盒/子代理各自成节点。
+6. **开注册面**：builder 增 `Topology::node()` / `with_processor()`，比照 gateway `with_stage_before_forward`（`gateway-facade/src/builder.rs:140`）。
 
 ## 8. 已知的开放问题（不定稿，留在这条分支上解决）
 
