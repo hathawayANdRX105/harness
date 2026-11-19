@@ -45,6 +45,7 @@ use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStrea
 use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
+use harness_core::topology::Turn;
 use harness_core::{RunControl, StopReason};
 use harness_loop::run;
 
@@ -327,8 +328,8 @@ async fn spec_builds_and_explains_minimal_runtime() -> Result<(), Box<dyn std::e
     );
     assert!(runtime.prompt.is_some(), "the prompt ledger is assembled");
     assert!(
-        runtime.hooks.prepare_request.is_some(),
-        "the prompt rides the prepare_request hook"
+        !runtime.prompt_topology.is_empty(),
+        "the prompt rides the prompt-side topology"
     );
     assert!(
         runtime.mcp_pool.is_empty(),
@@ -814,10 +815,10 @@ fn skill_tool_must_not_shadow_a_declared_tool() -> Result<(), Box<dyn std::error
 /// `prepare_request` seam, and a deny hook blocks only its listed tools.
 /// Scenario: one prompt section, one `InjectInstruction` hook, one
 /// `DenyTools` hook.
-/// Acceptance: the composed prepare hook puts the system ledger first and
-/// the instruction last; the deny hook rejects `rm` and allows `read`.
-#[test]
-fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error::Error>> {
+/// Acceptance: the prompt topology's one pass puts the system ledger first
+/// and the instruction last; the deny hook rejects `rm` and allows `read`.
+#[tokio::test]
+async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error::Error>> {
     let mut spec = HarnessSpec::new("hooks");
     spec.prompt_sections.push(PromptSectionSpec {
         name: "system".into(),
@@ -843,12 +844,20 @@ fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error::Erro
 
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new()))).build()?;
 
-    let prepare = runtime
-        .hooks
-        .prepare_request
-        .as_ref()
-        .ok_or_else(|| std::io::Error::other("composed prepare hook missing"))?;
-    let messages = prepare(Vec::new());
+    assert!(
+        !runtime.prompt_topology.is_empty(),
+        "the prompt topology carries the system ledger and instruction nodes"
+    );
+
+    // Drive one machining pass and read the ledger back out — the order the
+    // model will see: system ledger first, instruction after.
+    let mut turn = Turn::new(
+        Arc::new(MockModel::new(Vec::new())),
+        RunControl::new(),
+        Vec::new(),
+    );
+    runtime.prompt_topology.step(&mut turn).await;
+    let messages = turn.ledger;
     assert!(
         matches!(
             messages.first(),

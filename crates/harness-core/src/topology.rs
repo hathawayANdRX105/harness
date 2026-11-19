@@ -133,9 +133,9 @@ pub enum Route {
 
 /// The per-turn machining order: a DAG of `Processor` nodes.
 ///
-/// Slice 1 placeholder: node registration is real so the builder API is
-/// stable, but the edge machinery and `drive` land with the driver slice.
-/// The DAG-plus-outer-loop split is documented in `docs/topology-design.md`
+/// Slice 2: `step` runs the registered nodes in order (the edge machinery —
+/// `Route::Goto` — lands with the response-side slice). The
+/// DAG-plus-outer-loop split is documented in `docs/topology-design.md`
 /// §4 — Kafka topologies are acyclic, so the run-level cycle belongs to
 /// `drive`, not to the graph.
 pub struct Topology {
@@ -170,13 +170,52 @@ impl Topology {
         self.nodes.is_empty()
     }
 
-    /// Drive one turn through the DAG and return the run-level stop reason.
+    /// Run one pass of the DAG over the turn: every node in registration
+    /// order, stopping at the first `Done`.
     ///
-    /// Slice 4 placeholder: traversal resolves `Route::Goto` against the
-    /// edge table and folds the per-turn outcome into the run-level loop
-    /// decision (continue to the next turn or stop).
+    /// `Goto` (named-node routing) lands with the response-side slice
+    /// (slice 5); a node that returns it today hits the documented
+    /// placeholder, because the only topologies built so far are
+    /// prompt-side and never route.
+    pub async fn step(&self, turn: &mut Turn) -> Route {
+        let mut route = Route::Next;
+        for node in &self.nodes {
+            route = node.process(turn).await;
+            match &route {
+                Route::Next => {}
+                Route::Goto(_) => todo!("slice 5: named-node routing"),
+                Route::Done(_) => return route,
+            }
+        }
+        route
+    }
+
+    /// Drive the run through the topology until the loop stops, returning
+    /// the run-level stop reason. The outer re-entry: each call runs one
+    /// `step` pass, and the driver decides from the route whether the turn
+    /// produced another round.
+    ///
+    /// Slice 4 placeholder: folds the per-turn outcome into the run-level
+    /// loop decision (continue to the next turn or stop).
     pub async fn drive(&self, _turn: &mut Turn) -> RunStopReason {
-        todo!("slice 4: per-turn DAG traversal with Route::Goto edges")
+        todo!("slice 4: run-level loop over step passes")
+    }
+}
+
+impl std::fmt::Debug for Topology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&'static str> = self.nodes.iter().map(|node| node.name()).collect();
+        f.debug_struct("Topology").field("nodes", &names).finish()
+    }
+}
+
+impl Clone for Topology {
+    fn clone(&self) -> Self {
+        // Nodes are `Arc`-shared: cloning a topology shares the processors
+        // across runs rather than copying them (processors never mutate).
+        Self {
+            nodes: self.nodes.clone(),
+        }
     }
 }
 

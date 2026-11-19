@@ -29,6 +29,7 @@ use harness_core::message::{Content, Message};
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream};
 use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
+use harness_core::topology::Topology;
 use harness_core::{RunControl, StopReason};
 use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, run};
 use tokio_util::sync::CancellationToken;
@@ -339,6 +340,7 @@ async fn budget_exhausted_from_start_refuses_before_provider() -> Result<(), Str
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_topology: Topology::default(),
         tool_mode: ToolExecutionMode::Sequential,
         budget: Some(Budget {
             used_tokens: 0,
@@ -435,6 +437,7 @@ async fn compaction_frees_room_then_turn_proceeds() -> Result<(), String> {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_topology: Topology::default(),
         tool_mode: ToolExecutionMode::Sequential,
         budget: Some(Budget {
             used_tokens: 0,
@@ -565,6 +568,7 @@ async fn real_default_compactor_shrinks_oversized_history() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_topology: Topology::default(),
         tool_mode: ToolExecutionMode::Sequential,
         budget: None,
         compactor: Some(Arc::clone(&compactor) as Arc<dyn Compactor>),
@@ -631,6 +635,7 @@ async fn real_default_compactor_refuses_unshrinkable_history() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_topology: Topology::default(),
         tool_mode: ToolExecutionMode::Sequential,
         budget: None,
         compactor: Some(Arc::new(harness_context::DefaultCompactor::new()) as Arc<dyn Compactor>),
@@ -679,6 +684,7 @@ async fn configured_budget_caps_the_compactor_window() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_topology: Topology::default(),
         tool_mode: ToolExecutionMode::Sequential,
         budget: Some(Budget {
             used_tokens: 0,

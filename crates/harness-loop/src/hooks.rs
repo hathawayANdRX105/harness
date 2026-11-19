@@ -1,11 +1,12 @@
 //! Pi-style config callbacks for the agent loop.
 //!
 //! Design provenance: pi's `AgentHooks` (`packages/agent/src/agent-loop.ts:44-68`)
-//! contributes the callback shape -- `prepareRequest` transforms the transcript
-//! before each model call, `finishTurn` observes the completed turn,
-//! `shouldTerminateToolBatch` short-circuits after a tool batch. All hooks are
-//! plain `Arc<dyn Fn>` pointers (no Hook/Guide/Sensor trait system -- core v2
-//! deliberately avoids that abstraction).
+//! contributes the callback shape -- `finishTurn` observes the completed turn,
+//! `shouldTerminateToolBatch` short-circuits after a tool batch. All hooks
+//! are plain `Arc<dyn Fn>` pointers (no Hook/Guide/Sensor trait system --
+//! core v2 deliberately avoids that abstraction). The prompt-side
+//! `prepareRequest` seam moved to `processors.rs`: prompt machining is a
+//! `Topology` of `Processor` nodes now, not a closure pair.
 //!
 //! Every field is optional; unset hooks are no-ops. The callbacks are `Fn` (not
 //! `FnMut`) so a single [`LoopHooks`] can be shared across many runs without
@@ -16,8 +17,6 @@ use std::sync::Arc;
 use harness_core::message::{Message, ToolCall, ToolResultMessage};
 use harness_core::tool::ToolRequest;
 
-/// Type alias for the `prepare_request` hook.
-pub(crate) type PrepareRequestHook = Arc<dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync>;
 /// Type alias for the `finish_turn` hook.
 pub(crate) type FinishTurnHook = Arc<dyn Fn(u32, &[Message]) + Send + Sync>;
 /// Type alias for the `before_tool_call` hook.
@@ -49,14 +48,6 @@ pub enum ToolExecutionMode {
 /// to wire only the hooks you need.
 #[derive(Default, Clone)]
 pub struct LoopHooks {
-    /// Called with the current transcript **before** building the
-    /// `ModelRequest`. Returning a different `Vec<Message>` lets the hook
-    /// insert, remove or reorder messages -- for example a context-window
-    /// compactor or a session-level instruction overlay.
-    ///
-    /// Pi name: `prepareRequest`.
-    pub prepare_request: Option<PrepareRequestHook>,
-
     /// Called after a full turn (model response + tool batch, or just the
     /// model response when no tools were requested) completes. Receives the
     /// zero-based turn index and the current transcript.
@@ -91,10 +82,6 @@ pub struct LoopHooks {
 impl std::fmt::Debug for LoopHooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoopHooks")
-            .field(
-                "prepare_request",
-                &self.prepare_request.as_ref().map(|_| "..."),
-            )
             .field("finish_turn", &self.finish_turn.as_ref().map(|_| "..."))
             .field(
                 "before_tool_call",

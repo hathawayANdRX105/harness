@@ -24,13 +24,16 @@
 //! | [`engine`] | The `run()` function and the turn loop. |
 //! | [`dispatch`] | Tool dispatch pipeline (policy → approval → execute → after). |
 //! | [`hooks`] | Pi-style config callbacks (`LoopHooks`, `ToolExecutionMode`). |
+//! | [`processors`] | Prompt-side `Processor` nodes (system ledger, instruction). |
 //! | [`transcript`] | `TranscriptSink`: host persistence of appended messages. |
 
 pub mod dispatch;
 pub mod engine;
 pub mod hooks;
+pub mod processors;
 pub mod transcript;
 
 pub use engine::{LoopDeps, run};
 pub use hooks::{LoopHooks, ToolExecutionMode};
+pub use processors::{InstructionProcessor, SystemLedgerProcessor};
 pub use transcript::TranscriptSink;

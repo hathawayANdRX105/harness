@@ -27,6 +27,7 @@ use harness_core::message::{Content, Message, ToolCall, ToolResultMessage};
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest};
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::{Tool, ToolSchema};
+use harness_core::topology::{Route, Topology, Turn};
 use harness_core::{EventSink, RunControl};
 
 use harness_context::{Budget, BudgetBlocked, Compactor};
@@ -36,10 +37,9 @@ use crate::hooks::{LoopHooks, ToolExecutionMode};
 use crate::transcript::{self, TranscriptSink};
 
 /// Dependencies the loop needs to run one turn-loop.
-///
-/// The loop is stateless: all per-run state lives in the `Vec<Message>`
-/// transcript and the sequence counter inside `run()`. `Arc<LoopDeps>` is
-/// cheap to clone and share across runs.
+/// The loop is stateless: all per-run state lives in the `Turn` `run()`
+/// builds from the seed (ledger, control, sequence counter). `Arc<LoopDeps>`
+/// is cheap to clone and share across runs.
 pub struct LoopDeps {
     /// The upstream model this loop calls.
     pub model: Arc<dyn Model>,
@@ -54,6 +54,11 @@ pub struct LoopDeps {
     pub approval_broker: Option<Arc<dyn harness_core::policy::ApprovalBroker>>,
     /// Pi-style config callbacks.
     pub hooks: LoopHooks,
+    /// The prompt-side machining chain: `Processor` nodes the run passes
+    /// the turn through before the model call (system ledger, injected
+    /// instructions, later skills and retrieval). The response side joins
+    /// this topology in slices 4–5.
+    pub prompt_topology: Topology,
     /// How tools are dispatched within one turn.
     pub tool_mode: ToolExecutionMode,
     /// Optional context budget: used vs available tokens plus the derived
@@ -93,6 +98,7 @@ impl std::fmt::Debug for LoopDeps {
                 &self.transcript_sink.as_ref().map(|_| "set"),
             )
             .field("hooks", &self.hooks)
+            .field("prompt_topology", &self.prompt_topology)
             .field("tool_mode", &self.tool_mode)
             .finish()
     }
@@ -351,51 +357,72 @@ async fn push_tool_results(
 ///
 /// Every exit path emits `RunFinished` before returning.
 pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> RunStopReason {
-    let mut transcript: Vec<Message> = deps.seed.clone();
-    let seq = AtomicU64::new(0);
+    // One Turn per run: the ledger, control and sequence counter live here
+    // from now on, and the legacy helpers below borrow them back by field
+    // until their slices fold them into processors.
+    let mut turn = Turn::new(Arc::clone(&deps.model), control, deps.seed.clone());
 
-    emit_run_started(&ctx, deps.event_sink.as_ref(), &seq);
+    emit_run_started(&ctx, deps.event_sink.as_ref(), &turn.seq);
 
     let mut turn_idx: u32 = 0;
 
     loop {
         // Turn boundary: cancellation, steering drain, task seed, max-turns.
-        let boundary = turn_boundary(&control, &deps, &mut transcript, &ctx, &seq, turn_idx).await;
+        let boundary = turn_boundary(
+            &turn.control,
+            &deps,
+            &mut turn.ledger,
+            &ctx,
+            &turn.seq,
+            turn_idx,
+        )
+        .await;
         if let Err(reason) = boundary {
-            return finish(&ctx, reason, deps.event_sink.as_ref(), &seq);
+            return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq);
         }
 
-        // Hook: prepare_request transforms the transcript before the model call.
-        if let Some(hook) = &deps.hooks.prepare_request {
-            transcript = hook(transcript);
+        // Prompt-side machining: the topology's processors reshape the
+        // ledger before the model call (system ledger, instructions, later
+        // skills and retrieval). A processor that returns Done ends the
+        // run here; Goto routing is slice 5.
+        if let Route::Done(reason) = deps.prompt_topology.step(&mut turn).await {
+            return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq);
         }
 
         // Budget gate: refuse the round before the provider call when the
         // context cannot fit another turn, even after one compaction pass.
         if let Some(reason) =
-            enforce_budget_gate(&deps, &mut transcript, &ctx, &control, &seq).await
+            enforce_budget_gate(&deps, &mut turn.ledger, &ctx, &turn.control, &turn.seq).await
         {
             return reason;
         }
 
-        let stream_outcome = model_turn(&ctx, &deps, &control, &seq, turn_idx, &transcript).await;
+        let stream_outcome = model_turn(
+            &ctx,
+            &deps,
+            &turn.control,
+            &turn.seq,
+            turn_idx,
+            &turn.ledger,
+        )
+        .await;
         let (tool_calls, assistant_content) = match handle_stream_outcome(
             &stream_outcome,
             &ctx,
             &deps,
-            &control,
-            &seq,
+            &turn.control,
+            &turn.seq,
             turn_idx,
-            &mut transcript,
+            &mut turn.ledger,
         )
         .await
         {
             Ok(pair) => pair,
-            Err(reason) => return finish(&ctx, reason, deps.event_sink.as_ref(), &seq),
+            Err(reason) => return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq),
         };
 
         transcript::push(
-            &mut transcript,
+            &mut turn.ledger,
             deps.transcript_sink.as_deref(),
             &ctx.session_id,
             Message::Assistant {
@@ -410,7 +437,7 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
                 &ctx,
                 RunStopReason::Completed,
                 deps.event_sink.as_ref(),
-                &seq,
+                &turn.seq,
             );
         }
 
@@ -419,14 +446,14 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
             turn_idx,
             &ctx,
             &deps,
-            &control,
-            &seq,
-            &mut transcript,
+            &turn.control,
+            &turn.seq,
+            &mut turn.ledger,
         )
         .await;
 
         if let Err(reason) = dispatched {
-            return finish(&ctx, reason, deps.event_sink.as_ref(), &seq);
+            return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq);
         }
 
         turn_idx += 1;

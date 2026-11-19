@@ -486,19 +486,20 @@ pub enum HookKind {
     /// End the run cleanly after the first tool batch executes (the
     /// `should_terminate_tool_batch` seam).
     TerminateAfterToolBatch,
-    /// Append a user message to the transcript before each model call (the
-    /// `prepare_request` seam).
+    /// Append a user message to the transcript before each model call —
+    /// materializes as an `InstructionProcessor` node in the prompt-side
+    /// topology (the seam moved off `LoopHooks`; see assemble.rs).
     InjectInstruction { text: String },
 }
 
 impl HookKind {
-    /// Which `LoopHooks` seam this kind occupies — the key used to reject
-    /// two hooks competing for the same seam.
+    /// Which seam this kind occupies — the key used to reject two hooks
+    /// competing for the same seam.
     pub fn seam(&self) -> &'static str {
         match self {
             HookKind::DenyTools { .. } => "before_tool_call",
             HookKind::TerminateAfterToolBatch => "should_terminate_tool_batch",
-            HookKind::InjectInstruction { .. } => "prepare_request",
+            HookKind::InjectInstruction { .. } => "prompt_topology",
         }
     }
 }

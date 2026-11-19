@@ -38,6 +38,8 @@ use harness_core::model::{Model, ModelInfo};
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::RunLimits;
 use harness_core::tool::{Tool, ToolRequest};
+use harness_core::topology::Topology;
+use harness_loop::{InstructionProcessor, SystemLedgerProcessor};
 use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode};
 use harness_mcp::{Mcp, McpServerConfig, ToolMeta};
 use harness_model::AliasRegistry;
@@ -347,6 +349,9 @@ pub struct AssembledRuntime {
     /// The prompt ledger, `None` when the spec declares no prompt sections.
     pub prompt: Option<Message>,
     pub tools: Vec<Arc<dyn Tool>>,
+    /// The prompt-side machining chain (system ledger + instructions); the
+    /// response-side nodes join in slices 4–5.
+    pub prompt_topology: Topology,
     pub mcp_pool: McpPool,
     pub hooks: LoopHooks,
     pub skills: Vec<SkillMeta>,
@@ -373,6 +378,7 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker.clone(),
             hooks: self.hooks.clone(),
             tool_mode: self.tool_mode,
+            prompt_topology: self.prompt_topology.clone(),
             budget: Some(self.budget),
             compactor: self
                 .compaction
@@ -394,6 +400,7 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker,
             hooks: self.hooks,
             tool_mode: self.tool_mode,
+            prompt_topology: self.prompt_topology,
             budget: Some(self.budget),
             compactor: self.compaction.and_then(|plan| plan.compactor),
             seed: Vec::new(),
@@ -412,6 +419,7 @@ impl fmt::Debug for AssembledRuntime {
             .field("tools", &tool_names)
             .field("prompt", &self.prompt.as_ref().map(prompt_section_names))
             .field("mcp_pool", &self.mcp_pool)
+            .field("prompt_topology", &self.prompt_topology)
             .field("hooks", &self.hooks)
             .field("skills", &self.skills)
             .field("models", &self.models)
@@ -584,7 +592,8 @@ impl HarnessBuilder {
         // and additionally exposed on `AssembledRuntime.skills`.
         register_skill_tool(&mut tools, &skills, self.cwd.clone().unwrap_or_default())?;
         let prompt = assemble_prompt(&self.spec.prompt_sections);
-        let hooks = assemble_hooks(&self.spec, &prompt);
+        let prompt_topology = assemble_prompt_topology(&self.spec, &prompt);
+        let hooks = assemble_hooks(&self.spec);
         let models: Vec<ModelInfo> = self.spec.models.iter().map(model_info_from_spec).collect();
         let compaction_stages = compaction_stages_from_spec(&self.spec.compaction);
         let compaction = (!compaction_stages.is_empty()).then_some(CompactionPlan {
@@ -599,6 +608,7 @@ impl HarnessBuilder {
             model,
             prompt,
             tools: tools.tools,
+            prompt_topology,
             mcp_pool: tools.pool,
             hooks,
             skills,
@@ -934,21 +944,10 @@ fn register_skill_tool(
     Ok(())
 }
 
-type PrepareRequestFn = Arc<dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync>;
 type BeforeToolCallFn = Arc<dyn Fn(&ToolRequest) -> Result<(), String> + Send + Sync>;
 
-fn assemble_hooks(spec: &HarnessSpec, prompt: &Option<Message>) -> LoopHooks {
+fn assemble_hooks(spec: &HarnessSpec) -> LoopHooks {
     let mut hooks = LoopHooks::default();
-
-    // The prompt ledger and a declared instruction both ride the one
-    // `prepare_request` seam, so they are composed in a fixed order: the
-    // prompt first (it must lead the transcript), then the instruction.
-    let prompt_hook = prompt.clone().map(prompt_prepare_hook);
-    let instruction_hook = spec.hooks.iter().find_map(|hook| match &hook.kind {
-        HookKind::InjectInstruction { text } => Some(instruction_prepare_hook(text)),
-        _ => None,
-    });
-    hooks.prepare_request = compose_prepare_hooks(prompt_hook, instruction_hook);
 
     for hook in &spec.hooks {
         match &hook.kind {
@@ -964,34 +963,20 @@ fn assemble_hooks(spec: &HarnessSpec, prompt: &Option<Message>) -> LoopHooks {
     hooks
 }
 
-fn prompt_prepare_hook(prompt: Message) -> PrepareRequestFn {
-    Arc::new(move |mut messages| {
-        if messages.first() != Some(&prompt) {
-            messages.insert(0, prompt.clone());
-        }
-        messages
-    })
-}
-
-fn instruction_prepare_hook(text: &str) -> PrepareRequestFn {
-    let instruction = Message::user_text(text);
-    Arc::new(move |mut messages| {
-        if !messages.contains(&instruction) {
-            messages.push(instruction.clone());
-        }
-        messages
-    })
-}
-
-fn compose_prepare_hooks(
-    first: Option<PrepareRequestFn>,
-    second: Option<PrepareRequestFn>,
-) -> Option<PrepareRequestFn> {
-    match (first, second) {
-        (None, None) => None,
-        (Some(hook), None) | (None, Some(hook)) => Some(hook),
-        (Some(first), Some(second)) => Some(Arc::new(move |messages| second(first(messages)))),
+/// The prompt-side topology: the system ledger node leads (it must precede
+/// everything), then the declared instruction node. One node per declared
+/// `InjectInstruction` hook keeps each instruction independently idempotent.
+fn assemble_prompt_topology(spec: &HarnessSpec, prompt: &Option<Message>) -> Topology {
+    let mut topology = Topology::new();
+    if let Some(prompt) = prompt {
+        topology = topology.node(Arc::new(SystemLedgerProcessor::new(prompt.clone())));
     }
+    for hook in &spec.hooks {
+        if let HookKind::InjectInstruction { text } = &hook.kind {
+            topology = topology.node(Arc::new(InstructionProcessor::new(text)));
+        }
+    }
+    topology
 }
 
 fn deny_tools_hook(hook_name: &str, tools: &[String]) -> BeforeToolCallFn {

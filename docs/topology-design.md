@@ -91,9 +91,16 @@ pub struct Turn {
     pub artifacts: TurnArtifacts,
     /// 模型引用（ModelProcessor 建流用，其余 Processor 只读 info）
     pub model: Arc<dyn Model>,
-    /// 账本不变式的守卫（见 §5）
+    /// 账本不变式的守卫（见 §5）——切片 5 实现，当前 append/retract 为 todo!()
     safe: LedgerGuard,
 }
+
+impl Turn {
+    /// 从种子账本起一个 turn；切片 5 补上转录下沉参数
+    pub fn new(model: Arc<dyn Model>, control: RunControl, seed: Vec<Message>) -> Self
+}
+// 以及：Topology::step(&mut turn) -> Route（单遍顺序执行，已实现）
+//     Topology::drive(&mut turn) -> RunStopReason（外层环，切片 4）
 
 pub struct TurnArtifacts {
     pub content: Vec<Content>,
@@ -120,7 +127,7 @@ pub enum Route {
 }
 ```
 
-`Topology` 描述一轮 turn 内的加工顺序（DAG，见 §4），`drive()` 在外层把 turn 环跑起来。
+`Topology` 描述一轮 turn 内的加工顺序（DAG，见 §4）：`step()` 跑单遍（已实现，切片 2 起 prompt 段在上面跑），`drive()` 在外层把 turn 环跑起来（切片 4）。
 
 ## 4. Topology 的形状：DAG + 外层环
 
