@@ -38,7 +38,7 @@ use harness_core::model::{Model, ModelInfo};
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::RunLimits;
 use harness_core::tool::{Tool, ToolRequest};
-use harness_core::topology::Topology;
+use harness_core::topology::{Processor, Topology};
 use harness_loop::{InstructionProcessor, SystemLedgerProcessor};
 use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode};
 use harness_mcp::{Mcp, McpServerConfig, ToolMeta};
@@ -461,6 +461,10 @@ pub struct HarnessBuilder {
     config: Option<ConfigBindings>,
     tool_mode: ToolExecutionMode,
     compactor: Option<Arc<dyn Compactor>>,
+    /// Host-supplied topology nodes, appended after the spec's prompt
+    /// nodes. Hosts extend the prompt phase here; the response phase
+    /// (model / append / tool dispatch) stays loop-owned.
+    custom_processors: Vec<Arc<dyn Processor>>,
 }
 
 impl HarnessBuilder {
@@ -477,6 +481,7 @@ impl HarnessBuilder {
             config: None,
             tool_mode: ToolExecutionMode::default(),
             compactor: None,
+            custom_processors: Vec::new(),
         }
     }
 
@@ -551,6 +556,20 @@ impl HarnessBuilder {
         self
     }
 
+    /// Register one custom topology node.
+    ///
+    /// Custom nodes run in the prompt phase, after the spec's system ledger
+    /// and instruction nodes and before the model call — the extension
+    /// surface for host-side prompt machining (retrieval injection, memory
+    /// recall, extra context sections). The response phase stays
+    /// loop-owned; hosts extend it by implementing `Processor` themselves
+    /// only where they also own the loop.
+    #[must_use]
+    pub fn with_processor(mut self, node: Arc<dyn Processor>) -> Self {
+        self.custom_processors.push(node);
+        self
+    }
+
     /// Validate, analyze, and assemble.
     ///
     /// # Errors
@@ -592,7 +611,8 @@ impl HarnessBuilder {
         // and additionally exposed on `AssembledRuntime.skills`.
         register_skill_tool(&mut tools, &skills, self.cwd.clone().unwrap_or_default())?;
         let prompt = assemble_prompt(&self.spec.prompt_sections);
-        let prompt_topology = assemble_prompt_topology(&self.spec, &prompt);
+        let prompt_topology =
+            assemble_prompt_topology(&self.spec, &prompt, &self.custom_processors);
         let hooks = assemble_hooks(&self.spec);
         let models: Vec<ModelInfo> = self.spec.models.iter().map(model_info_from_spec).collect();
         let compaction_stages = compaction_stages_from_spec(&self.spec.compaction);
@@ -964,9 +984,14 @@ fn assemble_hooks(spec: &HarnessSpec) -> LoopHooks {
 }
 
 /// The prompt-side topology: the system ledger node leads (it must precede
-/// everything), then the declared instruction node. One node per declared
-/// `InjectInstruction` hook keeps each instruction independently idempotent.
-fn assemble_prompt_topology(spec: &HarnessSpec, prompt: &Option<Message>) -> Topology {
+/// everything), then the declared instruction nodes (one per
+/// `InjectInstruction` hook, each independently idempotent), then the
+/// host's custom nodes from `HarnessBuilder::with_processor`.
+fn assemble_prompt_topology(
+    spec: &HarnessSpec,
+    prompt: &Option<Message>,
+    custom: &[Arc<dyn Processor>],
+) -> Topology {
     let mut topology = Topology::new();
     if let Some(prompt) = prompt {
         topology = topology.node(Arc::new(SystemLedgerProcessor::new(prompt.clone())));
@@ -975,6 +1000,9 @@ fn assemble_prompt_topology(spec: &HarnessSpec, prompt: &Option<Message>) -> Top
         if let HookKind::InjectInstruction { text } = &hook.kind {
             topology = topology.node(Arc::new(InstructionProcessor::new(text)));
         }
+    }
+    for node in custom {
+        topology = topology.node(Arc::clone(node));
     }
     topology
 }

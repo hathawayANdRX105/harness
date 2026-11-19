@@ -1193,3 +1193,71 @@ fn compactor_without_stages_is_dropped() -> Result<(), Box<dyn std::error::Error
     assert!(runtime.loop_deps().compactor.is_none());
     Ok(())
 }
+/// Purpose: `with_processor` is the host's extension surface — a custom node
+/// rides the prompt topology after the spec's own nodes.
+/// Scenario: a spec with one prompt section, plus a host node that appends
+/// a marker user message before the model call.
+/// Acceptance: the built prompt topology carries the custom node after the
+/// system ledger, and one `step` pass leaves both messages in the ledger.
+#[tokio::test]
+async fn with_processor_rides_the_prompt_topology() -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use harness_core::topology::{Processor, Route};
+
+    struct MarkerNode;
+
+    #[async_trait]
+    impl Processor for MarkerNode {
+        fn name(&self) -> &'static str {
+            "marker"
+        }
+
+        async fn process(&self, turn: &mut Turn) -> Route {
+            turn.ledger.push(Message::user_text("host node ran"));
+            Route::Next
+        }
+    }
+
+    let mut spec = HarnessSpec::new("custom-node");
+    spec.prompt_sections.push(PromptSectionSpec {
+        name: "system".into(),
+        content: "system prompt".into(),
+        manifest: UnitManifest::default(),
+    });
+    spec.models.push(mock_model_spec());
+    spec.default_model = Some("mock".into());
+
+    let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
+        .with_processor(Arc::new(MarkerNode))
+        .build()?;
+
+    assert_eq!(
+        runtime.prompt_topology.len(),
+        2,
+        "system ledger node + the host node"
+    );
+    let mut turn = Turn::new(
+        Arc::new(MockModel::new(Vec::new())),
+        RunControl::new(),
+        make_ctx(),
+        Vec::new(),
+    );
+    runtime.prompt_topology.step(&mut turn).await;
+    let messages = turn.ledger;
+    assert!(
+        matches!(
+            messages.first(),
+            Some(Message::System { sections }) if sections.contains_key("system")
+        ),
+        "the spec's system ledger still leads"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| *message == Message::user_text("host node ran")),
+        "the host node ran after the spec's nodes"
+    );
+    Ok(())
+}

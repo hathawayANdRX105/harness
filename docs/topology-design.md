@@ -179,31 +179,44 @@ flowchart TB
 
 | 现有位置 | 形态 | 迁移后 |
 |---|---|---|
-| `prepare_request` 单槽回调 (`harness-loop/src/hooks.rs:58`) | 一个 `Arc<dyn Fn>` | ToolProcessor / SkillProcessor / RetrievalProcessor，可注册多个，替代 `compose_prepare_hooks` 手工两两折叠 (`harness-builder/src/assemble.rs:981`) |
-| `enforce_budget_gate` (`engine.rs:444`) | 内联 fn + Compactor | ContextProcessor（Compactor 是它的策略） |
-| `pump_stream` / `absorb_event` (`engine.rs:678,603`) | 内联 | ModelProcessor（唯一持流） |
-| dispatch 六步定序 (`dispatch.rs:68-104`) | 固定顺序 fn | ApprovalProcessor → ToolExecProcessor → OutputProcessor |
-| `should_terminate_tool_batch` (`engine.rs:281`) | 回调 | OutputProcessor 的 `Route::Done(Completed)` |
-| `PolicyDecision.context_injection`/`output_suffix` (`policy.rs:53-61`) | **死字段**（loop 从不消费，grep 无命中） | ContextProcessor / OutputProcessor 真正消费 |
-| `run()` 写死整条流 (`engine.rs:347-428`) | 200 行状态机 | `drive()` + `Topology` 遍历 |
-| `LoopHooks` 5 个 Fn 槽 | callback bag | 降格为各 Processor 的实现细节或便捷注册面 |
+| `prepare_request` 单槽回调 | 一个 `Arc<dyn Fn>` | ✅ SystemLedgerProcessor + InstructionProcessor + `with_processor` 注册的自定义节点（slice 2/6） |
+| `enforce_budget_gate` | 内联 fn + Compactor | ⏳ 保留在 driver（run），夹在 prompt 段与 response 段之间；待迁成 ContextProcessor 节点 |
+| `pump_stream` / `absorb_event` | 内联 | ✅ ModelProcessor（唯一持流，slice 4） |
+| dispatch 六步定序 | 固定顺序 fn | ✅ ToolDispatchProcessor（batch 级单节点，slice 5；见下方偏差记录） |
+| `should_terminate_tool_batch` | 回调 | ✅ ToolDispatchProcessor 的 `Route::Done(Completed)` |
+| `PolicyDecision.output_suffix` (`policy.rs:53-61`) | **已被消费**（`dispatch.rs` after_stage 拼接进 ToolResult 内容）——原表误判 | 维持，随 ToolDispatchProcessor 迁移 |
+| `PolicyDecision.context_injection` (`policy.rs:53-61`) | 真死字段（loop 从不消费） | ⏳ 激活需要设计决策：policy 决定在并行批量里如何安全写账本（见 §8） |
+| `run()` 写死整条流 | 200 行状态机 | ✅ driver + prompt 拓扑 + response 拓扑（slice 2/4/5） |
+| `LoopHooks` 5 个 Fn 槽 | callback bag | ✅ `prepare_request` 消灭；其余 4 槽由 ToolDispatchProcessor 持有（slice 5） |
 
-最好的一件事：`dispatch.rs` 的 `before-hook → before-policy → approval → execute → after-policy → after-hook`（`dispatch.rs:68-104`）本身就是一条教科书式的节点链，只是写死了。拆成 Processor 后，权限/沙盒/子代理各成节点，顺序由拓扑决定。
+**偏差记录（slice 5）**：设计原设想 dispatch 拆成 Approval / ToolExec / Output 三节点，实现时发现
+六步链在 sequential 模式下按 tool call 交错执行（call1 全流程 → call2 全流程），按阶段拆开会改变
+`PolicyDecided`/`ToolStarted` 等事件的相对顺序，破坏行为等价。故先落成单个 batch 级
+ToolDispatchProcessor（事件顺序与旧路径逐字一致），待 per-call 状态进 `TurnArtifacts` 后再拆。
+
+**偏差记录（slice 5）**：driver 目前跑两段拓扑（prompt / response），budget gate 夹在中间——
+因为 compaction 必须作用在 prompt 注入之后的账本上。合成单一拓扑需要把 budget gate 也做成节点（§8）。
 
 ## 7. 迁移切片（每步独立可 PR、独立可验证）
 
 严格遵守 harness-projects.md 的「PR CI 是主测试路径」：每步一个 PR 到本分支，lint + spec-check + test 三 job 绿了再下一步。
 
-1. **空壳**：引入 `Turn`/`Processor`/`Route`/`Topology`（无实现），`run()` 内部走旧路径，topology 旁路空跑 → 现有 `crates/*/tests` 全绿，零行为变化。
-2. **prompt 段**：`prepare_request` 迁成 ToolProcessor（行为等价），删 `compose_prepare_hooks` → prompt 顺序测试绿。
-3. **`turn` 消歧**：把现有 `turn: u32` 轮次序号全改 `turn_idx`（§1.1 治理硬判据）——`event.rs`/`tool.rs`/`dispatch.rs`/`engine.rs` 与测试 12+ 处，纯重命名，编译即验收。
-4. **ModelProcessor**：`pump_stream`/`absorb_event` 封装，唯一持流；其余响应 Processor 先空实现 → 流式 tool-call 组装测试绿。
-5. **response 段**：拆 dispatch 六步为三 Processor，激活 `context_injection`/`output_suffix` 消费 → 权限/沙盒/子代理各自成节点。
-6. **开注册面**：builder 增 `Topology::node()` / `with_processor()`，比照 gateway `with_stage_before_forward`（`gateway-facade/src/builder.rs:140`）。
+1. ✅ **空壳**（`1481ee17`）：`Turn`/`Processor`/`Route`/`Topology` 进 harness-core，旧路径不动。
+2. ✅ **prompt 段**（`05615293`）：`prepare_request` 消灭，SystemLedgerProcessor / InstructionProcessor 落地。
+3. ✅ **`turn` 消歧**（`3693d411`）：`turn: u32` → `turn_idx` 全仓（含事件 JSON 键）。
+4. ✅ **ModelProcessor**（`34fa22c0`）：唯一持流，`pump_stream`/`absorb_event` 迁入。
+5. ✅ **response 段**（`1876576f`）：AppendProcessor（gate）+ ToolDispatchProcessor；三节点拆分按 §6 偏差记录推迟。
+6. ✅ **开注册面**：builder `with_processor()`，自定义节点挂在 prompt 拓扑末尾（比照 gateway `with_stage_before_forward`）。
+
+**尚未落地**（留作后续切片，不阻塞本分支的可评审性）：budget gate 节点化、`Route::Goto` 路由、
+`context_injection` 激活、三节点拆分、`Turn` 的 `append_message`/`retract_messages` 配对守卫。
 
 ## 8. 已知的开放问题（不定稿，留在这条分支上解决）
 
 - **顺序约束的表达**：ContextProcessor 必须在 ModelProcessor 前——靠拓扑边显式表达，还是靠元数据（如 `kind()`）让调度器检查？倾向前者（边即顺序，可见可测）。
+- **预算门的位置**：当前由 driver 在 prompt 段后执行（preserve 旧行为）。节点化时它必须访问 Compactor + Budget + model info，且 compaction 作用在 prompt 注入后的账本上——倾向 ContextProcessor 节点，单独在 ModelProcessor 之前跑一轮。
+- **`context_injection` 激活**：policy 的 `context_injection` 仍未被消费。难点是并行 dispatch：policy 决定发生在 per-call 链中，而并行模式下账本不能被多个 future 同时写。可行做法（批量决策前置 → 收集 injection → 注入账本 → 批量执行）会改变 sequential 模式的事件顺序（与 §6 偏差记录同源问题），需要一次专门设计。
+- **per-call 状态进 artifacts**：把 ToolDispatchProcessor 拆成 Approval / ToolExec / Output 三节点的前提是 per-call 的 request、decision、execution 状态挂在 `TurnArtifacts` 上而不是闭包里；拆开后「无 tool 调用跳过执行段」才能用 `Goto` 表达。
 - **ToolExecProcessor 的并行**：`join_all` 在节点内部（`dispatch.rs:321-389` 现状），确认这部分不外泄成图分支。
 - **转向（steering）注入点**：当前在 `turn_boundary`（每轮开始）；Topology 化后应是 DAG 源节点的一部分，需确认与 `Route::Goto` 不冲突。
 - **预算门的位置**：ContextProcessor 在 prompt 段末，还是 ModelProcessor 自己做？旧代码在 `prepare_request` 之后、模型调用之前（`engine.rs:369`），倾向保持同样的拓扑位置。
