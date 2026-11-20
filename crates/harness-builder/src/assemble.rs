@@ -43,7 +43,8 @@ use harness_core::{LoopHooks, ToolExecutionMode};
 use harness_loop::{Chain, LoopDeps};
 use harness_model::AliasRegistry;
 
-use crate::processors::{InstructionProcessor, SystemLedgerProcessor};
+use crate::instruction_processor::InstructionProcessor;
+use crate::system_ledger_processor::SystemLedgerProcessor;
 use harness_mcp::{Mcp, McpServerConfig, ToolMeta};
 use harness_tools::{
     EditTool, GlobTool, GrepTool, ReadTool, SkillMeta, SkillTool, TerminalTool, WebFetchTool,
