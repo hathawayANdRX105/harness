@@ -16,8 +16,9 @@ use harness_core::control::RunControl;
 use harness_core::event::{EventSink, RunEvent};
 use harness_core::message::{Content, Message, ToolCall, ToolResultMessage};
 use harness_core::model::{Model, ModelInfo, ModelRequest, ModelStream};
+use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, RunLimits, SessionId, Task};
-use harness_core::topology::Turn;
+use harness_core::topology::{RunSeams, Turn};
 
 /// The turn contract requires a sink; this one discards — the primitives
 /// under test emit nothing.
@@ -25,6 +26,37 @@ struct NullSink;
 
 impl EventSink for NullSink {
     fn emit(&self, _event: RunEvent) {}
+}
+
+/// A policy that approves everything: the tests under here exercise the
+/// turn primitives, not tool gating.
+struct AllowAllPolicy;
+
+impl ToolPolicy for AllowAllPolicy {
+    fn decide(
+        &self,
+        _stage: PolicyStage,
+        _req: &harness_core::tool::ToolRequest,
+        _execution: Option<&ToolExecution>,
+    ) -> PolicyDecision {
+        PolicyDecision {
+            outcome: PolicyOutcome::Allow,
+            reason: "test policy allows all".into(),
+            source: "test".into(),
+            context_injection: None,
+            output_suffix: None,
+        }
+    }
+}
+
+fn seams() -> RunSeams {
+    RunSeams {
+        policy: std::sync::Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: harness_core::LoopHooks::default(),
+        event_sink: std::sync::Arc::new(NullSink),
+        transcript_sink: None,
+    }
 }
 
 struct StubModel(ModelInfo);
@@ -77,13 +109,7 @@ fn turn_carries_seed_ledger_verbatim() {
         Message::user_text("first user turn"),
         Message::user_text("second user turn"),
     ];
-    let turn = Turn::new(
-        model,
-        RunControl::new(),
-        sample_ctx(),
-        seed,
-        Arc::new(NullSink),
-    );
+    let turn = Turn::new(model, RunControl::new(), sample_ctx(), seed, seams());
 
     assert_eq!(turn.ledger.len(), 2, "seed messages ride the turn verbatim");
     assert!(
@@ -110,13 +136,7 @@ fn turn_carries_seed_ledger_verbatim() {
 #[test]
 fn retract_never_orphans_a_tool_call() {
     let model = Arc::new(StubModel(sample_info()));
-    let mut turn = Turn::new(
-        model,
-        RunControl::new(),
-        sample_ctx(),
-        Vec::new(),
-        Arc::new(NullSink),
-    );
+    let mut turn = Turn::new(model, RunControl::new(), sample_ctx(), Vec::new(), seams());
 
     let call_a = Message::Assistant {
         content: vec![Content::ToolCall(ToolCall {

@@ -45,8 +45,8 @@ use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStrea
 use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
-use harness_core::topology::Turn;
-use harness_core::{RunControl, StopReason};
+use harness_core::topology::{RunSeams, Turn};
+use harness_core::{LoopHooks, RunControl, StopReason};
 use harness_loop::run;
 
 // ---------------------------------------------------------------------------
@@ -856,7 +856,13 @@ async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error
         RunControl::new(),
         make_ctx(),
         Vec::new(),
-        Arc::new(TestSink::default()),
+        RunSeams {
+            policy: Arc::new(AllowAllPolicy),
+            approval_broker: None,
+            hooks: LoopHooks::default(),
+            event_sink: Arc::new(TestSink::default()),
+            transcript_sink: None,
+        },
     );
     runtime.prompt_chain.step(&mut turn).await;
     let messages = turn.ledger;
@@ -1244,7 +1250,13 @@ async fn with_processor_rides_the_prompt_chain() -> Result<(), Box<dyn std::erro
         RunControl::new(),
         make_ctx(),
         Vec::new(),
-        Arc::new(TestSink::default()),
+        RunSeams {
+            policy: Arc::new(AllowAllPolicy),
+            approval_broker: None,
+            hooks: LoopHooks::default(),
+            event_sink: Arc::new(TestSink::default()),
+            transcript_sink: None,
+        },
     );
     runtime.prompt_chain.step(&mut turn).await;
     let messages = turn.ledger;

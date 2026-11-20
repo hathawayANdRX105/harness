@@ -21,4 +21,4 @@ pub mod processor;
 pub mod turn;
 
 pub use processor::{Processor, Route};
-pub use turn::{Turn, TurnArtifacts};
+pub use turn::{RunSeams, Turn, TurnArtifacts};

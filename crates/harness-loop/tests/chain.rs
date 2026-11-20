@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 
+use harness_core::LoopHooks;
 use harness_core::control::RunControl;
 use harness_core::event::{EventSink, RunEvent};
 use harness_core::message::{Content, Message};
 use harness_core::model::{Model, ModelInfo, ModelRequest, ModelStream};
+use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
-use harness_core::topology::{Processor, Route, Turn};
+use harness_core::topology::{Processor, Route, RunSeams, Turn};
 use harness_loop::Chain;
 
 /// The chain contract needs a sink on the turn; this one discards.
@@ -24,6 +26,37 @@ struct NullSink;
 
 impl EventSink for NullSink {
     fn emit(&self, _event: RunEvent) {}
+}
+
+/// A policy that approves everything: the chain tests exercise routing, not
+/// tool gating.
+struct AllowAllPolicy;
+
+impl ToolPolicy for AllowAllPolicy {
+    fn decide(
+        &self,
+        _stage: PolicyStage,
+        _req: &harness_core::tool::ToolRequest,
+        _execution: Option<&ToolExecution>,
+    ) -> PolicyDecision {
+        PolicyDecision {
+            outcome: PolicyOutcome::Allow,
+            reason: "test policy allows all".into(),
+            source: "test".into(),
+            context_injection: None,
+            output_suffix: None,
+        }
+    }
+}
+
+fn seams() -> RunSeams {
+    RunSeams {
+        policy: Arc::new(AllowAllPolicy),
+        approval_broker: None,
+        hooks: LoopHooks::default(),
+        event_sink: Arc::new(NullSink),
+        transcript_sink: None,
+    }
 }
 
 struct StubModel(ModelInfo);
@@ -83,7 +116,7 @@ fn stub_turn() -> Turn {
         RunControl::new(),
         sample_ctx(),
         Vec::new(),
-        Arc::new(NullSink),
+        seams(),
     )
 }
 

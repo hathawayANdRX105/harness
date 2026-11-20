@@ -135,7 +135,7 @@ impl Processor for CompactProcessor {
         };
         let message = blocked.error_message();
         emit_event(
-            turn.event_sink.as_ref(),
+            turn.event_sink().as_ref(),
             &turn.ctx.run_id,
             &turn.ctx.session_id,
             &turn.seq,

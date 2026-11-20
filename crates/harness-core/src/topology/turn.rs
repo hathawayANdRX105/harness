@@ -19,10 +19,37 @@ use std::sync::atomic::AtomicU64;
 
 use crate::control::RunControl;
 use crate::event::EventSink;
+use crate::hooks::LoopHooks;
 use crate::message::{Content, Message, ToolCall, ToolResultMessage};
 use crate::model::Model;
+use crate::policy::{ApprovalBroker, ToolPolicy};
 use crate::run::RunContext;
 use crate::tool::Tool;
+use crate::transcript::TranscriptSink;
+
+/// The run-level seams one turn carries: the sinks and policy objects the
+/// *run* is wired to, as opposed to the cross-run configuration processors
+/// hold.
+///
+/// Hosts swap these per run — the scheduler registers a `BusSink` and a
+/// run-scoped transcript sink, the daemon its own — so a processor that
+/// captured one at construction would talk to a dead channel. Bundling them
+/// keeps [`Turn::new`] callable; the turn then hands every node exactly the
+/// seam it needs, and the nodes stay stateless.
+pub struct RunSeams {
+    /// The policy every tool call is evaluated against this run.
+    pub policy: Arc<dyn ToolPolicy>,
+    /// The approval broker the run's risky tools go through, when one is
+    /// wired.
+    pub approval_broker: Option<Arc<dyn ApprovalBroker>>,
+    /// The run's tool-call hooks (deny/terminate/inject).
+    pub hooks: LoopHooks,
+    /// The sink this run's events go to.
+    pub event_sink: Arc<dyn EventSink>,
+    /// The sink this run's messages are persisted through, when the host
+    /// persists the transcript per run.
+    pub transcript_sink: Option<Arc<dyn TranscriptSink>>,
+}
 
 /// One turn being machined: the single source of truth a `Processor` reads
 /// and mutates in place.
@@ -50,11 +77,10 @@ pub struct Turn {
     /// The model this turn talks to. `ModelProcessor` is the only node that
     /// streams; the rest read `info()` for catalog data and budget math.
     pub model: Arc<dyn Model>,
-    /// The sink this run's events go to. Every emitting node reads it from
-    /// the turn — hosts swap the sink per run (the scheduler registers a
-    /// `BusSink`, the daemon its own), and a node capturing a sink at
-    /// construction would emit to a dead channel.
-    pub event_sink: Arc<dyn EventSink>,
+    /// The run's seams: event sink, transcript sink, policy, approval
+    /// broker, hooks. Every emitting/persisting/policy-reading node takes
+    /// them from here (see [`RunSeams`]).
+    pub seams: RunSeams,
 }
 
 impl Turn {
@@ -66,7 +92,7 @@ impl Turn {
         control: RunControl,
         ctx: RunContext,
         seed: Vec<Message>,
-        event_sink: Arc<dyn EventSink>,
+        seams: RunSeams,
     ) -> Self {
         Self {
             ledger: seed,
@@ -77,8 +103,13 @@ impl Turn {
             seq: AtomicU64::new(0),
             artifacts: TurnArtifacts::default(),
             model,
-            event_sink,
+            seams,
         }
+    }
+
+    /// The sink this run's events go to (see [`RunSeams::event_sink`]).
+    pub fn event_sink(&self) -> &Arc<dyn EventSink> {
+        &self.seams.event_sink
     }
 
     /// Append one message at the ledger tail.

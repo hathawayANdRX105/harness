@@ -39,28 +39,22 @@ pub struct DispatchCtx<'a> {
 }
 
 impl<'a> DispatchCtx<'a> {
-    /// Derive a dispatch context from the turn plus the three policy seams.
+    /// Derive a dispatch context entirely from the turn.
     ///
-    /// Six of the nine fields are turn state (index, identity, tools, seq,
-    /// event sink, run control) — the single source of truth — so the only
-    /// hand-supplied inputs are the run-level policy seams the caller
-    /// already holds. Assembling this struct in one place keeps the turn
-    /// and the dispatch context from drifting apart.
-    pub fn from_turn(
-        turn: &'a Turn,
-        policy: &'a dyn ToolPolicy,
-        approval_broker: &'a Option<Arc<dyn ApprovalBroker>>,
-        hooks: &'a LoopHooks,
-    ) -> Self {
+    /// Every field is turn state now (identity, tools, seq, event sink, run
+    /// control, and the policy seams the turn carries): the turn is the
+    /// single source of truth, so the dispatch context can never disagree
+    /// with the run the turn belongs to.
+    pub fn from_turn(turn: &'a Turn) -> Self {
         Self {
             turn_idx: turn.turn_idx,
             ctx: &turn.ctx,
             tools: &turn.tools,
-            policy,
-            approval_broker,
-            hooks,
+            policy: turn.seams.policy.as_ref(),
+            approval_broker: &turn.seams.approval_broker,
+            hooks: &turn.seams.hooks,
             seq: &turn.seq,
-            sink: turn.event_sink.as_ref(),
+            sink: turn.event_sink().as_ref(),
             control: &turn.control,
         }
     }

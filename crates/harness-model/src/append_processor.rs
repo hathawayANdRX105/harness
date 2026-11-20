@@ -1,23 +1,26 @@
 //! The response-side node that appends assistant content and gates the run.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use harness_core::message::Message;
 use harness_core::run::RunStopReason;
 use harness_core::topology::{Processor, Route, Turn};
 
-use harness_core::transcript::{self, TranscriptSink};
+use harness_core::transcript;
 
 /// Append the model's assistant content to the ledger, then gate the run:
 /// no tool calls means the model answered the user, so the run completes.
-pub struct AppendProcessor {
-    transcript_sink: Option<Arc<dyn TranscriptSink>>,
-}
+/// State-less: the transcript sink rides the turn (`RunSeams`).
+pub struct AppendProcessor;
 
 impl AppendProcessor {
-    pub fn new(transcript_sink: Option<Arc<dyn TranscriptSink>>) -> Self {
-        Self { transcript_sink }
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for AppendProcessor {
+    fn default() -> Self {
+        Self
     }
 }
 
@@ -31,7 +34,7 @@ impl Processor for AppendProcessor {
         let content = std::mem::take(&mut turn.artifacts.content);
         transcript::push(
             &mut turn.ledger,
-            self.transcript_sink.as_deref(),
+            turn.seams.transcript_sink.as_deref(),
             &turn.ctx.session_id,
             Message::Assistant { content },
         )

@@ -44,7 +44,7 @@ use harness_core::model::Model;
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::Tool;
-use harness_core::topology::{Route, Turn};
+use harness_core::topology::{Route, RunSeams, Turn};
 use harness_core::transcript::{self, TranscriptSink};
 use harness_core::{LoopHooks, RunControl, ToolExecutionMode};
 use harness_model::{AppendProcessor, ModelProcessor};
@@ -128,22 +128,19 @@ impl LoopDeps {
     /// Assembly happens here, at run time, rather than at build time: the
     /// scheduler and the daemon swap `event_sink` / `transcript_sink` per
     /// run (the bus sink for a scheduler run, the session sink for a daemon
-    /// run), and the transcript sink is captured at construction —
-    /// building the chain here means the nodes always see the sinks the
-    /// run will actually use. Event emission reads the sink off the turn
-    /// instead, so prompt-phase nodes (assembled at build time by the
-    /// facade) route events to the run's sink too.
+    /// run); the nodes themselves are stateless and read every seam off
+    /// the turn, so phase assembly no longer depends on sink lifetime —
+    /// see `RunSeams`.
     pub fn response_chain(&self) -> Chain {
+        // Stateless nodes: every run seam rides the turn, so the response
+        // chain carries no per-run state. The factory stays a method (not a
+        // build-time field) only because `LoopDeps` construction sites would
+        // otherwise each have to build it — hoisting it to the facade is a
+        // pure API-shape decision, not a correctness one.
         Chain::new()
             .node(Arc::new(ModelProcessor::new()))
-            .node(Arc::new(AppendProcessor::new(self.transcript_sink.clone())))
-            .node(Arc::new(ToolDispatchProcessor::new(
-                Arc::clone(&self.policy),
-                self.approval_broker.clone(),
-                self.hooks.clone(),
-                self.tool_mode,
-                self.transcript_sink.clone(),
-            )))
+            .node(Arc::new(AppendProcessor::new()))
+            .node(Arc::new(ToolDispatchProcessor::new(self.tool_mode)))
     }
 }
 
@@ -257,7 +254,13 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
         control,
         ctx.clone(),
         deps.seed.clone(),
-        Arc::clone(&deps.event_sink),
+        RunSeams {
+            policy: Arc::clone(&deps.policy),
+            approval_broker: deps.approval_broker.clone(),
+            hooks: deps.hooks.clone(),
+            event_sink: Arc::clone(&deps.event_sink),
+            transcript_sink: deps.transcript_sink.clone(),
+        },
     );
     // The tool manifest rides the turn — the model and dispatch nodes
     // render it.
@@ -326,11 +329,11 @@ async fn backfill_partial_turn(turn: &mut Turn, deps: &LoopDeps) {
     )
     .await;
     if !partial_calls.is_empty() {
-        let tcx = DispatchCtx::from_turn(turn, &*deps.policy, &deps.approval_broker, &deps.hooks);
+        let tcx = DispatchCtx::from_turn(turn);
         let (results, _terminal) = dispatch_batch(&partial_calls, &tcx, deps.tool_mode).await;
         push_tool_results(
             &mut turn.ledger,
-            deps.transcript_sink.as_deref(),
+            turn.seams.transcript_sink.as_deref(),
             &turn.ctx,
             results,
         )
