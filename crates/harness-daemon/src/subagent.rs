@@ -37,8 +37,8 @@ use harness_core::model::Model;
 use harness_core::policy::ToolPolicy;
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
-use harness_core::topology::Topology;
 use harness_core::{LoopHooks, ToolExecutionMode};
+use harness_loop::Chain;
 use harness_loop::{LoopDeps, run as run_child};
 
 /// Default tool subset for a profile with no `tools` listed: read-only, so
@@ -280,7 +280,7 @@ impl Tool for SubagentTool {
             approval_broker: None,
             hooks: LoopHooks::default(),
             tool_mode: ToolExecutionMode::Sequential,
-            prompt_topology: Topology::default(),
+            prompt_chain: Chain::default(),
             seed: Vec::new(),
             transcript_sink: None,
         };

@@ -499,7 +499,7 @@ impl HookKind {
         match self {
             HookKind::DenyTools { .. } => "before_tool_call",
             HookKind::TerminateAfterToolBatch => "should_terminate_tool_batch",
-            HookKind::InjectInstruction { .. } => "prompt_topology",
+            HookKind::InjectInstruction { .. } => "prompt_chain",
         }
     }
 }

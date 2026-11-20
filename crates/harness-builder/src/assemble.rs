@@ -31,16 +31,16 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use harness_config::{BudgetConfig, Config, McpServerEntry, ModelsConfig, PromptSection};
-use harness_context::{Budget, BudgetGateProcessor, CompactionStage, Compactor};
+use harness_context::{Budget, CompactProcessor, CompactionStage, Compactor};
 use harness_core::EventSink;
 use harness_core::message::Message;
 use harness_core::model::{Model, ModelInfo};
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::RunLimits;
 use harness_core::tool::{Tool, ToolRequest};
-use harness_core::topology::{Processor, Topology};
+use harness_core::topology::Processor;
 use harness_core::{LoopHooks, ToolExecutionMode};
-use harness_loop::LoopDeps;
+use harness_loop::{Chain, LoopDeps};
 use harness_model::AliasRegistry;
 
 use crate::processors::{InstructionProcessor, SystemLedgerProcessor};
@@ -354,7 +354,7 @@ pub struct AssembledRuntime {
     /// The prompt-side machining chain: system ledger, declared
     /// instructions, host nodes, and — when a compactor is injected — the
     /// budget gate as its last node.
-    pub prompt_topology: Topology,
+    pub prompt_chain: Chain,
     pub mcp_pool: McpPool,
     pub hooks: LoopHooks,
     pub skills: Vec<SkillMeta>,
@@ -381,7 +381,7 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker.clone(),
             hooks: self.hooks.clone(),
             tool_mode: self.tool_mode,
-            prompt_topology: self.prompt_topology.clone(),
+            prompt_chain: self.prompt_chain.clone(),
             seed: Vec::new(),
             transcript_sink: None,
         }
@@ -398,7 +398,7 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker,
             hooks: self.hooks,
             tool_mode: self.tool_mode,
-            prompt_topology: self.prompt_topology,
+            prompt_chain: self.prompt_chain,
             seed: Vec::new(),
             transcript_sink: None,
         }
@@ -415,7 +415,7 @@ impl fmt::Debug for AssembledRuntime {
             .field("tools", &tool_names)
             .field("prompt", &self.prompt.as_ref().map(prompt_section_names))
             .field("mcp_pool", &self.mcp_pool)
-            .field("prompt_topology", &self.prompt_topology)
+            .field("prompt_chain", &self.prompt_chain)
             .field("hooks", &self.hooks)
             .field("skills", &self.skills)
             .field("models", &self.models)
@@ -457,7 +457,7 @@ pub struct HarnessBuilder {
     config: Option<ConfigBindings>,
     tool_mode: ToolExecutionMode,
     compactor: Option<Arc<dyn Compactor>>,
-    /// Host-supplied topology nodes, appended after the spec's prompt
+    /// Host-supplied chain nodes, appended after the spec's prompt
     /// nodes. Hosts extend the prompt phase here; the response phase
     /// (model / append / tool dispatch) stays loop-owned.
     custom_processors: Vec<Arc<dyn Processor>>,
@@ -552,7 +552,7 @@ impl HarnessBuilder {
         self
     }
 
-    /// Register one custom topology node.
+    /// Register one custom chain node.
     ///
     /// Custom nodes run in the prompt phase, after the spec's system ledger
     /// and instruction nodes and before the model call — the extension
@@ -614,7 +614,7 @@ impl HarnessBuilder {
             compactor: self.compactor.take(),
         });
         let hooks = assemble_hooks(&self.spec);
-        let prompt_topology = assemble_prompt_topology(
+        let prompt_chain = assemble_prompt_chain(
             &self.spec,
             &prompt,
             &self.custom_processors,
@@ -629,7 +629,7 @@ impl HarnessBuilder {
             model,
             prompt,
             tools: tools.tools,
-            prompt_topology,
+            prompt_chain,
             mcp_pool: tools.pool,
             hooks,
             skills,
@@ -984,42 +984,42 @@ fn assemble_hooks(spec: &HarnessSpec) -> LoopHooks {
     hooks
 }
 
-/// The prompt-side topology: the system ledger node leads (it must precede
+/// The prompt-side chain: the system ledger node leads (it must precede
 /// everything), then the declared instruction nodes (one per
 /// `InjectInstruction` hook, each independently idempotent), the host's
 /// custom nodes from `HarnessBuilder::with_processor`, and — when a
 /// compactor is injected — the budget gate last, so compaction sees the
 /// prompt-machined ledger before the model call (the position the legacy
 /// `run()` had it).
-fn assemble_prompt_topology(
+fn assemble_prompt_chain(
     spec: &HarnessSpec,
     prompt: &Option<Message>,
     custom: &[Arc<dyn Processor>],
     compaction: &Option<CompactionPlan>,
     event_sink: &Arc<dyn EventSink>,
-) -> Topology {
-    let mut topology = Topology::new();
+) -> Chain {
+    let mut chain = Chain::new();
     if let Some(prompt) = prompt {
-        topology = topology.node(Arc::new(SystemLedgerProcessor::new(prompt.clone())));
+        chain = chain.node(Arc::new(SystemLedgerProcessor::new(prompt.clone())));
     }
     for hook in &spec.hooks {
         if let HookKind::InjectInstruction { text } = &hook.kind {
-            topology = topology.node(Arc::new(InstructionProcessor::new(text)));
+            chain = chain.node(Arc::new(InstructionProcessor::new(text)));
         }
     }
     for node in custom {
-        topology = topology.node(Arc::clone(node));
+        chain = chain.node(Arc::clone(node));
     }
     if let Some(plan) = compaction
         && let Some(compactor) = &plan.compactor
     {
-        topology = topology.node(Arc::new(BudgetGateProcessor::new(
+        chain = chain.node(Arc::new(CompactProcessor::new(
             Arc::clone(compactor),
             Some(plan.budget),
             Arc::clone(event_sink),
         )));
     }
-    topology
+    chain
 }
 
 fn deny_tools_hook(hook_name: &str, tools: &[String]) -> BeforeToolCallFn {

@@ -5,15 +5,15 @@
 //!
 //! - prompt phase: `SystemLedgerProcessor` / `InstructionProcessor`
 //!   (harness-builder, the facade's default prompt nodes) and
-//!   `BudgetGateProcessor` (harness-context, the domain that owns
+//!   `CompactProcessor` (harness-context, the domain that owns
 //!   `Budget` / `Compactor`);
 //! - response phase: `ModelProcessor` / `AppendProcessor` (harness-model,
 //!   the domain that owns the model stream) and `ToolDispatchProcessor`
 //!   (harness-tools, the domain that owns tool execution).
 //!
 //! `run()` drives the turn loop: the boundary (cancellation, steering,
-//! task seed, max-turns), then the prompt topology (machining the ledger,
-//! ending in the budget gate), then the response topology (model → append
+//! task seed, max-turns), then the prompt chain (machining the ledger,
+//! ending in the budget gate), then the response chain (model → append
 //! gate → tool dispatch). Everything else is the driver's error-path glue.
 //!
 //! Design provenance: pi's `agentLoop` (`packages/agent/src/agent-loop.ts`),
@@ -37,13 +37,14 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use crate::chain::Chain;
 use harness_core::event::{EventSink, RunEventKind, emit_event};
 use harness_core::message::Message;
 use harness_core::model::Model;
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::Tool;
-use harness_core::topology::{Route, Topology, Turn};
+use harness_core::topology::{Route, Turn};
 use harness_core::transcript::{self, TranscriptSink};
 use harness_core::{LoopHooks, RunControl, ToolExecutionMode};
 use harness_model::{AppendProcessor, ModelProcessor};
@@ -57,8 +58,8 @@ use harness_tools::{DispatchCtx, ToolDispatchProcessor, dispatch_batch, push_too
 ///
 /// Both topologies are assembled **by the caller** (the builder for a spec,
 /// or a host by hand): this struct is the driving contract, not an assembly
-/// point. `response_topology` is the response chain (model → append gate →
-/// tool dispatch) and `prompt_topology` the prompt chain ending in the
+/// point. `response_chain` is the response chain (model → append gate →
+/// tool dispatch) and `prompt_chain` the prompt chain ending in the
 /// budget gate when one is configured.
 pub struct LoopDeps {
     /// The upstream model this loop calls.
@@ -81,7 +82,7 @@ pub struct LoopDeps {
     /// is configured: `Processor` nodes the run passes the turn through
     /// before the model call (system ledger, injected instructions, budget
     /// gate, later skills and retrieval).
-    pub prompt_topology: Topology,
+    pub prompt_chain: Chain,
     /// Transcript to start from: the host's replay of the session ledger.
     /// Empty for a fresh session. Seeded messages are already persisted, so
     /// they are never mirrored to `transcript_sink`.
@@ -107,7 +108,7 @@ impl std::fmt::Debug for LoopDeps {
                 &self.transcript_sink.as_ref().map(|_| "set"),
             )
             .field("hooks", &self.hooks)
-            .field("prompt_topology", &self.prompt_topology)
+            .field("prompt_chain", &self.prompt_chain)
             .field("tool_mode", &self.tool_mode)
             .finish()
     }
@@ -119,7 +120,7 @@ impl std::fmt::Debug for LoopDeps {
 /// Returns `Ok` when the turn may proceed, or `Err` with the stop reason
 /// when the run ends at this boundary. The caller emits `RunFinished`
 impl LoopDeps {
-    /// The response-phase topology the driver installs: model → append
+    /// The response-phase chain the driver installs: model → append
     /// (gate) → tool dispatch, assembled from the domain-owned nodes
     /// (`harness-model`, `harness-tools`) over **this** `LoopDeps`' own
     /// sinks.
@@ -127,11 +128,11 @@ impl LoopDeps {
     /// Assembly happens here, at run time, rather than at build time: the
     /// scheduler and the daemon swap `event_sink` / `transcript_sink` per
     /// run (the bus sink for a scheduler run, the session sink for a daemon
-    /// run), and topology nodes capture the sink at construction — building
+    /// run), and chain nodes capture the sink at construction — building
     /// the chain here means the nodes always see the sink the run will
     /// actually use.
-    pub fn response_topology(&self) -> Topology {
-        Topology::new()
+    pub fn response_chain(&self) -> Chain {
+        Chain::new()
             .node(Arc::new(ModelProcessor::new(Arc::clone(&self.event_sink))))
             .node(Arc::new(AppendProcessor::new(self.transcript_sink.clone())))
             .node(Arc::new(ToolDispatchProcessor::new(
@@ -237,10 +238,10 @@ fn emit_run_started(ctx: &RunContext, event_sink: &dyn EventSink, seq: &AtomicU6
 ///   Drain steer / inject user
 ///     |
 ///     v
-///   Prompt topology (ledger machining, budget gate)
+///   Prompt chain (ledger machining, budget gate)
 ///     |--Done--> stop
 ///     v
-///   Response topology: model stream → append gate → tool dispatch
+///   Response chain: model stream → append gate → tool dispatch
 ///     |--Done--> stop (error: backfill partial tool calls first)
 ///     v
 ///   next turn
@@ -279,10 +280,10 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
             return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq);
         }
 
-        // Prompt-side machining: the topology's processors reshape the
+        // Prompt-side machining: the chain's processors reshape the
         // ledger before the model call (system ledger, instructions, budget
         // gate). A processor that returns Done ends the run here.
-        if let Route::Done(reason) = deps.prompt_topology.step(&mut turn).await {
+        if let Route::Done(reason) = deps.prompt_chain.step(&mut turn).await {
             return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq);
         }
 
@@ -290,7 +291,7 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
         // gates the run (no tool calls → Completed), the dispatch node runs
         // the batch.
         turn.turn_idx = turn_idx;
-        if let Route::Done(reason) = deps.response_topology().step(&mut turn).await {
+        if let Route::Done(reason) = deps.response_chain().step(&mut turn).await {
             // Error backfill: partial content and tool calls still get
             // their ledger entries, so tool-call/result pairing never
             // breaks.

@@ -1,24 +1,28 @@
-//! The machining order: a `Topology` is a chain of `Processor` nodes plus
-//! the one-pass driver (`step`).
+//! The machining order: a `Chain` is an ordered set of `Processor` nodes
+//! plus the one-pass driver (`step`).
 //!
-//! The run-level cycle — turn boundary, prompt pass, response pass, repeat
-//! — lives in the driver (`harness_loop::run`), not here: machining an
-//! agent turn is a one-directional pass, and the outer loop is what makes
-//! it cyclic (Kafka topologies are acyclic for the same reason).
+//! This is the assembly surface — the factory line. The run-level cycle
+//! (turn boundary → prompt pass → response pass → repeat) lives in
+//! [`crate::engine::run`], not here: machining one agent turn is a
+//! one-directional pass, and the outer loop is what makes it cyclic
+//! (Kafka topologies are acyclic for the same reason).
+//!
+//! The trait vocabulary (`Processor`, `Route`, `Turn`) lives in
+//! `harness-core`; the chain itself is assembly, so it lives here with the
+//! driver, not in the contract crate.
 
 use std::sync::Arc;
 
-use crate::run::RunStopReason;
-use crate::topology::processor::{Processor, Route};
-use crate::topology::turn::Turn;
+use harness_core::run::RunStopReason;
+use harness_core::topology::{Processor, Route, Turn};
 
 /// The per-turn machining order: a chain of `Processor` nodes.
-pub struct Topology {
+pub struct Chain {
     nodes: Vec<Arc<dyn Processor>>,
 }
 
-impl Topology {
-    /// An empty topology; register nodes with `node`.
+impl Chain {
+    /// An empty chain; register nodes with [`Chain::node`].
     #[must_use]
     pub fn new() -> Self {
         Self { nodes: Vec::new() }
@@ -58,8 +62,8 @@ impl Topology {
     /// `Goto(name)` jumps to the next node with that name (a forward or
     /// backward jump — the name is what matters, not the direction) and
     /// machining continues from there. A name with no registered node is a
-    /// topology authoring bug, and the run fails loudly instead of
-    /// silently skipping the routing node's intent.
+    /// chain authoring bug, and the run fails loudly instead of silently
+    /// skipping the routing node's intent.
     pub async fn step(&self, turn: &mut Turn) -> Route {
         let mut next = 0usize;
         while let Some(node) = self.nodes.get(next) {
@@ -69,7 +73,7 @@ impl Topology {
                     Some(index) => next = index,
                     None => {
                         return Route::Done(RunStopReason::Error {
-                            message: format!("topology references unknown node `{target}`"),
+                            message: format!("chain references unknown node `{target}`"),
                         });
                     }
                 },
@@ -80,16 +84,16 @@ impl Topology {
     }
 }
 
-impl std::fmt::Debug for Topology {
+impl std::fmt::Debug for Chain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<&'static str> = self.nodes.iter().map(|node| node.name()).collect();
-        f.debug_struct("Topology").field("nodes", &names).finish()
+        f.debug_struct("Chain").field("nodes", &names).finish()
     }
 }
 
-impl Clone for Topology {
+impl Clone for Chain {
     fn clone(&self) -> Self {
-        // Nodes are `Arc`-shared: cloning a topology shares the processors
+        // Nodes are `Arc`-shared: cloning a chain shares the processors
         // across runs rather than copying them (processors never mutate).
         Self {
             nodes: self.nodes.clone(),
@@ -97,7 +101,7 @@ impl Clone for Topology {
     }
 }
 
-impl Default for Topology {
+impl Default for Chain {
     fn default() -> Self {
         Self::new()
     }

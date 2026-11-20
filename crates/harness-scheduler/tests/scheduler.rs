@@ -19,8 +19,8 @@ use harness_core::policy::{
 };
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
-use harness_core::topology::Topology;
 use harness_core::{LoopHooks, ToolExecutionMode};
+use harness_loop::Chain;
 use harness_loop::LoopDeps;
 use harness_scheduler::{
     EventBus, RunRequest, RunStatus, ScheduleError, Scheduler,
@@ -174,7 +174,7 @@ fn deps(model: Arc<dyn Model>, tools: Vec<Arc<dyn Tool>>, sink: Arc<dyn EventSin
         approval_broker: None,
         hooks: LoopHooks::default(),
         tool_mode: ToolExecutionMode::Sequential,
-        prompt_topology: Topology::default(),
+        prompt_chain: Chain::default(),
         seed: Vec::new(),
         transcript_sink: None,
     }
@@ -466,7 +466,7 @@ async fn approval_mid_ask_race_ends_the_run() {
                 })),
                 hooks: LoopHooks::default(),
                 tool_mode: ToolExecutionMode::Sequential,
-                prompt_topology: Topology::default(),
+                prompt_chain: Chain::default(),
                 seed: Vec::new(),
                 transcript_sink: None,
             },

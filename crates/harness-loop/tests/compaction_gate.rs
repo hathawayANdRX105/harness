@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_context::{
-    Budget, BudgetBlocked, BudgetGateProcessor, CompactionCheckpoint, CompactionResult,
+    Budget, BudgetBlocked, CompactProcessor, CompactionCheckpoint, CompactionResult,
     CompactionStage, Compactor, DefaultCompactor,
 };
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
@@ -29,8 +29,8 @@ use harness_core::message::{Content, Message};
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream};
 use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
-use harness_core::topology::Topology;
 use harness_core::{LoopHooks, RunControl, StopReason, ToolExecutionMode};
+use harness_loop::Chain;
 use harness_loop::{LoopDeps, run};
 use tokio_util::sync::CancellationToken;
 
@@ -340,7 +340,7 @@ async fn budget_exhausted_from_start_refuses_before_provider() -> Result<(), Str
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        prompt_topology: Topology::new().node(Arc::new(BudgetGateProcessor::new(
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
             Arc::clone(&compactor) as Arc<dyn Compactor>,
             Some(Budget {
                 used_tokens: 0,
@@ -439,7 +439,7 @@ async fn compaction_frees_room_then_turn_proceeds() -> Result<(), String> {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        prompt_topology: Topology::new().node(Arc::new(BudgetGateProcessor::new(
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
             Arc::clone(&compactor) as Arc<dyn Compactor>,
             Some(Budget {
                 used_tokens: 0,
@@ -573,7 +573,7 @@ async fn real_default_compactor_shrinks_oversized_history() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        prompt_topology: Topology::new().node(Arc::new(BudgetGateProcessor::new(
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
             Arc::clone(&compactor) as Arc<dyn Compactor>,
             None,
             sink.clone(),
@@ -643,7 +643,7 @@ async fn real_default_compactor_refuses_unshrinkable_history() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        prompt_topology: Topology::new().node(Arc::new(BudgetGateProcessor::new(
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
             Arc::new(harness_context::DefaultCompactor::new()) as Arc<dyn Compactor>,
             None,
             sink.clone(),
@@ -695,7 +695,7 @@ async fn configured_budget_caps_the_compactor_window() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        prompt_topology: Topology::new().node(Arc::new(BudgetGateProcessor::new(
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
             Arc::new(DefaultCompactor::new()) as Arc<dyn Compactor>,
             Some(Budget {
                 used_tokens: 0,

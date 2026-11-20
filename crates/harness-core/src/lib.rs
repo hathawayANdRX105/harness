@@ -66,7 +66,7 @@ pub use policy::{
 };
 pub use run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 pub use tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
-pub use topology::{Processor, Route, Topology, Turn, TurnArtifacts};
+pub use topology::{Processor, Route, Turn, TurnArtifacts};
 pub use transcript::TranscriptSink;
 
 pub mod control;

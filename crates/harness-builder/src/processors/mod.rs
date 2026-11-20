@@ -6,8 +6,8 @@
 //! crate: the builder is the assembly surface that decides what a default
 //! prompt topology looks like.
 
-mod instruction;
-mod system_ledger;
+mod instruction_processor;
+mod system_ledger_processor;
 
-pub use instruction::InstructionProcessor;
-pub use system_ledger::SystemLedgerProcessor;
+pub use instruction_processor::InstructionProcessor;
+pub use system_ledger_processor::SystemLedgerProcessor;

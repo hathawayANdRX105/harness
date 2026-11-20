@@ -328,7 +328,7 @@ async fn spec_builds_and_explains_minimal_runtime() -> Result<(), Box<dyn std::e
     );
     assert!(runtime.prompt.is_some(), "the prompt ledger is assembled");
     assert!(
-        !runtime.prompt_topology.is_empty(),
+        !runtime.prompt_chain.is_empty(),
         "the prompt rides the prompt-side topology"
     );
     assert!(
@@ -845,7 +845,7 @@ async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new()))).build()?;
 
     assert!(
-        !runtime.prompt_topology.is_empty(),
+        !runtime.prompt_chain.is_empty(),
         "the prompt topology carries the system ledger and instruction nodes"
     );
 
@@ -857,7 +857,7 @@ async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error
         make_ctx(),
         Vec::new(),
     );
-    runtime.prompt_topology.step(&mut turn).await;
+    runtime.prompt_chain.step(&mut turn).await;
     let messages = turn.ledger;
     assert!(
         matches!(
@@ -1165,8 +1165,8 @@ fn compactor_injection_reaches_loop_deps() -> Result<(), Box<dyn std::error::Err
         "the injected compactor is recorded"
     );
     assert!(
-        runtime.prompt_topology.names().contains(&"budget_gate"),
-        "the compactor rides the prompt topology as the budget gate"
+        runtime.prompt_chain.names().contains(&"compact"),
+        "the compactor rides the prompt chain as the compaction processor"
     );
     Ok(())
 }
@@ -1190,10 +1190,7 @@ fn compactor_without_stages_is_dropped() -> Result<(), Box<dyn std::error::Error
         .build()?;
 
     assert!(runtime.compaction.is_none(), "no stages, no plan");
-    assert!(
-        runtime.prompt_topology.is_empty(),
-        "no stages, no gate node"
-    );
+    assert!(runtime.prompt_chain.is_empty(), "no stages, no gate node");
     Ok(())
 }
 /// Purpose: `with_processor` is the host's extension surface — a custom node
@@ -1203,7 +1200,7 @@ fn compactor_without_stages_is_dropped() -> Result<(), Box<dyn std::error::Error
 /// Acceptance: the built prompt topology carries the custom node after the
 /// system ledger, and one `step` pass leaves both messages in the ledger.
 #[tokio::test]
-async fn with_processor_rides_the_prompt_topology() -> Result<(), Box<dyn std::error::Error>> {
+async fn with_processor_rides_the_prompt_chain() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -1237,7 +1234,7 @@ async fn with_processor_rides_the_prompt_topology() -> Result<(), Box<dyn std::e
         .build()?;
 
     assert_eq!(
-        runtime.prompt_topology.len(),
+        runtime.prompt_chain.len(),
         2,
         "system ledger node + the host node"
     );
@@ -1247,7 +1244,7 @@ async fn with_processor_rides_the_prompt_topology() -> Result<(), Box<dyn std::e
         make_ctx(),
         Vec::new(),
     );
-    runtime.prompt_topology.step(&mut turn).await;
+    runtime.prompt_chain.step(&mut turn).await;
     let messages = turn.ledger;
     assert!(
         matches!(
