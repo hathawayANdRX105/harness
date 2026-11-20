@@ -2,9 +2,8 @@
 //!
 //! This crate provides the stateless, async [`run()`] that drives one agent
 //! run: one [`Turn`] (the message ledger, tools, control and per-turn
-//! artifacts — the single source of truth) machined by two `Topology` phases
-//! assembled from domain-owned `Processor` nodes. See `docs/topology-design.md`
-//! for the design and §8.5 for the layering.
+//! artifacts — the single source of truth) machined by two `Topology`
+//! phases assembled from domain-owned `Processor` nodes.
 //!
 //! # Layering — this crate owns the driver, not the nodes
 //!

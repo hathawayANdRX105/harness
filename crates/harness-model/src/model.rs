@@ -18,7 +18,7 @@ use crate::pump::{StreamTurn, pump_stream};
 /// ledger and tool set, racing the cancel token against the stream, folding
 /// `ModelEvent`s into the turn's artifacts. The other nodes see only the
 /// turn-boundary product (`TurnArtifacts`), never a raw event — that is the
-/// hot-loop rule from `docs/topology-design.md` §5.
+/// hot-loop rule: only this node touches per-token state.
 pub struct ModelProcessor {
     event_sink: Arc<dyn EventSink>,
 }

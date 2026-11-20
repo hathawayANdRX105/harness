@@ -25,19 +25,19 @@
 //! dependency on `harness-config`.
 
 pub use alias::AliasRegistry;
-pub use append_node::AppendProcessor;
+pub use append::AppendProcessor;
 pub use backoff::RetryPolicy;
 pub use dialect::Dialect;
+pub use model::ModelProcessor;
 pub use model_info::ModelInfoLoader;
-pub use model_node::ModelProcessor;
 pub use openai::OpenAIModel;
 
 pub mod alias;
-pub mod append_node;
+pub mod append;
 pub mod backoff;
 pub mod dialect;
+pub mod model;
 pub mod model_info;
-pub mod model_node;
 pub mod openai;
 
 // The stream pump is the model node's private machinery: folding

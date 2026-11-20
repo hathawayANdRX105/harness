@@ -1,21 +1,16 @@
-//! The turn dataflow: `Processor` nodes machine a `Turn` along a `Topology`.
+//! The turn: the single source of truth a `Processor` reads and mutates.
 //!
-//! The vocabulary every run-side crate builds on: the turn is the single
-//! source of truth, a topology is the machining order, a processor is one
-//! step. `harness-loop` drives it; the concrete nodes live in the domain
-//! crates (`harness-model`, `harness-tools`, `harness-context`) and the
-//! facade (`harness-builder`).
+//! One `Turn` per run carries the message ledger, the tool set, run control,
+//! run identity and the sequence counter — everything the legacy loop
+//! scattered across function parameters — so a node asks the turn for what
+//! it needs instead of holding a copy. Cross-run handles (configs, sinks,
+//! limiters) stay in the processors; per-run state stays here.
 //!
-//! Design: see `docs/topology-design.md`. Kafka Streams contributes the
-//! vocabulary; LLVM contributes the load-bearing invariant — the data is
-//! the single source of truth, passed `&mut` between nodes and mutated in
-//! place, so exactly one node can write at a time by construction, not by
-//! lock. `2-governance` is the naming/discipline regime this module obeys.
+//! Ledger mutations go through `append_message` / `retract_messages`, the
+//! pairing-safe primitives: a tool call never survives without its result.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-
-use async_trait::async_trait;
 
 use crate::control::RunControl;
 use crate::message::{Content, Message, ToolCall, ToolResultMessage};
@@ -25,11 +20,6 @@ use crate::tool::Tool;
 
 /// One turn being machined: the single source of truth a `Processor` reads
 /// and mutates in place.
-///
-/// The turn carries the per-run state the legacy `LoopDeps` scattered
-/// across function parameters — ledger, tool set, run control, model — so
-/// a node asks the turn for whatever it needs instead of holding a copy.
-/// Cross-run handles (configs, sinks, limiters) stay in the processors.
 pub struct Turn {
     /// The message ledger. Processors append and prune it; the model request
     /// is rendered from it. Mutations go through `append_message` /
@@ -127,119 +117,6 @@ pub struct TurnArtifacts {
     pub stop: Option<RunStopReason>,
 }
 
-/// One machining step in the topology. Implementations hold only the
-/// strategy — config, handles, limiters — never per-run data: everything
-/// stateful arrives as the `&mut Turn` and leaves with it.
-///
-/// `process` is the Kafka Streams verb, kept over the higher-scoring `run`
-/// in the naming audit (`docs/topology-design.md` §1.1). The
-/// `2-governance/01-expression.md` bad-signal exemption is repaid by the
-/// signature saying what/who/result and by every implementation's module
-/// header stating what it machines.
-#[async_trait]
-pub trait Processor: Send + Sync + 'static {
-    /// The node's name: `Goto` targets address nodes by it, and it labels
-    /// tracing spans and metric points.
-    fn name(&self) -> &'static str;
-    /// Machine the turn once and report where the run goes next. `Next`
-    /// follows the default edge; `Goto` takes the conditional branch;
-    /// `Done` ends the run-level loop.
-    async fn process(&self, turn: &mut Turn) -> Route;
-}
-
-/// Where a processor sends the run next: the graph's routing outcome,
-/// gateway's `StageOutcome` minus the HTTP response (this graph machines a
-/// turn, not a request).
-pub enum Route {
-    /// Continue along the node's default edge.
-    Next,
-    /// Jump to a named node — the conditional branch. "No tool calls → end
-    /// the turn" is one `Goto`, not a hardcoded short-circuit in the driver.
-    Goto(&'static str),
-    /// End the run-level loop with a reason (Completed / Cancelled / Error).
-    Done(RunStopReason),
-}
-
-/// The per-turn machining order: a chain of `Processor` nodes.
-///
-/// The run-level cycle — turn boundary, prompt pass, response pass, repeat
-/// — lives in the driver (`harness_loop::run`), not here: machining an
-/// agent turn is a one-directional pass, and the outer loop is what makes
-/// it cyclic (see `docs/topology-design.md` §4).
-pub struct Topology {
-    nodes: Vec<Arc<dyn Processor>>,
-}
-
-impl Topology {
-    /// An empty topology; register nodes with `node`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { nodes: Vec::new() }
-    }
-
-    /// Register one node. Slices 2–5 fill this chain with real processors;
-    /// the driver resolves `Goto` targets against registered names.
-    #[must_use]
-    pub fn node(mut self, processor: Arc<dyn Processor>) -> Self {
-        self.nodes.push(processor);
-        self
-    }
-
-    /// Registered node count — the driver's sanity check and the shell's
-    /// unit surface.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// Whether no node is registered yet.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    /// Registered node names, in machining order — `Goto` targets resolve
-    /// against this, and hosts surface it in debug output.
-    #[must_use]
-    pub fn names(&self) -> Vec<&'static str> {
-        self.nodes.iter().map(|node| node.name()).collect()
-    }
-
-    /// Run one pass of the DAG over the turn: every node in registration
-    /// order, stopping at the first `Done`.
-    ///
-    /// `Goto(name)` jumps to the next node with that name (a forward or
-    /// backward jump — the name is what matters, not the direction) and
-    /// machining continues from there. A name with no registered node is a
-    /// topology authoring bug, and the run fails loudly instead of
-    /// silently skipping the routing node's intent.
-    pub async fn step(&self, turn: &mut Turn) -> Route {
-        let mut next = 0usize;
-        while let Some(node) = self.nodes.get(next) {
-            match node.process(turn).await {
-                Route::Next => next += 1,
-                Route::Goto(target) => match self.nodes.iter().position(|n| n.name() == target) {
-                    Some(index) => next = index,
-                    None => {
-                        return Route::Done(RunStopReason::Error {
-                            message: format!("topology references unknown node `{target}`"),
-                        });
-                    }
-                },
-                Route::Done(reason) => return Route::Done(reason),
-            }
-        }
-        Route::Next
-    }
-}
-
-impl std::fmt::Debug for Topology {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&'static str> = self.nodes.iter().map(|node| node.name()).collect();
-        f.debug_struct("Topology").field("nodes", &names).finish()
-    }
-}
-
 /// Close a message range under tool-call/tool-result pairing: the exact set
 /// of indices to remove so no straddling pair is cut.
 ///
@@ -292,19 +169,4 @@ fn pairing_closure(ledger: &[Message], range: std::ops::Range<usize>) -> Vec<usi
     let mut indices: Vec<usize> = drop_set.into_iter().collect();
     indices.sort_unstable();
     indices
-}
-impl Clone for Topology {
-    fn clone(&self) -> Self {
-        // Nodes are `Arc`-shared: cloning a topology shares the processors
-        // across runs rather than copying them (processors never mutate).
-        Self {
-            nodes: self.nodes.clone(),
-        }
-    }
-}
-
-impl Default for Topology {
-    fn default() -> Self {
-        Self::new()
-    }
 }
