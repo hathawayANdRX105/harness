@@ -22,7 +22,7 @@ use futures::stream::iter as stream_iter;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use harness_builder::{HarnessBuilder, HarnessSpec, ModelSpec, ToolSpec};
+use harness_builder::{HarnessBuilder, HarnessProfile, ModelEntry, ToolEntry};
 use harness_core::event::{EventSink, RunEvent};
 use harness_core::message::{Content, Message, StopReason};
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream};
@@ -202,9 +202,9 @@ async fn steer_reaches_the_next_turn_and_rejects_unknown_runs() {
         ],
     ]));
 
-    let mut spec = HarnessSpec::new("steering-test");
+    let mut spec = HarnessProfile::new("steering-test");
     spec.default_model = Some("steer".into());
-    spec.models = vec![ModelSpec {
+    spec.models = vec![ModelEntry {
         handle: "steer".into(),
         provider: "fake".into(),
         model: "steer-1".into(),
@@ -212,7 +212,7 @@ async fn steer_reaches_the_next_turn_and_rejects_unknown_runs() {
         supports_tool_use: true,
         supports_streaming: true,
     }];
-    spec.tools = vec![ToolSpec::external("slow")];
+    spec.tools = vec![ToolEntry::external("slow")];
     let runtime = HarnessBuilder::new(spec)
         .with_model(Arc::clone(&model) as Arc<dyn Model>)
         .with_policy(Arc::new(AllowAll))

@@ -48,23 +48,19 @@
 //! the scheduler, session, transport or daemon: it produces a runtime those
 //! layers consume, it does not drive them.
 
-mod analyze;
 mod assemble;
 mod error;
-mod explain;
 mod instruction_processor;
-mod spec;
+mod profile;
 mod system_ledger_processor;
-pub use analyze::{Analysis, analyze};
 pub use assemble::{
     AssembledRuntime, CompactionPlan, ConfigBindings, HarnessBuilder, McpPool, McpServerTools,
-    alias_registry_from_models, budget_from_config, compaction_stages_from_spec,
-    mcp_server_config_from_entry, mcp_server_specs, mcp_tool_specs, model_info_from_spec,
-    prompt_sections, run_limits_from_config, skill_specs_from_roots,
+    alias_registry_from_models, budget_from_config, compaction_stages_from_policy,
+    mcp_server_config_from_entry, mcp_server_entries_from_config, mcp_tool_entries,
+    model_info_from_entry, prompt_sections, run_limits_from_config, skill_refs_from_roots,
 };
-pub use error::{AnalyzeError, BuildError, SpecError};
-pub use explain::explain;
-pub use spec::{
-    BUILTIN_TOOLS, CompactionPolicySpec, CompactionStageSpec, HarnessSpec, HookKind, HookSpec,
-    McpServerSpec, ModelSpec, PromptSectionSpec, SkillSpec, ToolKind, ToolSpec, UnitManifest,
+pub use error::BuildError;
+pub use profile::{
+    BUILTIN_TOOLS, CompactionPolicy, CompactionStage, HarnessProfile, HookEntry, HookKind,
+    McpServerEntry, ModelEntry, PromptSection, SkillRef, ToolEntry, ToolKind,
 };

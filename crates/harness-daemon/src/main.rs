@@ -14,8 +14,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use harness_builder::{
-    AssembledRuntime, BUILTIN_TOOLS, CompactionStageSpec, HarnessBuilder, HarnessSpec, ModelSpec,
-    ToolSpec, compaction_stages_from_spec,
+    AssembledRuntime, BUILTIN_TOOLS, CompactionStage, HarnessBuilder, HarnessProfile, ModelEntry,
+    ToolEntry, compaction_stages_from_policy,
 };
 use harness_config::{Config, SubagentProfile};
 use harness_context::{DefaultCompactor, default_stages};
@@ -103,9 +103,9 @@ fn build_runtime(
     let alias = config.models.aliases.first().ok_or_else(|| {
         anyhow::anyhow!("no models configured: add at least one [[models.aliases]] entry")
     })?;
-    let mut spec = HarnessSpec::new("daemon-default");
+    let mut spec = HarnessProfile::new("daemon-default");
     spec.default_model = Some(alias.name.clone());
-    spec.models = vec![ModelSpec {
+    spec.models = vec![ModelEntry {
         handle: alias.name.clone(),
         provider: "openai".into(),
         model: alias.model_id.clone(),
@@ -115,7 +115,7 @@ fn build_runtime(
     }];
     spec.tools = BUILTIN_TOOLS
         .iter()
-        .map(|name| ToolSpec::builtin(*name))
+        .map(|name| ToolEntry::builtin(*name))
         .collect();
     // The `subagent` tool is declared as external so the builder validates
     // the injection and installs it into the base tool set; per-session
@@ -123,21 +123,21 @@ fn build_runtime(
     spec.tools.extend(
         subagent_tool
             .as_ref()
-            .map(|_| ToolSpec::external("subagent")),
+            .map(|_| ToolEntry::external("subagent")),
     );
     // Prompt sections, skills and MCP servers declared in config are mapped into
-    // the spec so the builder assembles them into the runtime. Hooks are
+    // the profile so the builder assembles them into the runtime. Hooks are
     // declarative-only: [registry].hooks is a list of paths with no on-disk
-    // definition contract, so there is no config->HookSpec mapping to apply and
-    // spec.hooks is left empty (no hook file format is invented here).
-    spec.prompt_sections = harness_builder::prompt_sections(&config.prompt.sections);
-    spec.skills = harness_builder::skill_specs_from_roots(&config.registry.skills);
-    spec.mcp_servers = harness_builder::mcp_server_specs(&config.mcp.servers);
-    // MCP tool units are namespaced `mcp-<server>`; spec validation rejects a
-    // genuine `tool:<name>` collision instead of silently dropping a configured
-    // server's tools.
+    // definition contract, so there is no config->hook mapping to apply and
+    // profile.hooks is left empty (no hook file format is invented here).
+    spec.prompt = harness_builder::prompt_sections(&config.prompt.sections);
+    spec.skills = harness_builder::skill_refs_from_roots(&config.registry.skills);
+    spec.mcp_servers = harness_builder::mcp_server_entries_from_config(&config.mcp.servers);
+    // MCP tool entries are namespaced `mcp-<server>`; build fails on a
+    // genuine `tool:<name>` collision instead of silently dropping a
+    // configured server's tools.
     spec.tools
-        .extend(harness_builder::mcp_tool_specs(&config.mcp.servers));
+        .extend(harness_builder::mcp_tool_entries(&config.mcp.servers));
     // Compaction: the harness-rs five-stage ladder, executed by the structural
     // DefaultCompactor — local, deterministic edits, never a model call. The
     // ladder is declared in the spec so the recorded plan and the executing
@@ -146,7 +146,7 @@ fn build_runtime(
     let ladder = default_stages();
     spec.compaction.stages = ladder
         .iter()
-        .map(|stage| CompactionStageSpec {
+        .map(|stage| CompactionStage {
             threshold: stage.threshold,
             target_ratio: stage.target_ratio,
             label: stage.label.clone(),
@@ -156,9 +156,9 @@ fn build_runtime(
         std::env::current_dir().context("resolving the current directory for tool execution")?;
     // The executing compactor is built from the same ladder the spec
     // records, so the plan and the runtime agree on the stages.
-    let compactor = Arc::new(DefaultCompactor::with_stages(compaction_stages_from_spec(
-        &spec.compaction,
-    )));
+    let compactor = Arc::new(DefaultCompactor::with_stages(
+        compaction_stages_from_policy(&spec.compaction),
+    ));
     let mut builder = HarnessBuilder::new(spec)
         .with_model(Arc::clone(&model))
         .with_policy(Arc::new(harness_daemon::wire::DaemonPolicy))

@@ -23,8 +23,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 use harness_builder::{
-    HarnessBuilder, HarnessSpec, ToolKind, mcp_server_specs, mcp_tool_specs, prompt_sections,
-    skill_specs_from_roots,
+    HarnessBuilder, HarnessProfile, ToolKind, mcp_server_entries_from_config, mcp_tool_entries,
+    prompt_sections, skill_refs_from_roots,
 };
 use harness_config::{
     AgentsConfig, BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry,
@@ -168,9 +168,9 @@ fn config_prompt_skills_mcp_wire_into_runtime() -> Result<(), Box<dyn std::error
     };
 
     // ── Mirror `build_runtime`'s spec mapping ──────────────────────────
-    let mut spec = HarnessSpec::new("config-wired");
+    let mut spec = HarnessProfile::new("config-wired");
     spec.default_model = Some("mock".into());
-    spec.models = vec![harness_builder::ModelSpec {
+    spec.models = vec![harness_builder::ModelEntry {
         handle: "mock".into(),
         provider: "mock".into(),
         model: "mock-1".into(),
@@ -180,17 +180,17 @@ fn config_prompt_skills_mcp_wire_into_runtime() -> Result<(), Box<dyn std::error
     }];
     spec.tools = harness_builder::BUILTIN_TOOLS
         .iter()
-        .map(|name| harness_builder::ToolSpec::builtin(*name))
+        .map(|name| harness_builder::ToolEntry::builtin(*name))
         .collect();
-    spec.prompt_sections = prompt_sections(&config.prompt.sections);
-    spec.skills = skill_specs_from_roots(&config.registry.skills);
-    spec.mcp_servers = mcp_server_specs(&config.mcp.servers);
-    // MCP tool units are namespaced `mcp-<server>`; spec validation catches
-    // a genuine `tool:<name>` collision.
-    spec.tools.extend(mcp_tool_specs(&config.mcp.servers));
+    spec.prompt = prompt_sections(&config.prompt.sections);
+    spec.skills = skill_refs_from_roots(&config.registry.skills);
+    spec.mcp_servers = mcp_server_entries_from_config(&config.mcp.servers);
+    // MCP tool entries are namespaced `mcp-<server>`; build fails on a
+    // genuine `tool:<name>` collision.
+    spec.tools.extend(mcp_tool_entries(&config.mcp.servers));
 
     // Spec-level wiring.
-    assert_eq!(spec.prompt_sections.len(), 2, "both prompt sections mapped");
+    assert_eq!(spec.prompt.len(), 2, "both prompt sections mapped");
     assert_eq!(spec.skills.len(), 1, "discovered skill mapped");
     assert_eq!(spec.mcp_servers.len(), 1, "MCP server entry mapped");
     assert!(

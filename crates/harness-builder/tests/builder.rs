@@ -8,36 +8,29 @@
 //!
 //! | Test | Scenario | Acceptance |
 //! |---|---|---|
-//! | `spec_builds_and_explains_minimal_runtime` | minimal spec (read + prompt + mock model) | explain renders it, build assembles it, the loop completes one turn |
-//! | `conflicts_fail_build` | unit conflicts with a provided capability | analysis and build both reject it |
-//! | `missing_requirement_fails_build` | unit requires an unprovided capability | analysis and build both reject it |
-//! | `dependency_cycles_are_rejected` | two units require each other's capability | analysis reports a cycle |
-//! | `install_order_is_topological` | dependent declared before its provider | provider installs first |
+//! | `profile_builds_and_runs_minimal_runtime` | minimal profile (read + prompt + mock model) | build assembles it, the loop completes one turn |
 //! | `config_bindings_map_into_runtime` | config models/budget/mcp sections | every mapped field reaches the runtime |
 //! | `mcp_entry_maps_to_server_config` | config MCP entry, with and without env var | fields map; unset secret is a named error |
-//! | `external_tool_requires_injection` | spec declares an external tool | build fails without `with_tool` |
+//! | `external_tool_requires_injection` | profile declares an external tool | build fails without `with_tool` |
 //! | `external_tool_injection_installs_tool` | host injects the declared tool | the injected tool is installed |
 //! | `model_is_never_defaulted` | no model injected | build fails with `MissingModel` |
 //! | `default_model_must_match_injected_model` | handle mismatch | build fails with `ModelMismatch` |
 //! | `declared_skills_are_discovered` | a real `SKILL.md` under a temp root | the named skill is assembled |
-//! | `declared_skills_register_the_skill_tool` | spec declares a skill | `skill` tool registered, skills metadata unchanged |
+//! | `declared_skills_register_the_skill_tool` | profile declares a skill | `skill` tool registered, skills metadata unchanged |
 //! | `skill_tool_must_not_shadow_a_declared_tool` | external tool named `skill` plus a declared skill | build fails with `DuplicateTool` |
 //! | `hooks_compose_prompt_and_instruction` | prompt + instruction + deny hooks | one composed prepare hook and one deny hook |
-//! | `spec_validation_is_standalone` | invalid builtin / duplicate hook seam / bad threshold | `validate()` rejects each without config |
-
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use harness_builder::{
-    AnalyzeError, BuildError, ConfigBindings, HarnessBuilder, HarnessSpec, HookKind, HookSpec,
-    ModelSpec, PromptSectionSpec, SkillSpec, SpecError, ToolKind, ToolSpec, UnitManifest, analyze,
-    mcp_server_config_from_entry, mcp_server_specs, mcp_tool_specs, prompt_sections,
-    skill_specs_from_roots,
+    BuildError, ConfigBindings, HarnessBuilder, HarnessProfile, HookEntry, HookKind, ModelEntry,
+    PromptSection, SkillRef, ToolEntry, ToolKind, mcp_server_config_from_entry,
+    mcp_server_entries_from_config, mcp_tool_entries, prompt_sections, skill_refs_from_roots,
 };
 use harness_config::{
     AgentsConfig, BudgetConfig, CURRENT_CONFIG_VERSION, Config, McpConfig, McpServerEntry,
-    ModelAlias, ModelsConfig, PromptConfig, PromptSection, RegistryConfig, SchedulerConfig,
-    SessionConfig, UpstreamConfig,
+    ModelAlias, ModelsConfig, PromptConfig, RegistryConfig, SchedulerConfig, SessionConfig,
+    UpstreamConfig,
 };
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
 use harness_core::message::Message;
@@ -202,36 +195,26 @@ impl TestSink {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn manifest(provides: &[&str], requires: &[&str], conflicts: &[&str]) -> UnitManifest {
-    UnitManifest {
-        provides: provides.iter().map(|name| name.to_string()).collect(),
-        requires: requires.iter().map(|name| name.to_string()).collect(),
-        conflicts: conflicts.iter().map(|name| name.to_string()).collect(),
-    }
-}
-
-fn external_tool(name: &str, provides: &[&str], requires: &[&str], conflicts: &[&str]) -> ToolSpec {
-    ToolSpec {
+fn external_tool(name: &str) -> ToolEntry {
+    ToolEntry {
         name: name.into(),
         kind: ToolKind::External,
         server: None,
         remote: None,
-        manifest: manifest(provides, requires, conflicts),
     }
 }
 
-fn builtin_tool(name: &str) -> ToolSpec {
-    ToolSpec {
+fn builtin_tool(name: &str) -> ToolEntry {
+    ToolEntry {
         name: name.into(),
         kind: ToolKind::Builtin,
         server: None,
         remote: None,
-        manifest: UnitManifest::default(),
     }
 }
 
-fn mock_model_spec() -> ModelSpec {
-    ModelSpec {
+fn mock_model_entry() -> ModelEntry {
+    ModelEntry {
         handle: "mock".into(),
         provider: "mock".into(),
         model: "mock-1".into(),
@@ -241,8 +224,8 @@ fn mock_model_spec() -> ModelSpec {
     }
 }
 
-fn builder_for(spec: HarnessSpec, model: Arc<dyn Model>) -> HarnessBuilder {
-    HarnessBuilder::new(spec)
+fn builder_for(profile: HarnessProfile, model: Arc<dyn Model>) -> HarnessBuilder {
+    HarnessBuilder::new(profile)
         .with_model(model)
         .with_policy(Arc::new(AllowAllPolicy))
         .with_event_sink(Arc::new(TestSink::default()))
@@ -266,54 +249,32 @@ fn make_ctx() -> RunContext {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Purpose: the acceptance path — a minimal spec is validated, explained,
-/// built and run through one loop turn.
+/// Purpose: the acceptance path — a minimal profile is built and run through
+/// one loop turn.
 /// Scenario: one builtin `read` tool, one prompt section, one declared model,
 /// a mock model that answers without tool calls.
-/// Acceptance: `explain` names the spec/units and reports `validation: ok`;
-/// `build` assembles the read tool and the prompt ledger; the loop's first
-/// request carries the system ledger and the read schema; the run completes.
+/// Acceptance: `build` assembles the read tool and the prompt ledger; the
+/// loop's first request carries the system ledger and the read schema; the
+/// run completes.
 #[tokio::test]
-async fn spec_builds_and_explains_minimal_runtime() -> Result<(), Box<dyn std::error::Error>> {
+async fn profile_builds_and_runs_minimal_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::TempDir::new()?;
 
-    let mut spec = HarnessSpec::new("minimal");
-    spec.tools.push(builtin_tool("read"));
-    spec.prompt_sections.push(PromptSectionSpec {
+    let mut profile = HarnessProfile::new("minimal");
+    profile.tools.push(builtin_tool("read"));
+    profile.prompt.push(PromptSection {
         name: "system".into(),
         content: "You are a test harness.".into(),
-        manifest: UnitManifest::default(),
     });
-    spec.models.push(mock_model_spec());
-    spec.default_model = Some("mock".into());
-
-    spec.validate()?;
-
-    let text = spec.explain();
-    assert!(
-        text.contains("harness spec `minimal`"),
-        "explain names the spec: {text}"
-    );
-    assert!(text.contains("tool:read"), "explain lists the tool: {text}");
-    assert!(
-        text.contains("prompt:system"),
-        "explain lists the prompt section: {text}"
-    );
-    assert!(
-        text.contains("validation: ok"),
-        "explain reports validation: {text}"
-    );
-    assert!(
-        text.contains("install order (2 units)"),
-        "explain prints the install order: {text}"
-    );
+    profile.models.push(mock_model_entry());
+    profile.default_model = Some("mock".into());
 
     let model = Arc::new(MockModel::new(vec![vec![
         ModelEvent::TextDelta("hello".into()),
         ModelEvent::Stop(StopReason::EndTurn),
     ]]));
     let sink = Arc::new(TestSink::default());
-    let runtime = HarnessBuilder::new(spec)
+    let runtime = HarnessBuilder::new(profile)
         .with_model(model.clone())
         .with_policy(Arc::new(AllowAllPolicy))
         .with_event_sink(sink.clone())
@@ -361,123 +322,6 @@ async fn spec_builds_and_explains_minimal_runtime() -> Result<(), Box<dyn std::e
         "the loop emitted RunFinished"
     );
     Ok(())
-}
-
-/// Purpose: a conflict declared by one unit against another unit's capability
-/// is a build failure.
-/// Scenario: `alpha` provides `net`, `beta` conflicts with `net`.
-/// Acceptance: `analyze` returns `Conflict` naming beta/net/alpha, and
-/// `build` surfaces it as `BuildError::Analyze`.
-#[test]
-fn conflicts_fail_build() {
-    let mut spec = HarnessSpec::new("conflict");
-    spec.tools.push(external_tool("alpha", &["net"], &[], &[]));
-    spec.tools.push(external_tool("beta", &[], &[], &["net"]));
-
-    let analysis = analyze(&spec);
-    assert!(
-        matches!(
-            analysis,
-            Err(AnalyzeError::Conflict {
-                ref unit,
-                ref capability,
-                ref provider,
-            }) if unit == "tool:beta" && capability == "net" && provider == "tool:alpha"
-        ),
-        "conflict names both units: {analysis:?}"
-    );
-
-    let error = HarnessBuilder::new(spec).build().err();
-    assert!(
-        matches!(
-            error,
-            Some(BuildError::Analyze(AnalyzeError::Conflict { .. }))
-        ),
-        "build rejects the conflict: {error:?}"
-    );
-}
-
-/// Purpose: a required capability with no provider is a build failure.
-/// Scenario: a tool requires `missing.cap`; no unit provides it.
-/// Acceptance: `analyze` returns `MissingRequirement`, and `build` surfaces
-/// it as `BuildError::Analyze`.
-#[test]
-fn missing_requirement_fails_build() {
-    let mut spec = HarnessSpec::new("missing");
-    spec.tools
-        .push(external_tool("needy", &[], &["missing.cap"], &[]));
-
-    let analysis = analyze(&spec);
-    assert!(
-        matches!(
-            analysis,
-            Err(AnalyzeError::MissingRequirement {
-                ref unit,
-                ref capability,
-            }) if unit == "tool:needy" && capability == "missing.cap"
-        ),
-        "missing provider is named: {analysis:?}"
-    );
-
-    let error = HarnessBuilder::new(spec).build().err();
-    assert!(
-        matches!(
-            error,
-            Some(BuildError::Analyze(AnalyzeError::MissingRequirement { .. }))
-        ),
-        "build rejects the missing requirement: {error:?}"
-    );
-}
-
-/// Purpose: two units requiring each other's capability form a cycle.
-/// Scenario: `prompt:a` provides `a.cap` and requires `b.cap`; `prompt:b`
-/// provides `b.cap` and requires `a.cap`.
-/// Acceptance: `analyze` returns `Cycle` listing both units.
-#[test]
-fn dependency_cycles_are_rejected() {
-    let mut spec = HarnessSpec::new("cycle");
-    spec.prompt_sections.push(PromptSectionSpec {
-        name: "a".into(),
-        content: "a".into(),
-        manifest: manifest(&["a.cap"], &["b.cap"], &[]),
-    });
-    spec.prompt_sections.push(PromptSectionSpec {
-        name: "b".into(),
-        content: "b".into(),
-        manifest: manifest(&["b.cap"], &["a.cap"], &[]),
-    });
-
-    let error = analyze(&spec).err();
-    assert!(
-        matches!(error, Some(AnalyzeError::Cycle { ref units }) if units.len() == 2),
-        "cycle lists the blocked units: {error:?}"
-    );
-}
-
-/// Purpose: the install order is topological, not declaration order.
-/// Scenario: a hook that requires `base.prompt` is declared before the prompt
-/// section that provides it.
-/// Acceptance: the prompt section is ordered before the hook.
-#[test]
-fn install_order_is_topological() {
-    let mut spec = HarnessSpec::new("order");
-    spec.hooks.push(HookSpec {
-        name: "guard".into(),
-        kind: HookKind::TerminateAfterToolBatch,
-        manifest: manifest(&[], &["base.prompt"], &[]),
-    });
-    spec.prompt_sections.push(PromptSectionSpec {
-        name: "base".into(),
-        content: "base".into(),
-        manifest: manifest(&["base.prompt"], &[], &[]),
-    });
-
-    let analysis = analyze(&spec).unwrap_or_else(|error| panic!("analysis failed: {error}"));
-    assert_eq!(
-        analysis.install_order,
-        vec!["prompt:base".to_string(), "hook:guard".to_string()],
-        "the provider installs before its dependent"
-    );
 }
 
 /// Purpose: every builder-relevant config section reaches the assembled
@@ -550,8 +394,8 @@ fn config_bindings_map_into_runtime() -> Result<(), Box<dyn std::error::Error>> 
     );
     assert!(server.env.is_empty(), "no env var is configured");
 
-    let mut spec = HarnessSpec::new("configured");
-    spec.models.push(mock_model_spec());
+    let mut spec = HarnessProfile::new("configured");
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
         .with_config_bindings(bindings)
@@ -621,8 +465,8 @@ fn mcp_entry_maps_to_server_config() -> Result<(), Box<dyn std::error::Error>> {
 /// Acceptance: `build` returns `MissingExternalTool { name: "custom" }`.
 #[test]
 fn external_tool_requires_injection() {
-    let mut spec = HarnessSpec::new("external");
-    spec.tools.push(external_tool("custom", &[], &[], &[]));
+    let mut spec = HarnessProfile::new("external");
+    spec.tools.push(external_tool("custom"));
 
     let error = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
         .build()
@@ -640,9 +484,9 @@ fn external_tool_requires_injection() {
 /// Acceptance: `build` succeeds and the runtime carries the injected tool.
 #[test]
 fn external_tool_injection_installs_tool() -> Result<(), Box<dyn std::error::Error>> {
-    let mut spec = HarnessSpec::new("injected");
-    spec.tools.push(external_tool("custom", &[], &[], &[]));
-    spec.models.push(mock_model_spec());
+    let mut spec = HarnessProfile::new("injected");
+    spec.tools.push(external_tool("custom"));
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
@@ -662,7 +506,7 @@ fn external_tool_injection_installs_tool() -> Result<(), Box<dyn std::error::Err
 /// Acceptance: `build` returns `MissingModel`.
 #[test]
 fn model_is_never_defaulted() {
-    let spec = HarnessSpec::new("no-model");
+    let spec = HarnessProfile::new("no-model");
     let error = HarnessBuilder::new(spec)
         .with_policy(Arc::new(AllowAllPolicy))
         .with_event_sink(Arc::new(TestSink::default()))
@@ -679,8 +523,8 @@ fn model_is_never_defaulted() {
 /// Acceptance: `build` returns `ModelMismatch` naming both handles.
 #[test]
 fn default_model_must_match_injected_model() {
-    let mut spec = HarnessSpec::new("mismatch");
-    spec.models.push(mock_model_spec());
+    let mut spec = HarnessProfile::new("mismatch");
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let model = Arc::new(MockModel::new(Vec::new()).with_handle("other"));
@@ -707,13 +551,12 @@ fn declared_skills_are_discovered() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(skill_dir.join("SKILL.md"), "# Greet\nA greeting skill.\n")?;
 
-    let mut spec = HarnessSpec::new("skills");
-    spec.skills.push(SkillSpec {
+    let mut spec = HarnessProfile::new("skills");
+    spec.skills.push(SkillRef {
         name: "greet".into(),
         path: dir.path().to_string_lossy().into_owned(),
-        manifest: UnitManifest::default(),
     });
-    spec.models.push(mock_model_spec());
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new()))).build()?;
@@ -740,13 +583,12 @@ fn declared_skills_register_the_skill_tool() -> Result<(), Box<dyn std::error::E
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(skill_dir.join("SKILL.md"), "# Demo\n\nA demo skill.\n")?;
 
-    let mut spec = HarnessSpec::new("skill-activation");
-    spec.skills.push(SkillSpec {
+    let mut spec = HarnessProfile::new("skill-activation");
+    spec.skills.push(SkillRef {
         name: "demo".into(),
         path: dir.path().to_string_lossy().into_owned(),
-        manifest: UnitManifest::default(),
     });
-    spec.models.push(mock_model_spec());
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new()))).build()?;
@@ -786,14 +628,13 @@ fn skill_tool_must_not_shadow_a_declared_tool() -> Result<(), Box<dyn std::error
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(skill_dir.join("SKILL.md"), "# Demo\n\nA demo skill.\n")?;
 
-    let mut spec = HarnessSpec::new("skill-collision");
-    spec.tools.push(external_tool("skill", &[], &[], &[]));
-    spec.skills.push(SkillSpec {
+    let mut spec = HarnessProfile::new("skill-collision");
+    spec.tools.push(external_tool("skill"));
+    spec.skills.push(SkillRef {
         name: "demo".into(),
         path: dir.path().to_string_lossy().into_owned(),
-        manifest: UnitManifest::default(),
     });
-    spec.models.push(mock_model_spec());
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let error = HarnessBuilder::new(spec)
@@ -819,27 +660,24 @@ fn skill_tool_must_not_shadow_a_declared_tool() -> Result<(), Box<dyn std::error
 /// and the instruction last; the deny hook rejects `rm` and allows `read`.
 #[tokio::test]
 async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error::Error>> {
-    let mut spec = HarnessSpec::new("hooks");
-    spec.prompt_sections.push(PromptSectionSpec {
+    let mut spec = HarnessProfile::new("hooks");
+    spec.prompt.push(PromptSection {
         name: "system".into(),
         content: "system prompt".into(),
-        manifest: UnitManifest::default(),
     });
-    spec.hooks.push(HookSpec {
+    spec.hooks.push(HookEntry {
         name: "steer".into(),
         kind: HookKind::InjectInstruction {
             text: "follow the rules".into(),
         },
-        manifest: UnitManifest::default(),
     });
-    spec.hooks.push(HookSpec {
+    spec.hooks.push(HookEntry {
         name: "guard".into(),
         kind: HookKind::DenyTools {
             tools: vec!["rm".into()],
         },
-        manifest: UnitManifest::default(),
     });
-    spec.models.push(mock_model_spec());
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new()))).build()?;
@@ -903,62 +741,6 @@ async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-/// Purpose: `validate()` is a standalone structural check — no config and no
-/// builder needed.
-/// Scenario: an unknown builtin, two hooks on the same loop seam, and a
-/// compaction threshold outside (0, 1].
-/// Acceptance: each malformed spec is rejected with its own `SpecError`.
-#[test]
-fn spec_validation_is_standalone() {
-    let mut unknown_builtin = HarnessSpec::new("bad-tool");
-    unknown_builtin.tools.push(builtin_tool("teleport"));
-    assert!(
-        matches!(
-            unknown_builtin.validate(),
-            Err(SpecError::UnknownBuiltin { ref name }) if name == "teleport"
-        ),
-        "an unknown builtin is rejected"
-    );
-
-    let mut duplicate_seam = HarnessSpec::new("bad-hooks");
-    duplicate_seam.hooks.push(HookSpec {
-        name: "first".into(),
-        kind: HookKind::TerminateAfterToolBatch,
-        manifest: UnitManifest::default(),
-    });
-    duplicate_seam.hooks.push(HookSpec {
-        name: "second".into(),
-        kind: HookKind::TerminateAfterToolBatch,
-        manifest: UnitManifest::default(),
-    });
-    assert!(
-        matches!(
-            duplicate_seam.validate(),
-            Err(SpecError::DuplicateHookKind {
-                seam: "should_terminate_tool_batch"
-            })
-        ),
-        "two hooks on one seam are rejected"
-    );
-
-    let mut bad_compaction = HarnessSpec::new("bad-compaction");
-    bad_compaction
-        .compaction
-        .stages
-        .push(harness_builder::CompactionStageSpec {
-            threshold: 1.5,
-            target_ratio: 0.5,
-            label: "impossible".into(),
-        });
-    assert!(
-        matches!(
-            bad_compaction.validate(),
-            Err(SpecError::InvalidThreshold { ref label, .. }) if label == "impossible"
-        ),
-        "an out-of-range threshold is rejected"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Config → spec mapping
 // ---------------------------------------------------------------------------
@@ -969,11 +751,11 @@ fn spec_validation_is_standalone() {
 #[test]
 fn prompt_sections_map_in_order() {
     let sections = prompt_sections(&[
-        PromptSection {
+        harness_config::PromptSection {
             name: "identity".into(),
             content: "You are harness.".into(),
         },
-        PromptSection {
+        harness_config::PromptSection {
             name: "rules".into(),
             content: "Be terse.".into(),
         },
@@ -999,7 +781,7 @@ fn mcp_specs_map_from_entries() {
         env_var: None,
     }];
 
-    let servers = mcp_server_specs(&entries);
+    let servers = mcp_server_entries_from_config(&entries);
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].name, "docs");
     assert!(
@@ -1007,7 +789,7 @@ fn mcp_specs_map_from_entries() {
         "resolution stays in config bindings"
     );
 
-    let tools = mcp_tool_specs(&entries);
+    let tools = mcp_tool_entries(&entries);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].kind, ToolKind::Mcp);
     assert_eq!(tools[0].server.as_deref(), Some("docs"));
@@ -1036,7 +818,7 @@ fn skill_specs_from_roots_scan_and_dedupe() -> Result<(), Box<dyn std::error::Er
         .display()
         .to_string();
 
-    let specs = skill_specs_from_roots(&[
+    let specs = skill_refs_from_roots(&[
         first.path().display().to_string(),
         second.path().display().to_string(),
         missing,
@@ -1081,11 +863,11 @@ fn config_prompt_and_skills_reach_the_runtime() -> Result<(), Box<dyn std::error
         agents: AgentsConfig::default(),
         prompt: PromptConfig {
             sections: vec![
-                PromptSection {
+                harness_config::PromptSection {
                     name: "identity".into(),
                     content: "You are harness.".into(),
                 },
-                PromptSection {
+                harness_config::PromptSection {
                     name: "rules".into(),
                     content: "Be terse.".into(),
                 },
@@ -1093,11 +875,11 @@ fn config_prompt_and_skills_reach_the_runtime() -> Result<(), Box<dyn std::error
         },
     };
 
-    let mut spec = HarnessSpec::new("config-wired");
-    spec.models.push(mock_model_spec());
+    let mut spec = HarnessProfile::new("config-wired");
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
-    spec.prompt_sections = prompt_sections(&config.prompt.sections);
-    spec.skills = skill_specs_from_roots(&config.registry.skills);
+    spec.prompt = prompt_sections(&config.prompt.sections);
+    spec.skills = skill_refs_from_roots(&config.registry.skills);
 
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
         .with_cwd(dir.path().to_path_buf())
@@ -1143,16 +925,16 @@ fn config_prompt_and_skills_reach_the_runtime() -> Result<(), Box<dyn std::error
 #[test]
 fn compactor_injection_reaches_loop_deps() -> Result<(), Box<dyn std::error::Error>> {
     let ladder = harness_context::default_stages();
-    let mut spec = HarnessSpec::new("compacted");
+    let mut spec = HarnessProfile::new("compacted");
     spec.compaction.stages = ladder
         .iter()
-        .map(|stage| harness_builder::CompactionStageSpec {
+        .map(|stage| harness_builder::CompactionStage {
             threshold: stage.threshold,
             target_ratio: stage.target_ratio,
             label: stage.label.clone(),
         })
         .collect();
-    spec.models.push(mock_model_spec());
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let compactor = Arc::new(harness_context::DefaultCompactor::with_stages(
@@ -1186,8 +968,8 @@ fn compactor_injection_reaches_loop_deps() -> Result<(), Box<dyn std::error::Err
 /// `None`.
 #[test]
 fn compactor_without_stages_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
-    let mut spec = HarnessSpec::new("no-ladder");
-    spec.models.push(mock_model_spec());
+    let mut spec = HarnessProfile::new("no-ladder");
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let compactor: Arc<dyn harness_context::Compactor> =
@@ -1227,13 +1009,12 @@ async fn with_processor_rides_the_prompt_chain() -> Result<(), Box<dyn std::erro
         }
     }
 
-    let mut spec = HarnessSpec::new("custom-node");
-    spec.prompt_sections.push(PromptSectionSpec {
+    let mut spec = HarnessProfile::new("custom-node");
+    spec.prompt.push(PromptSection {
         name: "system".into(),
         content: "system prompt".into(),
-        manifest: UnitManifest::default(),
     });
-    spec.models.push(mock_model_spec());
+    spec.models.push(mock_model_entry());
     spec.default_model = Some("mock".into());
 
     let runtime = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
