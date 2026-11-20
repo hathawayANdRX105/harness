@@ -40,51 +40,12 @@ pub const MAIN_BRANCH: &str = "main";
 /// starts here.
 pub const INITIAL_EPOCH: i64 = 1;
 
-/// What one ledger row is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnitKind {
-    /// A user prompt.
-    Prompt,
-    /// A steering message replayed as a user turn.
-    Steering,
-    /// A text or reasoning block of an assistant message.
-    Assistant,
-    /// A tool call block of an assistant message.
-    ToolCall,
-    /// A tool result message.
-    ToolResult,
-    /// A prompt-ledger section delta.
-    System,
-}
-
-impl UnitKind {
-    /// The stable wire/database string.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Prompt => "prompt",
-            Self::Steering => "steering",
-            Self::Assistant => "assistant",
-            Self::ToolCall => "tool_call",
-            Self::ToolResult => "tool_result",
-            Self::System => "system",
-        }
-    }
-
-    /// Parse the database string.
-    pub fn parse(value: &str) -> Result<Self, SessionStoreError> {
-        match value {
-            "prompt" => Ok(Self::Prompt),
-            "steering" => Ok(Self::Steering),
-            "assistant" => Ok(Self::Assistant),
-            "tool_call" => Ok(Self::ToolCall),
-            "tool_result" => Ok(Self::ToolResult),
-            "system" => Ok(Self::System),
-            other => Err(SessionStoreError::Internal(format!(
-                "unknown unit kind {other:?}"
-            ))),
-        }
-    }
-}
+/// The classification a unit row carries.
+///
+/// Core's `MessageKind` under its storage-side name: the taxonomy is
+/// defined once, next to `Message`, so a new message variant and its
+/// storage kind stay in step.
+pub use harness_core::message::MessageKind as UnitKind;
 
 /// One ledger row's index fields: exactly what the graph needs.
 ///
@@ -275,7 +236,9 @@ fn message_blocks(
 }
 
 /// One unit per assistant content block; an empty message keeps one empty
-/// unit so its existence and its message sequence survive.
+/// unit so its existence and its message sequence survive. Block kinds come
+/// from `Content::kind` (core): total, so the taxonomy cannot drift from
+/// the message model.
 fn assistant_blocks(
     content: &[Content],
 ) -> Result<Vec<(UnitKind, &'static str, &'static str, String)>, SessionStoreError> {
@@ -289,24 +252,16 @@ fn assistant_blocks(
     }
     content
         .iter()
-        .map(|block| match block {
-            Content::ToolCall(call) => Ok((
-                UnitKind::ToolCall,
-                "assistant",
-                "model",
-                serde_json::to_string(call).map_err(SessionStoreError::Serialization)?,
-            )),
-            Content::Text(_) | Content::Reasoning(_) => Ok((
-                UnitKind::Assistant,
-                "assistant",
-                "model",
-                serde_json::to_string(block).map_err(SessionStoreError::Serialization)?,
-            )),
-            // `Content` is `#[non_exhaustive]`; a new block kind must be
-            // mapped explicitly before it can be persisted.
-            _ => Err(SessionStoreError::Internal(
-                "unsupported content variant for the unit ledger".into(),
-            )),
+        .map(|block| {
+            // A tool-call unit's payload is the call itself — the store
+            // indexes `tool_call_id` out of it; every other block
+            // serializes whole.
+            let payload = match block {
+                Content::ToolCall(call) => serde_json::to_string(call),
+                _ => serde_json::to_string(block),
+            }
+            .map_err(SessionStoreError::Serialization)?;
+            Ok((block.kind(), "assistant", "model", payload))
         })
         .collect()
 }
@@ -348,7 +303,6 @@ pub fn assemble_messages(units: &[StoredUnit]) -> Result<Vec<MessageEntry>, Sess
     }
     Ok(entries)
 }
-
 /// Assemble one message's rows.
 fn assemble_group(group: &[&StoredUnit]) -> Result<MessageEntry, SessionStoreError> {
     let first = group

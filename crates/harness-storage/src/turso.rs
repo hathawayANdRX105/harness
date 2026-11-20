@@ -538,7 +538,7 @@ fn decode_unit_row(
             .map_err(|_| SessionStoreError::Internal("negative unit message_seq".into()))?,
         source_kind,
         role,
-        kind: UnitKind::parse(&kind)?,
+        kind: UnitKind::parse(&kind).map_err(SessionStoreError::Internal)?,
         run_id,
         tool_call_id,
         idempotency_key,

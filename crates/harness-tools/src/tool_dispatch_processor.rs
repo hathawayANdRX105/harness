@@ -53,17 +53,12 @@ impl Processor for ToolDispatchProcessor {
 
     async fn process(&self, turn: &mut Turn) -> Route {
         let calls = std::mem::take(&mut turn.artifacts.calls);
-        let tcx = DispatchCtx {
-            turn_idx: turn.turn_idx,
-            ctx: &turn.ctx,
-            tools: &turn.tools,
-            policy: self.policy.as_ref(),
-            approval_broker: &self.approval_broker,
-            hooks: &self.hooks,
-            seq: &turn.seq,
-            sink: turn.event_sink.as_ref(),
-            control: &turn.control,
-        };
+        let tcx = DispatchCtx::from_turn(
+            turn,
+            self.policy.as_ref(),
+            &self.approval_broker,
+            &self.hooks,
+        );
         let (result_msgs, terminal_reason) = dispatch_batch(&calls, &tcx, self.tool_mode).await;
 
         if let Some(reason) = terminal_reason {

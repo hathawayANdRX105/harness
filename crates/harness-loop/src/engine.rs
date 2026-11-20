@@ -326,17 +326,7 @@ async fn backfill_partial_turn(turn: &mut Turn, deps: &LoopDeps) {
     )
     .await;
     if !partial_calls.is_empty() {
-        let tcx = DispatchCtx {
-            turn_idx: turn.turn_idx,
-            ctx: &turn.ctx,
-            tools: &deps.tools,
-            policy: &*deps.policy,
-            approval_broker: &deps.approval_broker,
-            hooks: &deps.hooks,
-            seq: &turn.seq,
-            sink: turn.event_sink.as_ref(),
-            control: &turn.control,
-        };
+        let tcx = DispatchCtx::from_turn(turn, &*deps.policy, &deps.approval_broker, &deps.hooks);
         let (results, _terminal) = dispatch_batch(&partial_calls, &tcx, deps.tool_mode).await;
         push_tool_results(
             &mut turn.ledger,

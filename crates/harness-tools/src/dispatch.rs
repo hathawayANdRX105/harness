@@ -23,8 +23,8 @@ use harness_core::policy::{
 };
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult};
+use harness_core::topology::Turn;
 use harness_core::{EventSink, LoopHooks, RunControl, ToolExecutionMode};
-
 /// Shared context for one dispatch batch, passed to every tool-level call.
 pub struct DispatchCtx<'a> {
     pub turn_idx: u32,
@@ -36,6 +36,34 @@ pub struct DispatchCtx<'a> {
     pub seq: &'a AtomicU64,
     pub sink: &'a dyn EventSink,
     pub control: &'a RunControl,
+}
+
+impl<'a> DispatchCtx<'a> {
+    /// Derive a dispatch context from the turn plus the three policy seams.
+    ///
+    /// Six of the nine fields are turn state (index, identity, tools, seq,
+    /// event sink, run control) — the single source of truth — so the only
+    /// hand-supplied inputs are the run-level policy seams the caller
+    /// already holds. Assembling this struct in one place keeps the turn
+    /// and the dispatch context from drifting apart.
+    pub fn from_turn(
+        turn: &'a Turn,
+        policy: &'a dyn ToolPolicy,
+        approval_broker: &'a Option<Arc<dyn ApprovalBroker>>,
+        hooks: &'a LoopHooks,
+    ) -> Self {
+        Self {
+            turn_idx: turn.turn_idx,
+            ctx: &turn.ctx,
+            tools: &turn.tools,
+            policy,
+            approval_broker,
+            hooks,
+            seq: &turn.seq,
+            sink: turn.event_sink.as_ref(),
+            control: &turn.control,
+        }
+    }
 }
 
 /// The outcome of dispatching one tool call.
