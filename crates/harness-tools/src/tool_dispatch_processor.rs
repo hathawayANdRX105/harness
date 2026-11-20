@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_core::event::EventSink;
+
 use harness_core::message::{Message, ToolResultMessage};
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::{RunContext, RunStopReason};
@@ -23,7 +23,6 @@ pub struct ToolDispatchProcessor {
     policy: Arc<dyn ToolPolicy>,
     approval_broker: Option<Arc<dyn ApprovalBroker>>,
     hooks: LoopHooks,
-    event_sink: Arc<dyn EventSink>,
     tool_mode: ToolExecutionMode,
     transcript_sink: Option<Arc<dyn TranscriptSink>>,
 }
@@ -33,7 +32,6 @@ impl ToolDispatchProcessor {
         policy: Arc<dyn ToolPolicy>,
         approval_broker: Option<Arc<dyn ApprovalBroker>>,
         hooks: LoopHooks,
-        event_sink: Arc<dyn EventSink>,
         tool_mode: ToolExecutionMode,
         transcript_sink: Option<Arc<dyn TranscriptSink>>,
     ) -> Self {
@@ -41,7 +39,6 @@ impl ToolDispatchProcessor {
             policy,
             approval_broker,
             hooks,
-            event_sink,
             tool_mode,
             transcript_sink,
         }
@@ -64,7 +61,7 @@ impl Processor for ToolDispatchProcessor {
             approval_broker: &self.approval_broker,
             hooks: &self.hooks,
             seq: &turn.seq,
-            sink: self.event_sink.as_ref(),
+            sink: turn.event_sink.as_ref(),
             control: &turn.control,
         };
         let (result_msgs, terminal_reason) = dispatch_batch(&calls, &tcx, self.tool_mode).await;

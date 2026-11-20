@@ -128,18 +128,19 @@ impl LoopDeps {
     /// Assembly happens here, at run time, rather than at build time: the
     /// scheduler and the daemon swap `event_sink` / `transcript_sink` per
     /// run (the bus sink for a scheduler run, the session sink for a daemon
-    /// run), and chain nodes capture the sink at construction — building
-    /// the chain here means the nodes always see the sink the run will
-    /// actually use.
+    /// run), and the transcript sink is captured at construction —
+    /// building the chain here means the nodes always see the sinks the
+    /// run will actually use. Event emission reads the sink off the turn
+    /// instead, so prompt-phase nodes (assembled at build time by the
+    /// facade) route events to the run's sink too.
     pub fn response_chain(&self) -> Chain {
         Chain::new()
-            .node(Arc::new(ModelProcessor::new(Arc::clone(&self.event_sink))))
+            .node(Arc::new(ModelProcessor::new()))
             .node(Arc::new(AppendProcessor::new(self.transcript_sink.clone())))
             .node(Arc::new(ToolDispatchProcessor::new(
                 Arc::clone(&self.policy),
                 self.approval_broker.clone(),
                 self.hooks.clone(),
-                Arc::clone(&self.event_sink),
                 self.tool_mode,
                 self.transcript_sink.clone(),
             )))
@@ -256,6 +257,7 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
         control,
         ctx.clone(),
         deps.seed.clone(),
+        Arc::clone(&deps.event_sink),
     );
     // The tool manifest rides the turn — the model and dispatch nodes
     // render it.
@@ -280,9 +282,13 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
             return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq);
         }
 
+        // The turn index is set before BOTH passes: prompt-side nodes read
+        // it for event correlation too, not just the response phase.
+        turn.turn_idx = turn_idx;
+
         // Prompt-side machining: the chain's processors reshape the
-        // ledger before the model call (system ledger, instructions, budget
-        // gate). A processor that returns Done ends the run here.
+        // ledger before the model call (system ledger, instructions,
+        // compaction). A processor that returns Done ends the run here.
         if let Route::Done(reason) = deps.prompt_chain.step(&mut turn).await {
             return finish(&ctx, reason, deps.event_sink.as_ref(), &turn.seq);
         }
@@ -290,7 +296,6 @@ pub async fn run(ctx: RunContext, deps: Arc<LoopDeps>, control: RunControl) -> R
         // Response phase: the model node pumps the stream, the append node
         // gates the run (no tool calls → Completed), the dispatch node runs
         // the batch.
-        turn.turn_idx = turn_idx;
         if let Route::Done(reason) = deps.response_chain().step(&mut turn).await {
             // Error backfill: partial content and tool calls still get
             // their ledger entries, so tool-call/result pairing never
@@ -329,7 +334,7 @@ async fn backfill_partial_turn(turn: &mut Turn, deps: &LoopDeps) {
             approval_broker: &deps.approval_broker,
             hooks: &deps.hooks,
             seq: &turn.seq,
-            sink: deps.event_sink.as_ref(),
+            sink: turn.event_sink.as_ref(),
             control: &turn.control,
         };
         let (results, _terminal) = dispatch_batch(&partial_calls, &tcx, deps.tool_mode).await;

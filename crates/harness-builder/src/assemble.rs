@@ -615,13 +615,8 @@ impl HarnessBuilder {
             compactor: self.compactor.take(),
         });
         let hooks = assemble_hooks(&self.spec);
-        let prompt_chain = assemble_prompt_chain(
-            &self.spec,
-            &prompt,
-            &self.custom_processors,
-            &compaction,
-            &event_sink,
-        );
+        let prompt_chain =
+            assemble_prompt_chain(&self.spec, &prompt, &self.custom_processors, &compaction);
         let models: Vec<ModelInfo> = self.spec.models.iter().map(model_info_from_spec).collect();
 
         Ok(AssembledRuntime {
@@ -989,15 +984,18 @@ fn assemble_hooks(spec: &HarnessSpec) -> LoopHooks {
 /// everything), then the declared instruction nodes (one per
 /// `InjectInstruction` hook, each independently idempotent), the host's
 /// custom nodes from `HarnessBuilder::with_processor`, and — when a
-/// compactor is injected — the budget gate last, so compaction sees the
-/// prompt-machined ledger before the model call (the position the legacy
-/// `run()` had it).
+/// compactor is injected — the compaction node last, so compaction sees
+/// the prompt-machined ledger before the model call (the position the
+/// legacy `run()` had it).
+///
+/// The prompt chain is assembled once at build time: its nodes hold no
+/// per-run state (prompt nodes emit nothing; the compaction node emits
+/// through the turn's sink), so the shared `Chain` is safe across runs.
 fn assemble_prompt_chain(
     spec: &HarnessSpec,
     prompt: &Option<Message>,
     custom: &[Arc<dyn Processor>],
     compaction: &Option<CompactionPlan>,
-    event_sink: &Arc<dyn EventSink>,
 ) -> Chain {
     let mut chain = Chain::new();
     if let Some(prompt) = prompt {
@@ -1017,7 +1015,6 @@ fn assemble_prompt_chain(
         chain = chain.node(Arc::new(CompactProcessor::new(
             Arc::clone(compactor),
             Some(plan.budget),
-            Arc::clone(event_sink),
         )));
     }
     chain

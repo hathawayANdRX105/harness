@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_core::event::{EventSink, RunEventKind};
+use harness_core::event::RunEventKind;
 use harness_core::model::ModelRequest;
 use harness_core::run::RunStopReason;
 use harness_core::topology::{Processor, Route, Turn};
@@ -19,13 +19,19 @@ use crate::pump::{StreamTurn, pump_stream};
 /// `ModelEvent`s into the turn's artifacts. The other nodes see only the
 /// turn-boundary product (`TurnArtifacts`), never a raw event — that is the
 /// hot-loop rule: only this node touches per-token state.
-pub struct ModelProcessor {
-    event_sink: Arc<dyn EventSink>,
-}
+/// Emits through `turn.event_sink` — the run's sink, not one captured at
+/// construction (hosts swap sinks per run).
+pub struct ModelProcessor;
 
 impl ModelProcessor {
-    pub fn new(event_sink: Arc<dyn EventSink>) -> Self {
-        Self { event_sink }
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ModelProcessor {
+    fn default() -> Self {
+        Self
     }
 }
 
@@ -49,7 +55,7 @@ impl Processor for ModelProcessor {
             temperature: None,
         };
         emit_event(
-            self.event_sink.as_ref(),
+            turn.event_sink.as_ref(),
             &turn.ctx.run_id,
             &turn.ctx.session_id,
             &turn.seq,
@@ -62,7 +68,7 @@ impl Processor for ModelProcessor {
         let outcome = pump_stream(
             stream,
             &turn.seq,
-            self.event_sink.as_ref(),
+            turn.event_sink.as_ref(),
             &turn.ctx,
             &control,
         )
@@ -72,7 +78,7 @@ impl Processor for ModelProcessor {
         // Cancelled skips the event, Ok and Error both emit).
         if !matches!(outcome, StreamTurn::Cancelled) {
             emit_event(
-                self.event_sink.as_ref(),
+                turn.event_sink.as_ref(),
                 &turn.ctx.run_id,
                 &turn.ctx.session_id,
                 &turn.seq,

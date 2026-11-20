@@ -13,10 +13,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use harness_core::control::RunControl;
+use harness_core::event::{EventSink, RunEvent};
 use harness_core::message::{Content, Message, ToolCall, ToolResultMessage};
 use harness_core::model::{Model, ModelInfo, ModelRequest, ModelStream};
 use harness_core::run::{RunContext, RunId, RunLimits, SessionId, Task};
 use harness_core::topology::Turn;
+
+/// The turn contract requires a sink; this one discards — the primitives
+/// under test emit nothing.
+struct NullSink;
+
+impl EventSink for NullSink {
+    fn emit(&self, _event: RunEvent) {}
+}
 
 struct StubModel(ModelInfo);
 
@@ -68,7 +77,13 @@ fn turn_carries_seed_ledger_verbatim() {
         Message::user_text("first user turn"),
         Message::user_text("second user turn"),
     ];
-    let turn = Turn::new(model, RunControl::new(), sample_ctx(), seed);
+    let turn = Turn::new(
+        model,
+        RunControl::new(),
+        sample_ctx(),
+        seed,
+        Arc::new(NullSink),
+    );
 
     assert_eq!(turn.ledger.len(), 2, "seed messages ride the turn verbatim");
     assert!(
@@ -83,10 +98,6 @@ fn turn_carries_seed_ledger_verbatim() {
         turn.artifacts.calls.is_empty(),
         "no tool calls exist before the first model stream"
     );
-    assert!(
-        turn.artifacts.results.is_empty(),
-        "no tool results exist before the first dispatch"
-    );
 }
 
 /// Purpose: retracting a message range must never leave a tool call behind
@@ -99,7 +110,13 @@ fn turn_carries_seed_ledger_verbatim() {
 #[test]
 fn retract_never_orphans_a_tool_call() {
     let model = Arc::new(StubModel(sample_info()));
-    let mut turn = Turn::new(model, RunControl::new(), sample_ctx(), Vec::new());
+    let mut turn = Turn::new(
+        model,
+        RunControl::new(),
+        sample_ctx(),
+        Vec::new(),
+        Arc::new(NullSink),
+    );
 
     let call_a = Message::Assistant {
         content: vec![Content::ToolCall(ToolCall {

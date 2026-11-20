@@ -856,6 +856,7 @@ async fn hooks_compose_prompt_and_instruction() -> Result<(), Box<dyn std::error
         RunControl::new(),
         make_ctx(),
         Vec::new(),
+        Arc::new(TestSink::default()),
     );
     runtime.prompt_chain.step(&mut turn).await;
     let messages = turn.ledger;
@@ -1243,6 +1244,7 @@ async fn with_processor_rides_the_prompt_chain() -> Result<(), Box<dyn std::erro
         RunControl::new(),
         make_ctx(),
         Vec::new(),
+        Arc::new(TestSink::default()),
     );
     runtime.prompt_chain.step(&mut turn).await;
     let messages = turn.ledger;

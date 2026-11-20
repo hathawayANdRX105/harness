@@ -55,7 +55,6 @@ impl Chain {
     pub fn names(&self) -> Vec<&'static str> {
         self.nodes.iter().map(|node| node.name()).collect()
     }
-
     /// Run one pass of the chain over the turn: every node in registration
     /// order, stopping at the first `Done`.
     ///
@@ -63,10 +62,32 @@ impl Chain {
     /// backward jump — the name is what matters, not the direction) and
     /// machining continues from there. A name with no registered node is a
     /// chain authoring bug, and the run fails loudly instead of silently
-    /// skipping the routing node's intent.
+    /// skipping the routing node's intent. A routing *cycle* — a node that
+    /// always re-jumps — is bounded too: the pass dies with an error once
+    /// it clearly stopped making forward progress (see the hop budget in
+    /// the loop), and cancellation is re-checked every hop.
     pub async fn step(&self, turn: &mut Turn) -> Route {
         let mut next = 0usize;
+        // A `Goto` cycle (a router that always re-jumps) would spin forever
+        // inside one turn: the run's cancel token is only read at turn
+        // boundaries otherwise, so the pass bounds itself — a generous hop
+        // budget that no honest router approaches, checked every hop
+        // alongside cancellation so a hung pass still dies on cancel.
+        let max_hops = self.nodes.len().max(8) * 16;
+        let mut hops = 0usize;
         while let Some(node) = self.nodes.get(next) {
+            hops += 1;
+            if hops > max_hops {
+                return Route::Done(RunStopReason::Error {
+                    message: format!(
+                        "chain exceeded {max_hops} hops — suspected routing cycle at node `{}`",
+                        node.name()
+                    ),
+                });
+            }
+            if turn.control.is_cancelled() {
+                return Route::Done(RunStopReason::Cancelled);
+            }
             match node.process(turn).await {
                 Route::Next => next += 1,
                 Route::Goto(target) => match self.nodes.iter().position(|n| n.name() == target) {

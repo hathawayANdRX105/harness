@@ -12,11 +12,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 
 use harness_core::control::RunControl;
+use harness_core::event::{EventSink, RunEvent};
 use harness_core::message::{Content, Message};
 use harness_core::model::{Model, ModelInfo, ModelRequest, ModelStream};
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::topology::{Processor, Route, Turn};
 use harness_loop::Chain;
+
+/// The chain contract needs a sink on the turn; this one discards.
+struct NullSink;
+
+impl EventSink for NullSink {
+    fn emit(&self, _event: RunEvent) {}
+}
 
 struct StubModel(ModelInfo);
 
@@ -75,6 +83,7 @@ fn stub_turn() -> Turn {
         RunControl::new(),
         sample_ctx(),
         Vec::new(),
+        Arc::new(NullSink),
     )
 }
 
@@ -223,5 +232,43 @@ async fn goto_to_unknown_node_fails_loudly_async() {
             );
         }
         _ => panic!("an unknown Goto must fail the run"),
+    }
+}
+/// Purpose: a routing cycle — a node that `Goto`s back to itself forever —
+/// must not hang the run: the pass bounds its own hops and dies loudly.
+/// Scenario: one node that always routes to itself. The hop budget is
+/// `len.max(8) * 16`, so the single-node chain caps at 128 hops.
+/// Acceptance: the pass ends with `Route::Done(Error)` naming the cycle,
+/// not by spinning.
+#[test]
+fn goto_cycle_is_bounded() {
+    futures::executor::block_on(goto_cycle_is_bounded_async());
+}
+
+async fn goto_cycle_is_bounded_async() {
+    struct LoopRouter;
+
+    #[async_trait]
+    impl Processor for LoopRouter {
+        fn name(&self) -> &'static str {
+            "loop"
+        }
+
+        async fn process(&self, _turn: &mut Turn) -> Route {
+            Route::Goto("loop")
+        }
+    }
+
+    let chain = Chain::new().node(Arc::new(LoopRouter));
+    let mut turn = stub_turn();
+
+    match chain.step(&mut turn).await {
+        Route::Done(RunStopReason::Error { message }) => {
+            assert!(
+                message.contains("cycle") && message.contains("128"),
+                "the error names the cycle and the hop budget: {message}"
+            );
+        }
+        _ => panic!("a routing cycle must end the run with an error"),
     }
 }

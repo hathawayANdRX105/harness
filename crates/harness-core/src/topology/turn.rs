@@ -3,19 +3,25 @@
 //! One `Turn` per run carries the message ledger, the tool set, run control,
 //! run identity and the sequence counter — everything the legacy loop
 //! scattered across function parameters — so a node asks the turn for what
-//! it needs instead of holding a copy. Cross-run handles (configs, sinks,
-//! limiters) stay in the processors; per-run state stays here.
+//! it needs instead of holding a copy. Cross-run handles (configs,
+//! limiters) stay in the processors; per-run state stays here — the run's
+//! `event_sink` rides the turn too, so a node that emits always reaches the
+//! sink the *run* carries (the scheduler and the daemon swap it per run),
+//! never a stale construction-time copy.
 //!
-//! Ledger mutations go through `append_message` / `retract_messages`, the
-//! pairing-safe primitives: a tool call never survives without its result.
+//! Ledger writes keep pairing by order discipline: tool results are appended
+//! adjacent to their calls, and *removal* — the only operation that can
+//! orphan a result from its call — goes through `retract_messages`, the
+//! pairing-closing primitive.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use crate::control::RunControl;
+use crate::event::EventSink;
 use crate::message::{Content, Message, ToolCall, ToolResultMessage};
-use crate::model::{Model, Usage};
-use crate::run::{RunContext, RunStopReason};
+use crate::model::Model;
+use crate::run::RunContext;
 use crate::tool::Tool;
 
 /// One turn being machined: the single source of truth a `Processor` reads
@@ -44,6 +50,11 @@ pub struct Turn {
     /// The model this turn talks to. `ModelProcessor` is the only node that
     /// streams; the rest read `info()` for catalog data and budget math.
     pub model: Arc<dyn Model>,
+    /// The sink this run's events go to. Every emitting node reads it from
+    /// the turn — hosts swap the sink per run (the scheduler registers a
+    /// `BusSink`, the daemon its own), and a node capturing a sink at
+    /// construction would emit to a dead channel.
+    pub event_sink: Arc<dyn EventSink>,
 }
 
 impl Turn {
@@ -55,6 +66,7 @@ impl Turn {
         control: RunControl,
         ctx: RunContext,
         seed: Vec<Message>,
+        event_sink: Arc<dyn EventSink>,
     ) -> Self {
         Self {
             ledger: seed,
@@ -65,6 +77,7 @@ impl Turn {
             seq: AtomicU64::new(0),
             artifacts: TurnArtifacts::default(),
             model,
+            event_sink,
         }
     }
 
@@ -72,9 +85,9 @@ impl Turn {
     ///
     /// A tail append cannot orphan a tool result from its call — pairing
     /// only breaks when a *middle* of the ledger is edited — so the guard
-    /// is a plain push today. Keeping every ledger mutation behind this
-    /// primitive is what makes a future check (a sink mirror, a pairing
-    /// audit) enforceable at one place instead of at every writer.
+    /// is a plain push today. Writers that append (the transcript seam,
+    /// the seed processors) keep pairing by order; this primitive is the
+    /// surface tests and future audits exercise.
     pub fn append_message(&mut self, message: Message) {
         self.ledger.push(message);
     }
@@ -98,23 +111,14 @@ impl Turn {
 }
 
 /// Response-side intermediate products: what the model stream folded into,
-/// plus what the response nodes produced from it. Populated by
-/// `ModelProcessor` and the tool-side processors; read at turn boundaries,
-/// never per token.
+/// read by the append gate and the tool dispatch. Written by
+/// `ModelProcessor` only; read at turn boundaries, never per token.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnArtifacts {
     /// The assistant content blocks folded from the model stream.
     pub content: Vec<Content>,
     /// The tool calls parsed out of the stream.
     pub calls: Vec<ToolCall>,
-    /// The tool results the response nodes produced, in dispatch order.
-    pub results: Vec<ToolResultMessage>,
-    /// Token accounting, whenever the provider reports it.
-    pub usage: Usage,
-    /// The terminal route the model stream folded into: `None` on a clean
-    /// turn, `Some` when `ModelProcessor` saw a terminal event. The driver
-    /// reads it to backfill partials and finish the run.
-    pub stop: Option<RunStopReason>,
 }
 
 /// Close a message range under tool-call/tool-result pairing: the exact set

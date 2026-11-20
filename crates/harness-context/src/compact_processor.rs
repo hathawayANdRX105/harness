@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_core::event::{EventSink, RunEventKind, emit_event};
+use harness_core::event::{RunEventKind, emit_event};
 use harness_core::message::Message;
 use harness_core::model::ModelInfo;
 use harness_core::run::RunStopReason;
@@ -48,19 +48,13 @@ pub struct CompactProcessor {
     /// `[budget].max_input_tokens`. `None` leaves the strategy's own
     /// model-window estimate ungated.
     configured: Option<Budget>,
-    event_sink: Arc<dyn EventSink>,
 }
 
 impl CompactProcessor {
-    pub fn new(
-        strategy: Arc<dyn Compactor>,
-        configured: Option<Budget>,
-        event_sink: Arc<dyn EventSink>,
-    ) -> Self {
+    pub fn new(strategy: Arc<dyn Compactor>, configured: Option<Budget>) -> Self {
         Self {
             strategy,
             configured,
-            event_sink,
         }
     }
 
@@ -141,7 +135,7 @@ impl Processor for CompactProcessor {
         };
         let message = blocked.error_message();
         emit_event(
-            self.event_sink.as_ref(),
+            turn.event_sink.as_ref(),
             &turn.ctx.run_id,
             &turn.ctx.session_id,
             &turn.seq,
