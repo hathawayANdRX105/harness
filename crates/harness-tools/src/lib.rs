@@ -26,11 +26,15 @@
 pub mod args;
 pub mod builtin;
 pub mod catalog;
+pub mod dispatch;
 pub mod output;
 pub mod skills;
+pub mod tool_dispatch;
 
 pub use args::{optional_string, require_integer, require_string};
 pub use builtin::{EditTool, GlobTool, GrepTool, ReadTool, TerminalTool, WebFetchTool, WriteTool};
 pub use catalog::ToolCatalog;
+pub use dispatch::{DispatchCtx, dispatch_batch};
 pub use output::{DEFAULT_MAX_OUTPUT_CHARS, truncate_output};
 pub use skills::{SkillMeta, SkillTool, discover_skills};
+pub use tool_dispatch::{ToolDispatchProcessor, push_tool_results};

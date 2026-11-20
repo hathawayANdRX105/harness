@@ -1165,8 +1165,8 @@ fn compactor_injection_reaches_loop_deps() -> Result<(), Box<dyn std::error::Err
         "the injected compactor is recorded"
     );
     assert!(
-        runtime.loop_deps().compactor.is_some(),
-        "the compactor reaches the loop"
+        runtime.prompt_topology.names().contains(&"budget_gate"),
+        "the compactor rides the prompt topology as the budget gate"
     );
     Ok(())
 }
@@ -1190,7 +1190,10 @@ fn compactor_without_stages_is_dropped() -> Result<(), Box<dyn std::error::Error
         .build()?;
 
     assert!(runtime.compaction.is_none(), "no stages, no plan");
-    assert!(runtime.loop_deps().compactor.is_none());
+    assert!(
+        runtime.prompt_topology.is_empty(),
+        "no stages, no gate node"
+    );
     Ok(())
 }
 /// Purpose: `with_processor` is the host's extension surface — a custom node

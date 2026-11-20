@@ -8,8 +8,9 @@ use harness_core::model::ModelRequest;
 use harness_core::run::RunStopReason;
 use harness_core::topology::{Processor, Route, Turn};
 
-use crate::dispatch::emit_event;
-use crate::processors::pump::{StreamTurn, pump_stream};
+use harness_core::event::emit_event;
+
+use crate::pump::{StreamTurn, pump_stream};
 
 /// The one node that holds the model stream.
 ///

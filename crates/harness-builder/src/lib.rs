@@ -52,8 +52,8 @@ mod analyze;
 mod assemble;
 mod error;
 mod explain;
+mod processors;
 mod spec;
-
 pub use analyze::{Analysis, analyze};
 pub use assemble::{
     AssembledRuntime, CompactionPlan, ConfigBindings, HarnessBuilder, McpPool, McpServerTools,

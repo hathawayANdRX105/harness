@@ -16,6 +16,7 @@ harness-loop = { path = "../harness-loop" }
 harness-context = { path = "../harness-context" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+async-trait = "0.1"
 
 [dev-dependencies]
 async-trait = "0.1"

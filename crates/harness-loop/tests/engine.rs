@@ -39,8 +39,8 @@ use harness_core::policy::{
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
 use harness_core::topology::{Processor, Route, Topology, Turn};
-use harness_core::{RunControl, StopReason};
-use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, TranscriptSink, run};
+use harness_core::{LoopHooks, RunControl, StopReason, ToolExecutionMode, TranscriptSink};
+use harness_loop::{LoopDeps, run};
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -292,7 +292,7 @@ async fn two_turns_normal() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -302,8 +302,6 @@ async fn two_turns_normal() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -350,7 +348,7 @@ async fn model_ends_early() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -360,8 +358,6 @@ async fn model_ends_early() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -392,7 +388,7 @@ async fn cancellation_mid_loop() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -402,8 +398,6 @@ async fn cancellation_mid_loop() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -476,7 +470,7 @@ async fn tool_failure_backfill() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -486,8 +480,6 @@ async fn tool_failure_backfill() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -562,7 +554,7 @@ async fn max_turns_exceeded() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -572,8 +564,6 @@ async fn max_turns_exceeded() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -613,7 +603,7 @@ async fn steering_injection() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -623,8 +613,6 @@ async fn steering_injection() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -674,7 +662,7 @@ async fn hook_terminate_batch() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let hooks = LoopHooks {
         should_terminate_tool_batch: Some(Arc::new(|_, _| true)),
@@ -689,8 +677,6 @@ async fn hook_terminate_batch() {
         approval_broker: None,
         hooks,
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -796,8 +782,8 @@ async fn approval_denied_backfill() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(RequireApprovalPolicy);
-    let broker = Arc::new(MockBroker {
+    let policy: Arc<dyn ToolPolicy> = Arc::new(RequireApprovalPolicy);
+    let broker: Arc<dyn ApprovalBroker> = Arc::new(MockBroker {
         result: ApprovalResult::Denied {
             reason: "human said no".into(),
         },
@@ -811,8 +797,6 @@ async fn approval_denied_backfill() {
         approval_broker: Some(broker),
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -880,8 +864,8 @@ async fn approval_precancelled() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(RequireApprovalPolicy);
-    let broker = Arc::new(MockBroker {
+    let policy: Arc<dyn ToolPolicy> = Arc::new(RequireApprovalPolicy);
+    let broker: Arc<dyn ApprovalBroker> = Arc::new(MockBroker {
         result: ApprovalResult::Approved,
     });
 
@@ -893,8 +877,6 @@ async fn approval_precancelled() {
         approval_broker: Some(broker),
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -950,7 +932,7 @@ async fn approval_required_no_broker_fails_closed() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(RequireApprovalPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(RequireApprovalPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -960,8 +942,6 @@ async fn approval_required_no_broker_fails_closed() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1006,7 +986,7 @@ async fn ignores_events_after_terminal_stop() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -1016,8 +996,6 @@ async fn ignores_events_after_terminal_stop() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1070,7 +1048,7 @@ async fn model_stream_error_is_terminal() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -1080,8 +1058,6 @@ async fn model_stream_error_is_terminal() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1140,7 +1116,7 @@ async fn event_sequence_is_monotonic() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -1150,8 +1126,6 @@ async fn event_sequence_is_monotonic() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1197,7 +1171,6 @@ async fn cancel_mid_stream_ends_promptly() {
             }))
         }
     }
-
     let sink = Arc::new(TestSink::default());
     let deps = Arc::new(LoopDeps {
         model: Arc::new(ParkedStreamModel {
@@ -1209,8 +1182,6 @@ async fn cancel_mid_stream_ends_promptly() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1425,8 +1396,6 @@ async fn parallel_dispatch_executes_both_tools() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Parallel,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1589,8 +1558,6 @@ async fn hook_seams_before_after_finish_and_prepare() {
         approval_broker: None,
         hooks,
         prompt_topology: Topology::new().node(Arc::new(MarkerProcessor)),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Parallel,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1746,8 +1713,6 @@ async fn seed_reaches_model_and_new_messages_reach_sink() {
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
         tool_mode: ToolExecutionMode::Sequential,
-        budget: None,
-        compactor: None,
         seed: vec![Message::user_text("earlier question")],
         transcript_sink: Some(transcript_sink.clone() as Arc<dyn TranscriptSink>),
     });
@@ -1830,8 +1795,6 @@ async fn tool_results_are_mirrored_to_sink() {
         approval_broker: None,
         hooks: LoopHooks::default(),
         prompt_topology: Topology::default(),
-        budget: None,
-        compactor: None,
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: Some(transcript_sink.clone() as Arc<dyn TranscriptSink>),

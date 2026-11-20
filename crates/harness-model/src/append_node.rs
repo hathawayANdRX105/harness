@@ -7,7 +7,7 @@ use harness_core::message::Message;
 use harness_core::run::RunStopReason;
 use harness_core::topology::{Processor, Route, Turn};
 
-use crate::transcript::{self, TranscriptSink};
+use harness_core::transcript::{self, TranscriptSink};
 
 /// Append the model's assistant content to the ledger, then gate the run:
 /// no tool calls means the model answered the user, so the run completes.

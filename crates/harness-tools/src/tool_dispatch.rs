@@ -8,10 +8,10 @@ use harness_core::message::{Message, ToolResultMessage};
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::{RunContext, RunStopReason};
 use harness_core::topology::{Processor, Route, Turn};
+use harness_core::transcript::{self, TranscriptSink};
+use harness_core::{LoopHooks, ToolExecutionMode};
 
 use crate::dispatch::{DispatchCtx, dispatch_batch};
-use crate::hooks::{LoopHooks, ToolExecutionMode};
-use crate::transcript::{self, TranscriptSink};
 /// Drive the tool batch through the policy → approval → execute → after
 /// chain, then append the results to the ledger and run the post-batch
 /// seams (`finish_turn`, `should_terminate_tool_batch`).
@@ -108,7 +108,7 @@ impl Processor for ToolDispatchProcessor {
 
 /// Append a dispatched tool batch to the transcript, mirroring each result to
 /// the host sink in dispatch order.
-pub(crate) async fn push_tool_results(
+pub async fn push_tool_results(
     transcript: &mut Vec<Message>,
     transcript_sink: Option<&dyn TranscriptSink>,
     ctx: &RunContext,

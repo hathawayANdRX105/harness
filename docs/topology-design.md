@@ -219,32 +219,36 @@ ToolDispatchProcessor（事件顺序与旧路径逐字一致），待 per-call �
 - **per-call 状态进 artifacts**：把 ToolDispatchProcessor 拆成 Approval / ToolExec / Output 三节点的前提是 per-call 的 request、decision、execution 状态挂在 `TurnArtifacts` 上而不是闭包里；拆开后「无 tool 调用跳过执行段」才能用 `Goto` 表达。
 - **ToolExecProcessor 的并行**：`join_all` 在节点内部（`dispatch.rs:321-389` 现状），确认这部分不外泄成图分支。
 - **转向（steering）注入点**：当前在 `turn_boundary`（每轮开始）；Topology 化后应是 DAG 源节点的一部分，需确认与 `Route::Goto` 不冲突。
-- **预算门的模块归属**：已落地为独立模块 `src/budget.rs`（`harness-context`
-  的唯一消费者），driver 在两段拓扑之间调用；进一步节点化（prompt 段末的
-  ContextProcessor）仍是后续切片。
+- **预算门的位置**：已落地为 prompt 拓扑末节点（`BudgetGateProcessor`，harness-context），driver 不再夹在两段拓扑之间。
+## 8.5 分层落地：processor 归 domain crate，loop 只做组装与驱动
 
-## 8.5 模块拆分与能力依赖边界（harness-loop 内部）
+「core 定义 trait 能力，loop 是组装面，processor 实现归各自的 domain crate」——
+按这条边界落了地（而不是在 loop 里开 `processors/` 子目录聚合实现）：
 
-参照 gateway-gate（每道 gate 单文件：auth/quota/ratelimit/graylist，共享词汇在
-core，组装在 chain），`processors/` 一个处理器一个文件，共享机制各自归属：
-
-| 文件 | 职责 | 唯一依赖理由 |
+| Processor | 归属 crate | 依据（规则归拥有该域的crate） |
 |---|---|---|
-| `processors/system_ledger.rs` | 系统账本归位 | 纯 core 类型 |
-| `processors/instruction.rs` | 注入指令幂等追加 | 纯 core 类型 |
-| `processors/model.rs` | 唯一持流的模型节点 | pump 机制 |
-| `processors/pump.rs` | 流泵（ModelEvent 折叠） | `futures` / `tokio:macros` / `serde_json` 全 crate 唯一消费者 |
-| `processors/append.rs` | assistant 内容落地 + 完成门 | transcript |
-| `processors/tool_dispatch.rs` | 批量调度六步链 | dispatch / hooks |
-| `budget.rs` | 轮次边界预算门 | `harness-context` 全 crate 唯一消费者 |
-| `engine.rs` | driver：`run()` + `LoopDeps` + `response_topology()` 组装面 | — |
+| `SystemLedgerProcessor` / `InstructionProcessor` | `harness-builder` | facade 的默认 prompt 节点（纯 core 类型，随 spec 声明物化） |
+| `BudgetGateProcessor` | `harness-context` | 门是 context 管理规则，`Budget`/`Compactor` 的正本就在那；作为 prompt 拓扑的**最后一个节点**（compaction 作用在 prompt 注入后的账本上——§8「预算门位置」有了答案） |
+| `ModelProcessor` + pump（`pub(crate)` 藏实现） | `harness-model` | 模型流域；`futures`/`tokio:macros`/`serde_json` 依赖落在该 crate |
+| `AppendProcessor` | `harness-model` | 加工模型流的产物（assistant 落地 + 完成门） |
+| `ToolDispatchProcessor` + 六步链（`dispatch.rs`） | `harness-tools` | 工具执行域 |
+| — | `harness-loop` | **只有** driver：`run()`、`LoopDeps`、boundary、错误回填、`finish` |
 
-**能力依赖原则（回答「mcp/tool/model/context 怎么依赖」）**：loop 只依赖**契约**，
-不依赖**适配器**——`harness-mcp`/`harness-model`/`harness-tools` 不是 loop 的依赖。
-需要具体能力（MCP 检索、某个模型实现）的处理器由**宿主**实现并通过
-`with_processor` 注册（宿主处该能力本来就在）。`LoopDeps::response_topology()`
-是同一理由的响应侧接口：宿主自建 driver 时从默认链起点追加节点，而不是让 loop
-长出适配器依赖。Cargo.toml 里每个依赖都标注唯一消费文件。
+共享词汇上提到 core：`LoopHooks`、`TranscriptSink`、`emit_event`（原先分散在 loop 的
+`hooks.rs`/`transcript.rs`/`dispatch.rs`，四个 crate 用）。`harness-loop` 的依赖只剩
+`harness-core` + `harness-model` + `harness-tools`（响应链节点 + 回填），实现了「组装面
+不背流/运行时/序列化依赖」。
+
+**响应链在 run 时装配（不是 build 时）**：`LoopDeps::response_topology()` 在 `run()`
+内部用**当次 deps 的 sink** 组装 model→append→dispatch。理由是实测过的回归——scheduler
+的 `start_run` 会把 `event_sink` 换成 `BusSink`（`scheduler.rs`），daemon 会注入带 run id
+的 session sink；拓扑节点在构造时捕获 sink，若链在 build 时装配，模型节点的事件就会
+绕过总线（`sequence_stays_monotonic_across_the_fan_out` 测试抓住的正是这个）。
+
+**能力依赖原则（回答「mcp/tool/model/context 怎么依赖」）**：processor 归 domain crate
+就等于「用可见性藏细节」——`pump` 是 `harness-model` 的私有模块，`dispatch` 的内部
+函数是 `pub(crate)`。需要新能力（MCP 检索、某个具体模型）的 processor 由**拥有该域的
+crate 实现**，或由宿主通过 builder 的 `with_processor` 注册。
 
 ## 9. 参考项目佐证
 - **Kafka Streams**：`Processor` 是 topology 中「represents a single processing step」的节点（Confluent 文档）——词汇来源。

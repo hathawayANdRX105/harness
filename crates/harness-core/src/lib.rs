@@ -57,6 +57,7 @@
 // Crate-root re-exports: the names every host seam uses bare.
 pub use control::{RunControl, Steer};
 pub use event::{EventSink, RunEvent, RunEventKind};
+pub use hooks::{LoopHooks, ToolExecutionMode};
 pub use message::{Content, Message, Role, StopReason, ToolCall, ToolResultMessage};
 pub use model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream, Usage};
 pub use policy::{
@@ -66,12 +67,15 @@ pub use policy::{
 pub use run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 pub use tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
 pub use topology::{Processor, Route, Topology, Turn, TurnArtifacts};
+pub use transcript::TranscriptSink;
 
 pub mod control;
 pub mod event;
+pub mod hooks;
 pub mod message;
 pub mod model;
 pub mod policy;
 pub mod run;
 pub mod tool;
 pub mod topology;
+pub mod transcript;

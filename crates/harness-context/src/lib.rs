@@ -25,6 +25,7 @@
 //! `harness-mcp`, `harness-tools`, or the loop/daemon.
 
 mod budget;
+pub mod budget_gate;
 mod checkpoint;
 mod compactor;
 mod default_compactor;
@@ -32,6 +33,7 @@ mod stage;
 mod stop_reason;
 
 pub use budget::Budget;
+pub use budget_gate::BudgetGateProcessor;
 pub use checkpoint::CompactionCheckpoint;
 pub use compactor::{CompactionResult, Compactor};
 pub use default_compactor::{DEFAULT_TOKENS_PER_BYTE, DefaultCompactor};

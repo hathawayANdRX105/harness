@@ -15,29 +15,27 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use futures::future::join_all;
-use harness_core::event::{RunEvent, RunEventKind};
+use harness_core::event::{RunEventKind, emit_event};
 use harness_core::message::{ToolCall, ToolResultMessage};
 use harness_core::policy::{
     ApprovalBroker, ApprovalResult, ExecutionStatus, PolicyDecision, PolicyOutcome, PolicyStage,
     ToolExecution, ToolPolicy,
 };
-use harness_core::run::{RunContext, RunId, RunStopReason, SessionId};
+use harness_core::run::{RunContext, RunStopReason};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult};
-use harness_core::{EventSink, RunControl};
-
-use crate::hooks::{LoopHooks, ToolExecutionMode};
+use harness_core::{EventSink, LoopHooks, RunControl, ToolExecutionMode};
 
 /// Shared context for one dispatch batch, passed to every tool-level call.
-pub(crate) struct DispatchCtx<'a> {
-    pub(crate) turn_idx: u32,
-    pub(crate) ctx: &'a RunContext,
-    pub(crate) tools: &'a [Arc<dyn Tool>],
-    pub(crate) policy: &'a dyn ToolPolicy,
-    pub(crate) approval_broker: &'a Option<Arc<dyn ApprovalBroker>>,
-    pub(crate) hooks: &'a LoopHooks,
-    pub(crate) seq: &'a AtomicU64,
-    pub(crate) sink: &'a dyn EventSink,
-    pub(crate) control: &'a RunControl,
+pub struct DispatchCtx<'a> {
+    pub turn_idx: u32,
+    pub ctx: &'a RunContext,
+    pub tools: &'a [Arc<dyn Tool>],
+    pub policy: &'a dyn ToolPolicy,
+    pub approval_broker: &'a Option<Arc<dyn ApprovalBroker>>,
+    pub hooks: &'a LoopHooks,
+    pub seq: &'a AtomicU64,
+    pub sink: &'a dyn EventSink,
+    pub control: &'a RunControl,
 }
 
 /// The outcome of dispatching one tool call.
@@ -318,7 +316,7 @@ fn cancelled_result(call: &ToolCall) -> DispatchOutcome {
 ///
 /// Respects [`ToolExecutionMode`]: parallel runs all calls concurrently via
 /// `join_all`; sequential runs them one at a time so each result feeds the next.
-pub(crate) async fn dispatch_batch(
+pub async fn dispatch_batch(
     calls: &[ToolCall],
     tcx: &DispatchCtx<'_>,
     mode: ToolExecutionMode,
@@ -386,30 +384,4 @@ pub(crate) async fn dispatch_batch(
             (results, terminal)
         }
     }
-}
-
-/// Emit one `RunEvent` through the sink, assigning the next sequence number.
-///
-/// Uses `AtomicU64` so concurrent dispatch (parallel mode) can safely share
-/// the counter.
-#[inline]
-pub(crate) fn emit_event(
-    sink: &dyn EventSink,
-    run_id: &RunId,
-    session_id: &SessionId,
-    seq: &AtomicU64,
-    kind: RunEventKind,
-) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    let event = RunEvent {
-        run_id: run_id.clone(),
-        session_id: session_id.clone(),
-        seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        timestamp_ms: now_ms,
-        kind,
-    };
-    sink.emit(event);
 }

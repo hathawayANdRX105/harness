@@ -1,11 +1,10 @@
 //! The turn dataflow: `Processor` nodes machine a `Turn` along a `Topology`.
 //!
-//! Slice 1 (branch `arch/pipeline-dataflow`): vocabulary only. These types
-//! are the contract the next slices implement against; nothing here is
-//! wired into the loop yet, and `Topology::drive` plus the ledger-guard
-//! primitives are `todo!()` placeholders until their slices land. Shipping
-//! the shell first lets slices 2–5 add processors without touching `run()`'s
-//! legacy path.
+//! The vocabulary every run-side crate builds on: the turn is the single
+//! source of truth, a topology is the machining order, a processor is one
+//! step. `harness-loop` drives it; the concrete nodes live in the domain
+//! crates (`harness-model`, `harness-tools`, `harness-context`) and the
+//! facade (`harness-builder`).
 //!
 //! Design: see `docs/topology-design.md`. Kafka Streams contributes the
 //! vocabulary; LLVM contributes the load-bearing invariant — the data is
@@ -34,8 +33,7 @@ use crate::tool::Tool;
 pub struct Turn {
     /// The message ledger. Processors append and prune it; the model request
     /// is rendered from it. Mutations go through `append_message` /
-    /// `retract_messages` once the guard lands, so tool-call/result pairing
-    /// never breaks.
+    /// `retract_messages`, so tool-call/result pairing never breaks.
     pub ledger: Vec<Message>,
     /// The tool set injected into this turn: a prompt-side processor writes
     /// it, `ModelProcessor` renders it into the request.
@@ -80,18 +78,32 @@ impl Turn {
         }
     }
 
-    /// Append one message without orphaning a tool result from its call.
+    /// Append one message at the ledger tail.
     ///
-    /// Slice 5 placeholder: the final guard rejects an append that would
-    /// break tool-call/tool-result pairing and mirrors the message to the
-    /// transcript sink when one is wired in.
-    pub fn append_message(&mut self, _message: Message) {
-        todo!("slice 5: pairing-aware append")
+    /// A tail append cannot orphan a tool result from its call — pairing
+    /// only breaks when a *middle* of the ledger is edited — so the guard
+    /// is a plain push today. Keeping every ledger mutation behind this
+    /// primitive is what makes a future check (a sink mirror, a pairing
+    /// audit) enforceable at one place instead of at every writer.
+    pub fn append_message(&mut self, message: Message) {
+        self.ledger.push(message);
     }
 
     /// Drop a message range without orphaning a tool result from its call.
-    pub fn retract_messages(&mut self, _range: std::ops::Range<usize>) {
-        todo!("slice 5: pairing-aware retract")
+    ///
+    /// The compactor's pairing invariant (`harness-context::Compactor`):
+    /// a retained assistant message containing a `Content::ToolCall` must
+    /// keep its matching `Message::ToolResult`. So the requested range is
+    /// closed under pairing first — any pair straddling an edge is pulled
+    /// in wholesale — and only then removed. A range that starts on a
+    /// result whose call sits outside still drops both: keeping the call
+    /// without its result is the exact orphan the guard exists to refuse.
+    pub fn retract_messages(&mut self, range: std::ops::Range<usize>) {
+        let drop_set = pairing_closure(&self.ledger, range);
+        // Remove in reverse so earlier indices stay valid.
+        for index in drop_set.into_iter().rev() {
+            self.ledger.remove(index);
+        }
     }
 }
 
@@ -148,13 +160,12 @@ pub enum Route {
     Done(RunStopReason),
 }
 
-/// The per-turn machining order: a DAG of `Processor` nodes.
+/// The per-turn machining order: a chain of `Processor` nodes.
 ///
-/// Slice 2: `step` runs the registered nodes in order (the edge machinery —
-/// `Route::Goto` — lands with the response-side slice). The
-/// DAG-plus-outer-loop split is documented in `docs/topology-design.md`
-/// §4 — Kafka topologies are acyclic, so the run-level cycle belongs to
-/// `drive`, not to the graph.
+/// The run-level cycle — turn boundary, prompt pass, response pass, repeat
+/// — lives in the driver (`harness_loop::run`), not here: machining an
+/// agent turn is a one-directional pass, and the outer loop is what makes
+/// it cyclic (see `docs/topology-design.md` §4).
 pub struct Topology {
     nodes: Vec<Arc<dyn Processor>>,
 }
@@ -187,35 +198,38 @@ impl Topology {
         self.nodes.is_empty()
     }
 
+    /// Registered node names, in machining order — `Goto` targets resolve
+    /// against this, and hosts surface it in debug output.
+    #[must_use]
+    pub fn names(&self) -> Vec<&'static str> {
+        self.nodes.iter().map(|node| node.name()).collect()
+    }
+
     /// Run one pass of the DAG over the turn: every node in registration
     /// order, stopping at the first `Done`.
     ///
-    /// `Goto` (named-node routing) lands with the response-side slice
-    /// (slice 5); a node that returns it today hits the documented
-    /// placeholder, because the only topologies built so far are
-    /// prompt-side and never route.
+    /// `Goto(name)` jumps to the next node with that name (a forward or
+    /// backward jump — the name is what matters, not the direction) and
+    /// machining continues from there. A name with no registered node is a
+    /// topology authoring bug, and the run fails loudly instead of
+    /// silently skipping the routing node's intent.
     pub async fn step(&self, turn: &mut Turn) -> Route {
-        let mut route = Route::Next;
-        for node in &self.nodes {
-            route = node.process(turn).await;
-            match &route {
-                Route::Next => {}
-                Route::Goto(_) => todo!("slice 5: named-node routing"),
-                Route::Done(_) => return route,
+        let mut next = 0usize;
+        while let Some(node) = self.nodes.get(next) {
+            match node.process(turn).await {
+                Route::Next => next += 1,
+                Route::Goto(target) => match self.nodes.iter().position(|n| n.name() == target) {
+                    Some(index) => next = index,
+                    None => {
+                        return Route::Done(RunStopReason::Error {
+                            message: format!("topology references unknown node `{target}`"),
+                        });
+                    }
+                },
+                Route::Done(reason) => return Route::Done(reason),
             }
         }
-        route
-    }
-
-    /// Drive the run through the topology until the loop stops, returning
-    /// the run-level stop reason. The outer re-entry: each call runs one
-    /// `step` pass, and the driver decides from the route whether the turn
-    /// produced another round.
-    ///
-    /// Slice 4 placeholder: folds the per-turn outcome into the run-level
-    /// loop decision (continue to the next turn or stop).
-    pub async fn drive(&self, _turn: &mut Turn) -> RunStopReason {
-        todo!("slice 4: run-level loop over step passes")
+        Route::Next
     }
 }
 
@@ -226,6 +240,59 @@ impl std::fmt::Debug for Topology {
     }
 }
 
+/// Close a message range under tool-call/tool-result pairing: the exact set
+/// of indices to remove so no straddling pair is cut.
+///
+/// Pairs are matched by tool-call id: an assistant message carrying
+/// `Content::ToolCall(id)` and the `Message::ToolResult` whose
+/// `tool_call_id` is that id. When exactly one side of a pair is inside the
+/// requested range, the other side joins the removal — the invariant is
+/// "both or neither", never "call without result".
+fn pairing_closure(ledger: &[Message], range: std::ops::Range<usize>) -> Vec<usize> {
+    use std::collections::HashSet;
+
+    // Map each tool-call id to (call index, result index), when both exist.
+    let mut calls: Vec<(String, usize)> = Vec::new();
+    let mut results: Vec<(String, usize)> = Vec::new();
+    for (index, message) in ledger.iter().enumerate() {
+        match message {
+            Message::Assistant { content } => {
+                for block in content {
+                    if let Content::ToolCall(ToolCall { id, .. }) = block {
+                        calls.push((id.clone(), index));
+                    }
+                }
+            }
+            Message::ToolResult(ToolResultMessage { tool_call_id, .. }) => {
+                results.push((tool_call_id.clone(), index));
+            }
+            _ => {}
+        }
+    }
+
+    let mut drop_set: HashSet<usize> = range.collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (id, call_index) in &calls {
+            let Some(result_index) = results.iter().find(|(rid, _)| rid == id).map(|(_, i)| *i)
+            else {
+                continue;
+            };
+            let call_in = drop_set.contains(call_index);
+            let result_in = drop_set.contains(&result_index);
+            if call_in != result_in {
+                drop_set.insert(*call_index);
+                drop_set.insert(result_index);
+                changed = true;
+            }
+        }
+    }
+
+    let mut indices: Vec<usize> = drop_set.into_iter().collect();
+    indices.sort_unstable();
+    indices
+}
 impl Clone for Topology {
     fn clone(&self) -> Self {
         // Nodes are `Arc`-shared: cloning a topology shares the processors

@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use harness_core::TranscriptSink;
 use harness_core::message::Message;
 use harness_core::run::{RunId, SessionId};
-use harness_loop::TranscriptSink;
 use harness_session::SessionStore;
 
 /// [`TranscriptSink`] that appends to the session's message ledger, tagging

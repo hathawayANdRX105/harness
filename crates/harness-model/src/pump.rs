@@ -13,7 +13,7 @@ use harness_core::message::{Content, ToolCall};
 use harness_core::model::{ModelEvent, ModelStream};
 use harness_core::run::RunContext;
 
-use crate::dispatch::emit_event;
+use harness_core::event::emit_event;
 
 /// The outcome of pumping one model stream.
 pub(crate) enum StreamTurn {

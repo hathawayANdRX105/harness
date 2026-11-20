@@ -1,12 +1,10 @@
-//! Pi-style config callbacks for the agent loop.
+//! Pi-style config callbacks for the agent loop's tool dispatch.
 //!
 //! Design provenance: pi's `AgentHooks` (`packages/agent/src/agent-loop.ts:44-68`)
 //! contributes the callback shape -- `finishTurn` observes the completed turn,
 //! `shouldTerminateToolBatch` short-circuits after a tool batch. All hooks
 //! are plain `Arc<dyn Fn>` pointers (no Hook/Guide/Sensor trait system --
-//! core v2 deliberately avoids that abstraction). The prompt-side
-//! `prepareRequest` seam moved to `processors.rs`: prompt machining is a
-//! `Topology` of `Processor` nodes now, not a closure pair.
+//! core deliberately avoids that abstraction).
 //!
 //! Every field is optional; unset hooks are no-ops. The callbacks are `Fn` (not
 //! `FnMut`) so a single [`LoopHooks`] can be shared across many runs without
@@ -14,18 +12,17 @@
 
 use std::sync::Arc;
 
-use harness_core::message::{Message, ToolCall, ToolResultMessage};
-use harness_core::tool::ToolRequest;
+use crate::message::{Message, ToolCall, ToolResultMessage};
+use crate::tool::ToolRequest;
 
 /// Type alias for the `finish_turn` hook.
-pub(crate) type FinishTurnHook = Arc<dyn Fn(u32, &[Message]) + Send + Sync>;
+pub type FinishTurnHook = Arc<dyn Fn(u32, &[Message]) + Send + Sync>;
 /// Type alias for the `before_tool_call` hook.
-pub(crate) type BeforeToolCallHook = Arc<dyn Fn(&ToolRequest) -> Result<(), String> + Send + Sync>;
+pub type BeforeToolCallHook = Arc<dyn Fn(&ToolRequest) -> Result<(), String> + Send + Sync>;
 /// Type alias for the `after_tool_call` hook.
-pub(crate) type AfterToolCallHook = Arc<dyn Fn(&ToolRequest, &ToolResultMessage) + Send + Sync>;
+pub type AfterToolCallHook = Arc<dyn Fn(&ToolRequest, &ToolResultMessage) + Send + Sync>;
 /// Type alias for the `should_terminate_tool_batch` hook.
-pub(crate) type ShouldTerminateHook =
-    Arc<dyn Fn(&[ToolCall], &[ToolResultMessage]) -> bool + Send + Sync>;
+pub type ShouldTerminateHook = Arc<dyn Fn(&[ToolCall], &[ToolResultMessage]) -> bool + Send + Sync>;
 
 /// How tools are dispatched within one turn.
 ///

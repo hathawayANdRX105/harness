@@ -38,7 +38,8 @@ use harness_core::policy::ToolPolicy;
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolResult, ToolRisk, ToolSchema};
 use harness_core::topology::Topology;
-use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, run as run_child};
+use harness_core::{LoopHooks, ToolExecutionMode};
+use harness_loop::{LoopDeps, run as run_child};
 
 /// Default tool subset for a profile with no `tools` listed: read-only, so
 /// a subagent can observe its environment without necessarily changing it.
@@ -274,15 +275,12 @@ impl Tool for SubagentTool {
         let deps = LoopDeps {
             model: Arc::clone(&self.shared.model),
             tools: child_tools,
-
             event_sink: child_sink_dyn,
             policy: Arc::clone(&self.shared.policy),
             approval_broker: None,
             hooks: LoopHooks::default(),
             tool_mode: ToolExecutionMode::Sequential,
             prompt_topology: Topology::default(),
-            budget: None,
-            compactor: None,
             seed: Vec::new(),
             transcript_sink: None,
         };
