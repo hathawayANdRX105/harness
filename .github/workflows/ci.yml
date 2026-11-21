@@ -48,7 +48,11 @@ jobs:
         # provides it — the same component set rust-specs' own CI installs.
         with:
           toolchain: nightly-2026-08-20
-          components: rustfmt, clippy, rustc-dev, rust-src, llvm-tools-preview
+          # rustc-codegen-cranelift-preview: the workspace .cargo/config.toml
+          # selects codegen-backend=cranelift for profile.dev; without the
+          # component rustc fails with "failed to find a codegen-backends
+          # folder" when the dylint gate checks the consumer workspace.
+          components: rustfmt, clippy, rustc-dev, rust-src, llvm-tools-preview, rustc-codegen-cranelift-preview
       - name: Install cargo-dylint + dylint-link
         run: cargo +nightly-2026-08-20 install cargo-dylint dylint-link --locked
       # 规则库经 [workspace.metadata.dylint] 接入（root Cargo.toml，tag 固定
