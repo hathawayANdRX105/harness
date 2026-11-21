@@ -36,68 +36,16 @@ if ! cargo "+$NIGHTLY" dylint --version >/dev/null 2>&1; then
     exit 0
 fi
 
-TC_TRIPLE=$(rustup run "$NIGHTLY" rustc -vV 2>/dev/null | awk '/^host/ {print $2}')
-if [ -z "$TC_TRIPLE" ]; then
-    echo "spec-check: 无法解析 host triple，门 skip"
-    exit 0
-fi
-LIB_DIR="${DYLINT_LIB_DIR:-$REPO/target/dylint/libraries/$NIGHTLY-$TC_TRIPLE/release}"
-SUFFIX="@$NIGHTLY-$TC_TRIPLE.so"
-
-# ── build：从 rust-specs 构建预编译库 ────────────────────────────────────────
-if [ "${1:-}" = "build" ]; then
-    RS="${RUST_SPECS_DIR:-}"
-    [ -d "$RS" ] || RS="$HOME/projects/rust-specs"
-    if [ ! -d "$RS" ]; then
-        echo "spec-check: rust-specs 未找到（设 RUST_SPECS_DIR 或 clone 到 $HOME/projects/rust-specs）"
-        exit 1
-    fi
-    echo "==> 在 $RS 构建预编译 lints（$NIGHTLY）..."
-    # shellcheck disable=SC2164
-    (cd "$RS" && cargo "+$NIGHTLY" build --release -q) || { echo "✗ rust-specs build 失败"; exit 1; }
-    mkdir -p "$LIB_DIR"
-    # 遍历 lints/*/Cargo.toml 的 package name → lib<name_with_underscores>.so，
-    # 拷贝并改名为 dylint 加载所需的 lib<name>@<toolchain>.so 形式。
-    count=0
-    for m in "$RS"/lints/*/Cargo.toml; do
-        name=$(awk '/^name *=/ { gsub(/[" ]/, "", $0); split($0, a, "="); print a[2]; exit }' "$m" 2>/dev/null)
-        [ -n "$name" ] || continue
-        us=$(printf '%s' "$name" | tr '-' '_')
-        src="$RS/target/release/lib${us}.so"
-        if [ -f "$src" ]; then
-            cp "$src" "$LIB_DIR/lib${us}${SUFFIX}"
-            count=$((count + 1))
-        fi
-    done
-    echo "✓ 已放置 $count 个预编译 lint 库到 $LIB_DIR"
-    exit 0
-fi
-
-# ── 默认：加载预编译库逐个跑 ─────────────────────────────────────────────────
-if [ ! -d "$LIB_DIR" ] || ! ls "$LIB_DIR"/lib*"$SUFFIX" >/dev/null 2>&1; then
-    echo "spec-check: 预编译库未就绪（just spec-check build），门 skip —— 桌面/CI 补跑"
-    exit 0
-fi
-
-names=()
-for lib in "$LIB_DIR"/lib*"$SUFFIX"; do
-    base=$(basename "$lib")
-    n="${base#lib}"
-    n="${n%"$SUFFIX"}"
-    names+=("$n")
-done
-echo "==> dylint: ${#names[@]} 个 lint 库（$LIB_DIR）"
-
+# ── 本地跑：metadata entry 加载，系统 cargo 规避 fork 重定向 ────────────────
+# 本机默认 cargo 是 huacnlee fork（~/.local/bin/cargo），会把 target 目录
+# 重定向到 dylint 查找路径之外。PATH=/usr/bin 前缀强制用系统标准 cargo 跑，
+# 与 CI 同一入口（cargo dylint --all，规则库从 root Cargo.toml 的
+# [workspace.metadata.dylint] tag 拉取）。
 rc=0
-for n in "${names[@]}"; do
-    echo "--- lint: $n ---"
-    if ! DYLINT_LIBRARY_PATH="$LIB_DIR" cargo "+$NIGHTLY" dylint --manifest-path Cargo.toml --lib "$n" -q; then
-        rc=1
-    fi
-done
-if [ "$rc" -eq 0 ]; then
+if PATH="/usr/bin:$PATH" cargo "+$NIGHTLY" dylint --all --workspace; then
     echo "✓ spec-check 通过"
 else
-    echo "✗ spec-check 有 findings（见 .agent/rules/testing-ci.md「gate findings are work items」）"
+    echo "✗ spec-check 有 findings（fix 或在 PR 里说明）"
+    rc=1
 fi
 exit "$rc"
