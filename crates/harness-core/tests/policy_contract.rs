@@ -25,7 +25,7 @@ fn sample_request(name: &str) -> ToolRequest {
         args: serde_json::json!({}),
         run_id: RunId("r-1".into()),
         session_id: SessionId("s-1".into()),
-        turn: 0,
+        turn_idx: 0,
     }
 }
 
@@ -237,12 +237,12 @@ fn tool_request_round_trips_with_run_correlation() -> serde_json::Result<()> {
         args: serde_json::json!({"path": "src/lib.rs"}),
         run_id: RunId("r-9".into()),
         session_id: SessionId("s-2".into()),
-        turn: 3,
+        turn_idx: 3,
     };
     let wire = serde_json::to_value(&req)?;
     assert_eq!(wire["run_id"], "r-9");
     assert_eq!(wire["session_id"], "s-2");
-    assert_eq!(wire["turn"], 3);
+    assert_eq!(wire["turn_idx"], 3);
     let back: ToolRequest = serde_json::from_value(wire)?;
     assert_eq!(back, req);
     Ok(())

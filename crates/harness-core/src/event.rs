@@ -64,9 +64,9 @@ pub enum RunEventKind {
     /// before the next model call (nanoharness's `STEERING_APPLIED`).
     SteeringApplied { message: String },
     /// One model round-trip begins.
-    TurnStarted { turn: u32 },
+    TurnStarted { turn_idx: u32 },
     /// One model round-trip ended (stop reason at the model level).
-    TurnFinished { turn: u32 },
+    TurnFinished { turn_idx: u32 },
     /// Streaming assistant text fragment (pi's anchoring of provider deltas
     /// onto run-level events).
     TextDelta { text: String },
@@ -144,4 +144,32 @@ pub enum SubagentStatus {
 /// queue, not by being an `EventSink`.
 pub trait EventSink: Send + Sync + 'static {
     fn emit(&self, event: RunEvent);
+}
+
+/// Emit one event through the sink, stamping it with the next sequence
+/// number and the current wall clock.
+///
+/// The shared emitter every run-side crate (model stream node, tool
+/// dispatch, budget gate, driver) funnels through, so `seq` stays
+/// monotonic per run regardless of which phase produced the event.
+#[inline]
+pub fn emit_event(
+    sink: &dyn EventSink,
+    run_id: &RunId,
+    session_id: &SessionId,
+    seq: &std::sync::atomic::AtomicU64,
+    kind: RunEventKind,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let event = RunEvent {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        seq: seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        timestamp_ms: now_ms,
+        kind,
+    };
+    sink.emit(event);
 }

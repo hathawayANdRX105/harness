@@ -58,6 +58,17 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
+impl Content {
+    /// The storage/replay classification of this block: text and reasoning
+    /// are assistant output, a tool call is its own unit kind.
+    pub fn kind(&self) -> MessageKind {
+        match self {
+            Content::Text(_) | Content::Reasoning(_) => MessageKind::Assistant,
+            Content::ToolCall(_) => MessageKind::ToolCall,
+        }
+    }
+}
+
 /// One message in the transcript. The transcript is the source of truth for
 /// everything downstream: model requests, compaction, session persistence
 /// and event replay.
@@ -102,6 +113,20 @@ impl Message {
             Message::ToolResult(_) => Role::Assistant,
         }
     }
+
+    /// The storage/replay classification of this message. `User` messages
+    /// classify as [`MessageKind::Prompt`]; a steering injection is a
+    /// store-side provenance override onto that kind, not a message
+    /// variant. Assistant messages with mixed blocks still split per
+    /// block at storage time — see [`Content::kind`].
+    pub fn kind(&self) -> MessageKind {
+        match self {
+            Message::System { .. } => MessageKind::System,
+            Message::User { .. } => MessageKind::Prompt,
+            Message::Assistant { .. } => MessageKind::Assistant,
+            Message::ToolResult(_) => MessageKind::ToolResult,
+        }
+    }
 }
 
 /// The answer to one tool call, as its own message kind.
@@ -115,6 +140,58 @@ pub struct ToolResultMessage {
     /// True when the tool failed — the value-shaped failure contract.
     #[serde(default)]
     pub is_error: bool,
+}
+
+/// How a message is classified for storage, replay and provenance.
+///
+/// One taxonomy for the whole workspace: the session store splits ledger
+/// messages into *units* labeled by this kind, so the classification lives
+/// next to [`Message`] instead of being re-derived downstream. `Steering`
+/// is the one kind that is not a pure projection — it marks a `User`
+/// message injected mid-run (a store-side provenance override), so the
+/// store applies it rather than deriving it from the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// A user prompt.
+    Prompt,
+    /// A steering message replayed as a user turn.
+    Steering,
+    /// An assistant text or reasoning block.
+    Assistant,
+    /// An assistant tool-call block.
+    ToolCall,
+    /// A tool result message.
+    ToolResult,
+    /// A prompt-ledger section delta.
+    System,
+}
+
+impl MessageKind {
+    /// The stable wire/database string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Steering => "steering",
+            Self::Assistant => "assistant",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::System => "system",
+        }
+    }
+
+    /// Parse the wire/database string.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "prompt" => Ok(Self::Prompt),
+            "steering" => Ok(Self::Steering),
+            "assistant" => Ok(Self::Assistant),
+            "tool_call" => Ok(Self::ToolCall),
+            "tool_result" => Ok(Self::ToolResult),
+            "system" => Ok(Self::System),
+            other => Err(format!("unknown message kind {other:?}")),
+        }
+    }
 }
 
 /// Message-level reason a model turn stopped. Caller-level cancellation is

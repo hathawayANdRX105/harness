@@ -1171,6 +1171,8 @@ dependencies = [
  "futures",
  "harness-context",
  "harness-core",
+ "harness-model",
+ "harness-tools",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -1257,6 +1259,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "futures",
  "glob",
  "harness-core",
  "regex",

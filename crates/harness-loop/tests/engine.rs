@@ -38,8 +38,10 @@ use harness_core::policy::{
 };
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
 use harness_core::tool::{Tool, ToolError, ToolRequest, ToolResult, ToolRisk, ToolSchema};
-use harness_core::{RunControl, StopReason};
-use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, TranscriptSink, run};
+use harness_core::topology::{Processor, Route, Turn};
+use harness_core::{LoopHooks, RunControl, StopReason, ToolExecutionMode, TranscriptSink};
+use harness_loop::Chain;
+use harness_loop::{LoopDeps, run};
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -291,7 +293,7 @@ async fn two_turns_normal() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -300,8 +302,7 @@ async fn two_turns_normal() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -348,7 +349,7 @@ async fn model_ends_early() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -357,8 +358,7 @@ async fn model_ends_early() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -389,7 +389,7 @@ async fn cancellation_mid_loop() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -398,8 +398,7 @@ async fn cancellation_mid_loop() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -472,7 +471,7 @@ async fn tool_failure_backfill() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -481,8 +480,7 @@ async fn tool_failure_backfill() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -557,7 +555,7 @@ async fn max_turns_exceeded() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -566,8 +564,7 @@ async fn max_turns_exceeded() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -607,7 +604,7 @@ async fn steering_injection() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -616,8 +613,7 @@ async fn steering_injection() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -667,7 +663,7 @@ async fn hook_terminate_batch() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let hooks = LoopHooks {
         should_terminate_tool_batch: Some(Arc::new(|_, _| true)),
@@ -681,8 +677,7 @@ async fn hook_terminate_batch() {
         policy,
         approval_broker: None,
         hooks,
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -788,8 +783,8 @@ async fn approval_denied_backfill() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(RequireApprovalPolicy);
-    let broker = Arc::new(MockBroker {
+    let policy: Arc<dyn ToolPolicy> = Arc::new(RequireApprovalPolicy);
+    let broker: Arc<dyn ApprovalBroker> = Arc::new(MockBroker {
         result: ApprovalResult::Denied {
             reason: "human said no".into(),
         },
@@ -802,8 +797,7 @@ async fn approval_denied_backfill() {
         policy,
         approval_broker: Some(broker),
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -871,8 +865,8 @@ async fn approval_precancelled() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(RequireApprovalPolicy);
-    let broker = Arc::new(MockBroker {
+    let policy: Arc<dyn ToolPolicy> = Arc::new(RequireApprovalPolicy);
+    let broker: Arc<dyn ApprovalBroker> = Arc::new(MockBroker {
         result: ApprovalResult::Approved,
     });
 
@@ -883,8 +877,7 @@ async fn approval_precancelled() {
         policy,
         approval_broker: Some(broker),
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -940,7 +933,7 @@ async fn approval_required_no_broker_fails_closed() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(RequireApprovalPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(RequireApprovalPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -949,8 +942,7 @@ async fn approval_required_no_broker_fails_closed() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -995,7 +987,7 @@ async fn ignores_events_after_terminal_stop() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -1004,8 +996,7 @@ async fn ignores_events_after_terminal_stop() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1058,7 +1049,7 @@ async fn model_stream_error_is_terminal() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -1067,8 +1058,7 @@ async fn model_stream_error_is_terminal() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1127,7 +1117,7 @@ async fn event_sequence_is_monotonic() {
     ));
 
     let sink = Arc::new(TestSink::default());
-    let policy = Arc::new(AllowAllPolicy);
+    let policy: Arc<dyn ToolPolicy> = Arc::new(AllowAllPolicy);
 
     let deps = Arc::new(LoopDeps {
         model,
@@ -1136,8 +1126,7 @@ async fn event_sequence_is_monotonic() {
         policy,
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1183,7 +1172,6 @@ async fn cancel_mid_stream_ends_promptly() {
             }))
         }
     }
-
     let sink = Arc::new(TestSink::default());
     let deps = Arc::new(LoopDeps {
         model: Arc::new(ParkedStreamModel {
@@ -1194,8 +1182,7 @@ async fn cancel_mid_stream_ends_promptly() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1335,10 +1322,10 @@ fn record_hook_entry(log: &Arc<Mutex<Vec<String>>>, entry: String) {
 }
 
 /// Records the turn index `finish_turn` ran for.
-fn record_turn_index(log: &Arc<Mutex<Vec<u32>>>, turn: u32) {
+fn record_turn_index(log: &Arc<Mutex<Vec<u32>>>, turn_idx: u32) {
     log.lock()
         .unwrap_or_else(|e| panic!("hook log lock poisoned: {e}"))
-        .push(turn);
+        .push(turn_idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,8 +1396,7 @@ async fn parallel_dispatch_executes_both_tools() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Parallel,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1479,15 +1465,15 @@ async fn parallel_dispatch_executes_both_tools() {
     assert_eq!(seqs.len(), 2, "per-call seq values must be unique");
 }
 
-/// Hook seams: `prepare_request` reshapes the transcript; `before_tool_call`
-/// and `after_tool_call` fire per call; `finish_turn` fires once per tool
-/// turn.
+/// Hook seams: the prompt topology's marker processor reshapes the ledger;
+/// `before_tool_call` and `after_tool_call` fire per call; `finish_turn`
+/// fires once per tool turn.
 ///
 /// Scenario:
 /// 1. Turn 0: the model requests `tool_a` and `tool_b` in one turn, then
 ///    `Stop(ToolUse)`.
 /// 2. Turn 1: the model answers with `Stop(EndTurn)`.
-/// Hooks: `prepare_request` appends a marker user message to the transcript;
+/// Prompt side: `MarkerProcessor` appends a marker user message per turn;
 /// `before_tool_call` / `after_tool_call` record `"before:<name>"` /
 /// `"after:<name>"`; `finish_turn` records the turn index.
 ///
@@ -1543,7 +1529,6 @@ async fn hook_seams_before_after_finish_and_prepare() {
     let (capturing, captured) = CapturingModel::wrap(model);
 
     let hooks = LoopHooks {
-        prepare_request: Some(Arc::new(append_prepare_marker)),
         before_tool_call: Some(Arc::new({
             let log = before_after.clone();
             move |req: &ToolRequest| {
@@ -1559,8 +1544,8 @@ async fn hook_seams_before_after_finish_and_prepare() {
         })),
         finish_turn: Some(Arc::new({
             let log = finish_turns.clone();
-            move |turn: u32, _transcript: &[Message]| {
-                record_turn_index(&log, turn);
+            move |turn_idx: u32, _transcript: &[Message]| {
+                record_turn_index(&log, turn_idx);
             }
         })),
         ..LoopHooks::default()
@@ -1573,8 +1558,7 @@ async fn hook_seams_before_after_finish_and_prepare() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks,
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::new().node(Arc::new(MarkerProcessor)),
         tool_mode: ToolExecutionMode::Parallel,
         seed: Vec::new(),
         transcript_sink: None,
@@ -1689,10 +1673,19 @@ async fn hook_seams_before_after_finish_and_prepare() {
     }
 }
 
-/// `prepare_request` hook: appends a marker user message to the transcript.
-fn append_prepare_marker(mut transcript: Vec<Message>) -> Vec<Message> {
-    transcript.push(Message::user_text("prepared by hook"));
-    transcript
+/// Prompt-side processor: appends a marker user message to the turn.
+struct MarkerProcessor;
+
+#[async_trait::async_trait]
+impl Processor for MarkerProcessor {
+    fn name(&self) -> &'static str {
+        "marker"
+    }
+
+    async fn process(&self, turn: &mut Turn) -> Route {
+        turn.ledger.push(Message::user_text("prepared by hook"));
+        Route::Next
+    }
 }
 
 /// Purpose: a seeded transcript reaches the model and the run's own messages
@@ -1719,9 +1712,8 @@ async fn seed_reaches_model_and_new_messages_reach_sink() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
-        budget: None,
-        compactor: None,
         seed: vec![Message::user_text("earlier question")],
         transcript_sink: Some(transcript_sink.clone() as Arc<dyn TranscriptSink>),
     });
@@ -1803,8 +1795,7 @@ async fn tool_results_are_mirrored_to_sink() {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
-        budget: None,
-        compactor: None,
+        prompt_chain: Chain::default(),
         tool_mode: ToolExecutionMode::Sequential,
         seed: Vec::new(),
         transcript_sink: Some(transcript_sink.clone() as Arc<dyn TranscriptSink>),

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::iter as stream_iter;
-use harness_builder::{HarnessBuilder, HarnessSpec, ModelSpec};
+use harness_builder::{HarnessBuilder, HarnessProfile, ModelEntry};
 use harness_core::event::{EventSink, RunEvent};
 use harness_core::message::{Content, Message, StopReason};
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream};
@@ -168,9 +168,9 @@ async fn second_run_replays_first_run_history() {
     );
 
     let model = Arc::new(RecordingModel::new(&["OK-BANANA", "BANANA"]));
-    let mut spec = HarnessSpec::new("session-history-test");
+    let mut spec = HarnessProfile::new("session-history-test");
     spec.default_model = Some("fake".into());
-    spec.models = vec![ModelSpec {
+    spec.models = vec![ModelEntry {
         handle: "fake".into(),
         provider: "fake".into(),
         model: "fake-1".into(),

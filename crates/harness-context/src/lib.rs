@@ -26,6 +26,7 @@
 
 mod budget;
 mod checkpoint;
+pub mod compact_processor;
 mod compactor;
 mod default_compactor;
 mod stage;
@@ -33,6 +34,7 @@ mod stop_reason;
 
 pub use budget::Budget;
 pub use checkpoint::CompactionCheckpoint;
+pub use compact_processor::CompactProcessor;
 pub use compactor::{CompactionResult, Compactor};
 pub use default_compactor::{DEFAULT_TOKENS_PER_BYTE, DefaultCompactor};
 pub use stage::{CompactionStage, default_stages};

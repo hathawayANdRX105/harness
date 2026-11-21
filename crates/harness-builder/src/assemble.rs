@@ -1,13 +1,8 @@
 //! Runtime assembly: map config sections onto harness types, then build the
-//! assembled runtime from a validated spec by explicit injection.
+//! assembled runtime from a profile plus explicit injections.
 //!
 //! # Design provenance
 //!
-//! - NanoHarness's `HarnessBuilder.build`
-//!   (`refs/nanoharness/nanoharness/profiles/builder.py:162`) — validate the
-//!   spec, resolve the manifest, bind services, return one assembled object.
-//!   The Rust reading replaces its dynamic `ExtensionManager` with explicit
-//!   `Arc<dyn ...>` injection and a static install order.
 //! - `harness-rs`'s `AgentLoop` builder (`with_tool` / `with_system` /
 //!   `with_compact_policy`) — the fluent, explicit knob surface. Here the
 //!   knobs are typed once and the resulting `LoopDeps` is what the loop
@@ -19,9 +14,10 @@
 //! # No defaults
 //!
 //! The builder never invents a model, a tool policy, an event sink or a tool
-//! set. A spec that declares nothing assembles nothing; a spec that declares
-//! something the host did not inject fails with a named error. That is the
-//! "explicit injection, no coding fallback" rule this crate exists to enforce.
+//! set. A profile that declares nothing assembles nothing; a profile that
+//! declares something the host did not inject fails with a named error. That
+//! is the "explicit injection, no coding fallback" rule this crate exists to
+//! enforce.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -30,27 +26,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use harness_config::{BudgetConfig, Config, McpServerEntry, ModelsConfig, PromptSection};
-use harness_context::{Budget, CompactionStage, Compactor};
+use harness_config::{BudgetConfig, Config, ModelsConfig};
+use harness_context::{Budget, CompactProcessor, CompactionStage, Compactor};
 use harness_core::EventSink;
 use harness_core::message::Message;
 use harness_core::model::{Model, ModelInfo};
 use harness_core::policy::{ApprovalBroker, ToolPolicy};
 use harness_core::run::RunLimits;
 use harness_core::tool::{Tool, ToolRequest};
-use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode};
-use harness_mcp::{Mcp, McpServerConfig, ToolMeta};
+use harness_core::topology::Processor;
+use harness_core::{LoopHooks, ToolExecutionMode};
+use harness_loop::{Chain, LoopDeps};
 use harness_model::AliasRegistry;
+
+use crate::instruction_processor::InstructionProcessor;
+use crate::system_ledger_processor::SystemLedgerProcessor;
+use harness_mcp::{Mcp, McpServerConfig, ToolMeta};
 use harness_tools::{
     EditTool, GlobTool, GrepTool, ReadTool, SkillMeta, SkillTool, TerminalTool, WebFetchTool,
     WriteTool, discover_skills,
 };
 
 use crate::BuildError;
-use crate::analyze;
-use crate::spec::{
-    CompactionPolicySpec, HarnessSpec, HookKind, McpServerSpec, ModelSpec, PromptSectionSpec,
-    SkillSpec, ToolKind, ToolSpec, UnitManifest,
+use crate::profile::{
+    CompactionPolicy, HarnessProfile, HookKind, McpServerEntry, ModelEntry, PromptSection,
+    SkillRef, ToolEntry, ToolKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,7 +101,9 @@ pub fn alias_registry_from_models(models: &ModelsConfig) -> AliasRegistry {
 ///
 /// Returns [`BuildError::MissingEnvVar`] when `env_var` names an unset
 /// variable.
-pub fn mcp_server_config_from_entry(entry: &McpServerEntry) -> Result<McpServerConfig, BuildError> {
+pub fn mcp_server_config_from_entry(
+    entry: &harness_config::McpServerEntry,
+) -> Result<McpServerConfig, BuildError> {
     let mut env = HashMap::new();
     if let Some(variable) = &entry.env_var {
         let value = std::env::var(variable).map_err(|_| BuildError::MissingEnvVar {
@@ -120,20 +122,20 @@ pub fn mcp_server_config_from_entry(entry: &McpServerEntry) -> Result<McpServerC
     })
 }
 
-/// A spec model declaration mapped to the core catalog type.
-pub fn model_info_from_spec(spec: &ModelSpec) -> ModelInfo {
+/// A profile model entry mapped to the core catalog type.
+pub fn model_info_from_entry(entry: &ModelEntry) -> ModelInfo {
     ModelInfo {
-        handle: spec.handle.clone(),
-        provider: spec.provider.clone(),
-        model: spec.model.clone(),
-        context_window: spec.context_window,
-        supports_tool_use: spec.supports_tool_use,
-        supports_streaming: spec.supports_streaming,
+        handle: entry.handle.clone(),
+        provider: entry.provider.clone(),
+        model: entry.model.clone(),
+        context_window: entry.context_window,
+        supports_tool_use: entry.supports_tool_use,
+        supports_streaming: entry.supports_streaming,
     }
 }
 
-/// Spec compaction stages mapped to `harness-context` stages.
-pub fn compaction_stages_from_spec(policy: &CompactionPolicySpec) -> Vec<CompactionStage> {
+/// Profile compaction stages mapped to `harness-context` stages.
+pub fn compaction_stages_from_policy(policy: &CompactionPolicy) -> Vec<CompactionStage> {
     policy
         .stages
         .iter()
@@ -197,31 +199,33 @@ impl Default for ConfigBindings {
     }
 }
 
-// ── Config → spec mapping ───────────────────────────────────────────────────
+// ── Config → profile mapping ─────────────────────────────────────────────
 
-/// Map config prompt sections into spec entries, preserving the config's
+/// Map config prompt sections into profile entries, preserving the config's
 /// order. The assembled ledger is ordered by section name, so duplicate
-/// section names are rejected by spec validation as duplicate units.
-pub fn prompt_sections(sections: &[PromptSection]) -> Vec<PromptSectionSpec> {
+/// section names collapse on assembly — the first one wins.
+pub fn prompt_sections(sections: &[harness_config::PromptSection]) -> Vec<PromptSection> {
     sections
         .iter()
-        .map(|section| PromptSectionSpec {
+        .map(|section| PromptSection {
             name: section.name.clone(),
             content: section.content.clone(),
-            manifest: Default::default(),
         })
         .collect()
 }
 
-/// Map config MCP server entries into spec server declarations.
+/// Map config MCP server entries into profile server declarations.
 ///
 /// `from_config: true` defers command/env resolution to [`ConfigBindings`] at
 /// assembly time, so each server is described once in the config and the
-/// spec stays free of deployment detail.
-pub fn mcp_server_specs(entries: &[McpServerEntry]) -> Vec<McpServerSpec> {
+/// profile stays free of deployment detail. Servers spawn lazily when their
+/// first tool is built, so servers and tools need no ordering.
+pub fn mcp_server_entries_from_config(
+    entries: &[harness_config::McpServerEntry],
+) -> Vec<McpServerEntry> {
     entries
         .iter()
-        .map(|entry| McpServerSpec {
+        .map(|entry| McpServerEntry {
             name: entry.name.clone(),
             command: None,
             args: Vec::new(),
@@ -229,40 +233,32 @@ pub fn mcp_server_specs(entries: &[McpServerEntry]) -> Vec<McpServerSpec> {
             url: None,
             tool_call_timeout_ms: None,
             from_config: true,
-            // The matching `mcp_tool_specs` unit requires this capability so
-            // analysis installs the server before its tools.
-            manifest: UnitManifest {
-                provides: vec![format!("mcp:{}", entry.name)],
-                ..UnitManifest::default()
-            },
         })
         .collect()
 }
 
-/// One MCP tool unit per server: `remote: None` installs every tool the
-/// server advertises. The spec name is only the unit label — the model-facing
-/// names are the server's remote tools with the `mcp__<server>__<tool>`
-/// namespace — so the `mcp-<server>` label cannot collide with a builtin.
-pub fn mcp_tool_specs(entries: &[McpServerEntry]) -> Vec<ToolSpec> {
+/// One MCP tool entry per server: `remote: None` installs every tool the
+/// server advertises. The entry name is only a label — the model-facing names
+/// are the server's remote tools with the `mcp__<server>__<tool>` namespace —
+/// so the `mcp-<server>` label cannot collide with a builtin.
+pub fn mcp_tool_entries(entries: &[harness_config::McpServerEntry]) -> Vec<ToolEntry> {
     entries
         .iter()
-        .map(|entry| ToolSpec {
+        .map(|entry| ToolEntry {
             name: format!("mcp-{}", entry.name),
             kind: ToolKind::Mcp,
             server: Some(entry.name.clone()),
             remote: None,
-            manifest: Default::default(),
         })
         .collect()
 }
 
-/// Scan each skills root and map every discovered skill to a spec entry.
+/// Scan each skills root and map every discovered skill to a profile entry.
 ///
 /// Duplicate names keep the first root's skill (a user-level root shadows a
-/// later project-level root); the builder would otherwise reject the
-/// duplicate unit ids at validation time. Roots need not exist — an
-/// unreadable root yields no skills rather than a startup failure.
-pub fn skill_specs_from_roots(roots: &[String]) -> Vec<SkillSpec> {
+/// later project-level root). Roots need not exist — an unreadable root
+/// yields no skills rather than a startup failure.
+pub fn skill_refs_from_roots(roots: &[String]) -> Vec<SkillRef> {
     let mut seen = std::collections::HashSet::new();
     roots
         .iter()
@@ -272,11 +268,7 @@ pub fn skill_specs_from_roots(roots: &[String]) -> Vec<SkillSpec> {
                 .map(|skill| (skill.name, root.clone()))
         })
         .filter(|(name, _)| seen.insert(name.clone()))
-        .map(|(name, root)| SkillSpec {
-            name,
-            path: root,
-            manifest: Default::default(),
-        })
+        .map(|(name, root)| SkillRef { name, path: root })
         .collect()
 }
 
@@ -340,13 +332,15 @@ impl fmt::Debug for CompactionPlan {
 /// skills, models, aliases, limits, budget, compaction, MCP pool) are the
 /// session/config surface it carries alongside the loop dependencies.
 pub struct AssembledRuntime {
-    pub spec_name: String,
-    /// Unit ids in the order dependency analysis resolved them.
-    pub install_order: Vec<String>,
+    pub profile_name: String,
     pub model: Arc<dyn Model>,
     /// The prompt ledger, `None` when the spec declares no prompt sections.
     pub prompt: Option<Message>,
     pub tools: Vec<Arc<dyn Tool>>,
+    /// The prompt-side machining chain: system ledger, declared
+    /// instructions, host nodes, and — when a compactor is injected — the
+    /// budget gate as its last node.
+    pub prompt_chain: Chain,
     pub mcp_pool: McpPool,
     pub hooks: LoopHooks,
     pub skills: Vec<SkillMeta>,
@@ -373,11 +367,7 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker.clone(),
             hooks: self.hooks.clone(),
             tool_mode: self.tool_mode,
-            budget: Some(self.budget),
-            compactor: self
-                .compaction
-                .as_ref()
-                .and_then(|plan| plan.compactor.as_ref().map(Arc::clone)),
+            prompt_chain: self.prompt_chain.clone(),
             seed: Vec::new(),
             transcript_sink: None,
         }
@@ -394,8 +384,7 @@ impl AssembledRuntime {
             approval_broker: self.approval_broker,
             hooks: self.hooks,
             tool_mode: self.tool_mode,
-            budget: Some(self.budget),
-            compactor: self.compaction.and_then(|plan| plan.compactor),
+            prompt_chain: self.prompt_chain,
             seed: Vec::new(),
             transcript_sink: None,
         }
@@ -406,12 +395,12 @@ impl fmt::Debug for AssembledRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tool_names: Vec<&str> = self.tools.iter().map(|tool| tool.name()).collect();
         f.debug_struct("AssembledRuntime")
-            .field("spec_name", &self.spec_name)
-            .field("install_order", &self.install_order)
+            .field("profile_name", &self.profile_name)
             .field("model", self.model.info())
             .field("tools", &tool_names)
             .field("prompt", &self.prompt.as_ref().map(prompt_section_names))
             .field("mcp_pool", &self.mcp_pool)
+            .field("prompt_chain", &self.prompt_chain)
             .field("hooks", &self.hooks)
             .field("skills", &self.skills)
             .field("models", &self.models)
@@ -435,15 +424,15 @@ fn prompt_section_names(message: &Message) -> Vec<String> {
 // Builder
 // ---------------------------------------------------------------------------
 
-/// Builds an [`AssembledRuntime`] from a [`HarnessSpec`].
+/// Builds an [`AssembledRuntime`] from a [`HarnessProfile`].
 ///
-/// Every capability the spec declares must be supplied explicitly: the model
-/// adapter, the tool policy and the event sink are required injections; tools
-/// of kind `external` must be registered with [`HarnessBuilder::with_tool`];
-/// builtin tools need a working directory via [`HarnessBuilder::with_cwd`].
-/// Nothing is defaulted — see the module docs.
+/// Every capability the profile declares must be supplied explicitly: the
+/// model adapter, the tool policy and the event sink are required injections;
+/// tools of kind `external` must be registered with
+/// [`HarnessBuilder::with_tool`]; builtin tools need a working directory via
+/// [`HarnessBuilder::with_cwd`]. Nothing is defaulted — see the module docs.
 pub struct HarnessBuilder {
-    spec: HarnessSpec,
+    profile: HarnessProfile,
     model: Option<Arc<dyn Model>>,
     policy: Option<Arc<dyn ToolPolicy>>,
     approval_broker: Option<Arc<dyn ApprovalBroker>>,
@@ -453,13 +442,17 @@ pub struct HarnessBuilder {
     config: Option<ConfigBindings>,
     tool_mode: ToolExecutionMode,
     compactor: Option<Arc<dyn Compactor>>,
+    /// Host-supplied chain nodes, appended after the spec's prompt
+    /// nodes. Hosts extend the prompt phase here; the response phase
+    /// (model / append / tool dispatch) stays loop-owned.
+    custom_processors: Vec<Arc<dyn Processor>>,
 }
 
 impl HarnessBuilder {
-    /// Start a builder for a spec.
-    pub fn new(spec: HarnessSpec) -> Self {
+    /// Start a builder for a capability preset.
+    pub fn new(profile: HarnessProfile) -> Self {
         Self {
-            spec,
+            profile,
             model: None,
             policy: None,
             approval_broker: None,
@@ -469,6 +462,7 @@ impl HarnessBuilder {
             config: None,
             tool_mode: ToolExecutionMode::default(),
             compactor: None,
+            custom_processors: Vec::new(),
         }
     }
 
@@ -543,21 +537,33 @@ impl HarnessBuilder {
         self
     }
 
-    /// Validate, analyze, and assemble.
+    /// Register one custom chain node.
+    ///
+    /// Custom nodes run in the prompt phase, after the spec's system ledger
+    /// and instruction nodes and before the model call — the extension
+    /// surface for host-side prompt machining (retrieval injection, memory
+    /// recall, extra context sections). The response phase stays
+    /// loop-owned; hosts extend it by implementing `Processor` themselves
+    /// only where they also own the loop.
+    #[must_use]
+    pub fn with_processor(mut self, node: Arc<dyn Processor>) -> Self {
+        self.custom_processors.push(node);
+        self
+    }
+
+    /// Assemble the runtime.
     ///
     /// # Errors
     ///
-    /// [`BuildError::Spec`] / [`BuildError::Analyze`] for spec and dependency
-    /// problems; [`BuildError::MissingModel`], [`BuildError::MissingPolicy`],
+    /// [`BuildError::MissingModel`], [`BuildError::MissingPolicy`],
     /// [`BuildError::MissingEventSink`], [`BuildError::MissingCwd`] and
     /// [`BuildError::MissingExternalTool`] for missing explicit injections;
     /// [`BuildError::Mcp`] / [`BuildError::SkillNotFound`] for assembly
-    /// failures.
+    /// failures. A declaration that cannot be resolved against what the host
+    /// injected surfaces here — the profile itself carries no validation.
     pub fn build(mut self) -> Result<AssembledRuntime, BuildError> {
-        self.spec.validate()?;
-        let analysis = analyze::analyze(&self.spec)?;
         let model = self.model.ok_or(BuildError::MissingModel)?;
-        if let Some(expected) = &self.spec.default_model {
+        if let Some(expected) = &self.profile.default_model {
             let actual = model.info().handle.as_str();
             if actual != expected.as_str() {
                 return Err(BuildError::ModelMismatch {
@@ -571,34 +577,40 @@ impl HarnessBuilder {
         let config = self.config.unwrap_or_default();
 
         let mut tools = assemble_tools(
-            &self.spec,
-            &analysis.install_order,
+            &self.profile,
             &self.external_tools,
             self.cwd.as_deref(),
             &config,
         )?;
-        let skills = assemble_skills(&self.spec.skills)?;
-        // Register the `skill` tool when the spec declares skills, so the
+        let skills = assemble_skills(&self.profile.skills)?;
+        // Register the `skill` tool when the profile declares skills, so the
         // loop can activate any declared skill by name (issue #7). The tool
         // reads each SKILL.md body on demand; `skills` metadata is unchanged
         // and additionally exposed on `AssembledRuntime.skills`.
         register_skill_tool(&mut tools, &skills, self.cwd.clone().unwrap_or_default())?;
-        let prompt = assemble_prompt(&self.spec.prompt_sections);
-        let hooks = assemble_hooks(&self.spec, &prompt);
-        let models: Vec<ModelInfo> = self.spec.models.iter().map(model_info_from_spec).collect();
-        let compaction_stages = compaction_stages_from_spec(&self.spec.compaction);
+        let prompt = assemble_prompt(&self.profile.prompt);
+        let compaction_stages = compaction_stages_from_policy(&self.profile.compaction);
         let compaction = (!compaction_stages.is_empty()).then_some(CompactionPlan {
             stages: compaction_stages,
             budget: config.budget,
             compactor: self.compactor.take(),
         });
+        let hooks = assemble_hooks(&self.profile)?;
+        let prompt_chain =
+            assemble_prompt_chain(&self.profile, &prompt, &self.custom_processors, &compaction);
+        let models: Vec<ModelInfo> = self
+            .profile
+            .models
+            .iter()
+            .map(model_info_from_entry)
+            .collect();
 
         Ok(AssembledRuntime {
-            spec_name: self.spec.name,
-            install_order: analysis.install_order,
+            profile_name: self.profile.name,
             model,
             prompt,
             tools: tools.tools,
+            prompt_chain,
             mcp_pool: tools.pool,
             hooks,
             skills,
@@ -618,7 +630,7 @@ impl HarnessBuilder {
 impl fmt::Debug for HarnessBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HarnessBuilder")
-            .field("spec", &self.spec.name)
+            .field("profile", &self.profile.name)
             .field("has_model", &self.model.is_some())
             .field("has_policy", &self.policy.is_some())
             .field("has_event_sink", &self.event_sink.is_some())
@@ -646,7 +658,7 @@ struct ToolContext<'a, 's> {
     external: &'a HashMap<String, Arc<dyn Tool>>,
     cwd: Option<&'a Path>,
     config: &'a ConfigBindings,
-    servers: &'a HashMap<&'s str, &'s McpServerSpec>,
+    servers: &'a HashMap<&'s str, &'s McpServerEntry>,
 }
 
 /// One spawned MCP server: the metadata it advertised and the tools built
@@ -657,18 +669,12 @@ struct SpawnedServer {
 }
 
 fn assemble_tools(
-    spec: &HarnessSpec,
-    install_order: &[String],
+    profile: &HarnessProfile,
     external: &HashMap<String, Arc<dyn Tool>>,
     cwd: Option<&Path>,
     config: &ConfigBindings,
 ) -> Result<ToolAssembly, BuildError> {
-    let by_name: HashMap<&str, &ToolSpec> = spec
-        .tools
-        .iter()
-        .map(|tool| (tool.name.as_str(), tool))
-        .collect();
-    let servers: HashMap<&str, &McpServerSpec> = spec
+    let servers: HashMap<&str, &McpServerEntry> = profile
         .mcp_servers
         .iter()
         .map(|server| (server.name.as_str(), server))
@@ -686,14 +692,10 @@ fn assemble_tools(
     };
     let mut spawned: HashMap<String, SpawnedServer> = HashMap::new();
     let mut installed_names = HashSet::new();
-    for unit in install_order {
-        let Some(name) = unit.strip_prefix("tool:") else {
-            continue;
-        };
-        let tool = by_name
-            .get(name)
-            .copied()
-            .ok_or_else(|| BuildError::UnknownToolUnit { unit: unit.clone() })?;
+    // Tools install in profile order. MCP servers spawn lazily inside
+    // `assemble_one_tool` when their first tool is built, so no ordering
+    // between servers and their tools is needed.
+    for tool in &profile.tools {
         let installed = assemble_one_tool(tool, &context, &mut spawned, &mut assembly.pool)?;
         for tool in installed {
             if !installed_names.insert(tool.name().to_string()) {
@@ -708,7 +710,7 @@ fn assemble_tools(
 }
 
 fn assemble_one_tool(
-    tool: &ToolSpec,
+    tool: &ToolEntry,
     context: &ToolContext<'_, '_>,
     spawned: &mut HashMap<String, SpawnedServer>,
     pool: &mut McpPool,
@@ -744,7 +746,7 @@ fn builtin_tool(name: &str, cwd: Option<&Path>) -> Result<Arc<dyn Tool>, BuildEr
 }
 
 fn assemble_mcp_tool(
-    tool: &ToolSpec,
+    tool: &ToolEntry,
     context: &ToolContext<'_, '_>,
     spawned: &mut HashMap<String, SpawnedServer>,
     pool: &mut McpPool,
@@ -810,7 +812,7 @@ fn assemble_mcp_tool(
 }
 
 fn resolve_server_config(
-    server: &McpServerSpec,
+    server: &McpServerEntry,
     config: &ConfigBindings,
 ) -> Result<McpServerConfig, BuildError> {
     if server.from_config {
@@ -822,10 +824,10 @@ fn resolve_server_config(
                 })?;
         return Ok(merge_server_config(base.clone(), server));
     }
-    Ok(server_config_from_spec(server))
+    Ok(server_config_from_entry(server))
 }
 
-fn server_config_from_spec(server: &McpServerSpec) -> McpServerConfig {
+fn server_config_from_entry(server: &McpServerEntry) -> McpServerConfig {
     McpServerConfig {
         name: server.name.clone(),
         command: server.command.clone(),
@@ -842,7 +844,7 @@ fn server_config_from_spec(server: &McpServerSpec) -> McpServerConfig {
 
 /// Merge a config-backed server with its spec declaration: the spec wins on
 /// every field it sets, the config fills the rest.
-fn merge_server_config(mut base: McpServerConfig, spec: &McpServerSpec) -> McpServerConfig {
+fn merge_server_config(mut base: McpServerConfig, spec: &McpServerEntry) -> McpServerConfig {
     base.name = spec.name.clone();
     base.command = spec.command.clone().or(base.command);
     if !spec.args.is_empty() {
@@ -882,7 +884,7 @@ fn spawn_mcp_server(config: &McpServerConfig) -> Result<SpawnedServer, BuildErro
 // Prompt, hooks and skills
 // ---------------------------------------------------------------------------
 
-fn assemble_prompt(sections: &[PromptSectionSpec]) -> Option<Message> {
+fn assemble_prompt(sections: &[PromptSection]) -> Option<Message> {
     if sections.is_empty() {
         return None;
     }
@@ -893,17 +895,17 @@ fn assemble_prompt(sections: &[PromptSectionSpec]) -> Option<Message> {
     Some(Message::System { sections: ledger })
 }
 
-fn assemble_skills(specs: &[SkillSpec]) -> Result<Vec<SkillMeta>, BuildError> {
-    specs.iter().map(resolve_skill).collect()
+fn assemble_skills(refs: &[SkillRef]) -> Result<Vec<SkillMeta>, BuildError> {
+    refs.iter().map(resolve_skill).collect()
 }
 
-fn resolve_skill(spec: &SkillSpec) -> Result<SkillMeta, BuildError> {
-    discover_skills(Path::new(&spec.path))
+fn resolve_skill(skill_ref: &SkillRef) -> Result<SkillMeta, BuildError> {
+    discover_skills(Path::new(&skill_ref.path))
         .into_iter()
-        .find(|skill| skill.name == spec.name)
+        .find(|skill| skill.name == skill_ref.name)
         .ok_or_else(|| BuildError::SkillNotFound {
-            name: spec.name.clone(),
-            path: spec.path.clone(),
+            name: skill_ref.name.clone(),
+            path: skill_ref.path.clone(),
         })
 }
 /// Register the `skill` tool when the spec declares skills, so the loop can
@@ -934,64 +936,73 @@ fn register_skill_tool(
     Ok(())
 }
 
-type PrepareRequestFn = Arc<dyn Fn(Vec<Message>) -> Vec<Message> + Send + Sync>;
 type BeforeToolCallFn = Arc<dyn Fn(&ToolRequest) -> Result<(), String> + Send + Sync>;
 
-fn assemble_hooks(spec: &HarnessSpec, prompt: &Option<Message>) -> LoopHooks {
+fn assemble_hooks(profile: &HarnessProfile) -> Result<LoopHooks, BuildError> {
     let mut hooks = LoopHooks::default();
 
-    // The prompt ledger and a declared instruction both ride the one
-    // `prepare_request` seam, so they are composed in a fixed order: the
-    // prompt first (it must lead the transcript), then the instruction.
-    let prompt_hook = prompt.clone().map(prompt_prepare_hook);
-    let instruction_hook = spec.hooks.iter().find_map(|hook| match &hook.kind {
-        HookKind::InjectInstruction { text } => Some(instruction_prepare_hook(text)),
-        _ => None,
-    });
-    hooks.prepare_request = compose_prepare_hooks(prompt_hook, instruction_hook);
-
-    for hook in &spec.hooks {
+    for hook in &profile.hooks {
         match &hook.kind {
             HookKind::DenyTools { tools } => {
+                if hooks.before_tool_call.is_some() {
+                    return Err(BuildError::DuplicateHookKind {
+                        seam: "before_tool_call",
+                    });
+                }
                 hooks.before_tool_call = Some(deny_tools_hook(&hook.name, tools));
             }
             HookKind::TerminateAfterToolBatch => {
+                if hooks.should_terminate_tool_batch.is_some() {
+                    return Err(BuildError::DuplicateHookKind {
+                        seam: "should_terminate_tool_batch",
+                    });
+                }
                 hooks.should_terminate_tool_batch = Some(Arc::new(|_, _| true));
             }
             HookKind::InjectInstruction { .. } => {}
         }
     }
-    hooks
+    Ok(hooks)
 }
 
-fn prompt_prepare_hook(prompt: Message) -> PrepareRequestFn {
-    Arc::new(move |mut messages| {
-        if messages.first() != Some(&prompt) {
-            messages.insert(0, prompt.clone());
-        }
-        messages
-    })
-}
-
-fn instruction_prepare_hook(text: &str) -> PrepareRequestFn {
-    let instruction = Message::user_text(text);
-    Arc::new(move |mut messages| {
-        if !messages.contains(&instruction) {
-            messages.push(instruction.clone());
-        }
-        messages
-    })
-}
-
-fn compose_prepare_hooks(
-    first: Option<PrepareRequestFn>,
-    second: Option<PrepareRequestFn>,
-) -> Option<PrepareRequestFn> {
-    match (first, second) {
-        (None, None) => None,
-        (Some(hook), None) | (None, Some(hook)) => Some(hook),
-        (Some(first), Some(second)) => Some(Arc::new(move |messages| second(first(messages)))),
+/// The prompt-side chain: the system ledger node leads (it must precede
+/// everything), then the declared instruction nodes (one per
+/// `InjectInstruction` hook, each independently idempotent), the host's
+/// custom nodes from `HarnessBuilder::with_processor`, and — when a
+/// compactor is injected — the compaction node last, so compaction sees
+/// the prompt-machined ledger before the model call (the position the
+/// legacy `run()` had it).
+///
+/// The prompt chain is assembled once at build time: its nodes hold no
+/// per-run state (prompt nodes emit nothing; the compaction node emits
+/// through the turn's sink), so the shared `Chain` is safe across runs.
+fn assemble_prompt_chain(
+    profile: &HarnessProfile,
+    prompt: &Option<Message>,
+    custom: &[Arc<dyn Processor>],
+    compaction: &Option<CompactionPlan>,
+) -> Chain {
+    let mut chain = Chain::new();
+    if let Some(prompt) = prompt {
+        chain = chain.node(Arc::new(SystemLedgerProcessor::new(prompt.clone())));
     }
+    for hook in &profile.hooks {
+        if let HookKind::InjectInstruction { text } = &hook.kind {
+            chain = chain.node(Arc::new(InstructionProcessor::new(text)));
+        }
+    }
+    for node in custom {
+        chain = chain.node(Arc::clone(node));
+    }
+    if let Some(plan) = compaction
+        && let Some(compactor) = &plan.compactor
+    {
+        chain = chain.node(Arc::new(CompactProcessor::new(
+            Arc::clone(compactor),
+            Some(plan.budget),
+        )));
+    }
+    chain
 }
 
 fn deny_tools_hook(hook_name: &str, tools: &[String]) -> BeforeToolCallFn {

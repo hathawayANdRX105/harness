@@ -104,7 +104,7 @@ pub struct ToolRequest {
     pub session_id: crate::run::SessionId,
     /// Which turn of the run issued the call (0-based).
     #[serde(default)]
-    pub turn: u32,
+    pub turn_idx: u32,
 }
 
 /// One model-callable tool.

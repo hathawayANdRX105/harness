@@ -2,29 +2,32 @@
 name = "harness-loop"
 version = "0.1.0"
 edition = "2024"
-description = "Harness agent loop: model stream -> tool dispatch -> turn loop, with pi-style hooks and no persistent engine state."
+description = "Harness agent loop driver: drives one run as two topologies (prompt machining, model → append → tool dispatch) over a single Turn — stateless, no processor implementations of its own"
 license = "MIT"
 publish = false
 
 [dependencies]
+# The response chain's domain-owned nodes: the model stream node and append
+# gate (harness-model), the tool dispatch node (harness-tools). The loop is
+# the assembly surface — it composes the default chain at run time from
+# whatever sinks the run carries (see `LoopDeps::response_topology`).
 harness-core = { path = "../harness-core" }
-harness-context = { path = "../harness-context" }
-async-trait = "0.1"
-serde_json = "1"
-# macros only: `tokio::select!` races the model stream against the cancel
-# token in pump_stream; the loop itself stays runtime-agnostic.
-tokio = { version = "1", default-features = false, features = ["macros"] }
-futures = { version = "0.3", default-features = false, features = [
-    "std",
-    "async-await",
-] }
+harness-model = { path = "../harness-model" }
+# driver lands the partial tool batch through the tool domain's helper. No
+# stream, runtime or serialization dependency belongs here — those ride the
+# domain crates that own the nodes.
+harness-tools = { path = "../harness-tools" }
 
 [dev-dependencies]
 harness-core = { path = "../harness-core" }
+harness-context = { path = "../harness-context" }
+harness-model = { path = "../harness-model" }
+harness-tools = { path = "../harness-tools" }
+async-trait = "0.1"
 futures = "0.3"
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = [] }
-async-trait = "0.1"
 
 [lints]
 workspace = true

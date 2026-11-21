@@ -21,16 +21,17 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use harness_context::{
-    Budget, BudgetBlocked, CompactionCheckpoint, CompactionResult, CompactionStage, Compactor,
-    DefaultCompactor,
+    Budget, BudgetBlocked, CompactProcessor, CompactionCheckpoint, CompactionResult,
+    CompactionStage, Compactor, DefaultCompactor,
 };
 use harness_core::event::{EventSink, RunEvent, RunEventKind};
 use harness_core::message::{Content, Message};
 use harness_core::model::{Model, ModelEvent, ModelInfo, ModelRequest, ModelStream};
 use harness_core::policy::{PolicyDecision, PolicyOutcome, PolicyStage, ToolExecution, ToolPolicy};
 use harness_core::run::{RunContext, RunId, RunLimits, RunStopReason, SessionId, Task};
-use harness_core::{RunControl, StopReason};
-use harness_loop::{LoopDeps, LoopHooks, ToolExecutionMode, run};
+use harness_core::{LoopHooks, RunControl, StopReason, ToolExecutionMode};
+use harness_loop::Chain;
+use harness_loop::{LoopDeps, run};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -339,12 +340,14 @@ async fn budget_exhausted_from_start_refuses_before_provider() -> Result<(), Str
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
+            Arc::clone(&compactor) as Arc<dyn Compactor>,
+            Some(Budget {
+                used_tokens: 0,
+                available_tokens: 0,
+            }),
+        ))),
         tool_mode: ToolExecutionMode::Sequential,
-        budget: Some(Budget {
-            used_tokens: 0,
-            available_tokens: 0,
-        }),
-        compactor: Some(Arc::clone(&compactor) as Arc<dyn Compactor>),
         seed: Vec::new(),
         transcript_sink: None,
     });
@@ -435,12 +438,14 @@ async fn compaction_frees_room_then_turn_proceeds() -> Result<(), String> {
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
+            Arc::clone(&compactor) as Arc<dyn Compactor>,
+            Some(Budget {
+                used_tokens: 0,
+                available_tokens: 256,
+            }),
+        ))),
         tool_mode: ToolExecutionMode::Sequential,
-        budget: Some(Budget {
-            used_tokens: 0,
-            available_tokens: 256,
-        }),
-        compactor: Some(Arc::clone(&compactor) as Arc<dyn Compactor>),
         seed: Vec::new(),
         transcript_sink: None,
     });
@@ -558,16 +563,19 @@ async fn real_default_compactor_shrinks_oversized_history() {
         ]],
     ));
     let compactor = Arc::new(harness_context::DefaultCompactor::new());
+    let sink = Arc::new(TestSink::default());
     let deps = Arc::new(LoopDeps {
         model: Arc::clone(&model) as Arc<dyn Model>,
         tools: Vec::new(),
-        event_sink: Arc::new(TestSink::default()),
+        event_sink: sink.clone(),
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
+            Arc::clone(&compactor) as Arc<dyn Compactor>,
+            None,
+        ))),
         tool_mode: ToolExecutionMode::Sequential,
-        budget: None,
-        compactor: Some(Arc::clone(&compactor) as Arc<dyn Compactor>),
         seed: seed_oversized_history(),
         transcript_sink: None,
     });
@@ -624,16 +632,19 @@ async fn real_default_compactor_refuses_unshrinkable_history() {
             ModelEvent::Stop(StopReason::EndTurn),
         ]],
     ));
+    let sink = Arc::new(TestSink::default());
     let deps = Arc::new(LoopDeps {
         model: Arc::clone(&model) as Arc<dyn Model>,
         tools: Vec::new(),
-        event_sink: Arc::new(TestSink::default()),
+        event_sink: sink.clone(),
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
+            Arc::new(harness_context::DefaultCompactor::new()) as Arc<dyn Compactor>,
+            None,
+        ))),
         tool_mode: ToolExecutionMode::Sequential,
-        budget: None,
-        compactor: Some(Arc::new(harness_context::DefaultCompactor::new()) as Arc<dyn Compactor>),
         seed: vec![Message::user_text("y".repeat(100_000))],
         transcript_sink: None,
     });
@@ -672,19 +683,22 @@ async fn configured_budget_caps_the_compactor_window() {
             ModelEvent::Stop(StopReason::EndTurn),
         ]],
     ));
+    let sink = Arc::new(TestSink::default());
     let deps = Arc::new(LoopDeps {
         model: Arc::clone(&model) as Arc<dyn Model>,
         tools: Vec::new(),
-        event_sink: Arc::new(TestSink::default()),
+        event_sink: sink.clone(),
         policy: Arc::new(AllowAllPolicy),
         approval_broker: None,
         hooks: LoopHooks::default(),
+        prompt_chain: Chain::new().node(Arc::new(CompactProcessor::new(
+            Arc::new(DefaultCompactor::new()) as Arc<dyn Compactor>,
+            Some(Budget {
+                used_tokens: 0,
+                available_tokens: 100,
+            }),
+        ))),
         tool_mode: ToolExecutionMode::Sequential,
-        budget: Some(Budget {
-            used_tokens: 0,
-            available_tokens: 100,
-        }),
-        compactor: Some(Arc::new(DefaultCompactor::new()) as Arc<dyn Compactor>),
         seed: vec![Message::user_text("x".repeat(1_000))],
         transcript_sink: None,
     });
