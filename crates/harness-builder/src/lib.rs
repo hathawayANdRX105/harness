@@ -1,14 +1,12 @@
-//! Harness builder: turn a declarative [`HarnessSpec`] into an assembled
+//! Harness builder: turn a declarative [`HarnessProfile`] into an assembled
 //! runtime by explicit injection.
 //!
-//! The crate has four stages, each usable on its own:
+//! The crate has two stages, each usable on its own:
 //!
 //! | Stage | Entry point | What it does |
 //! |---|---|---|
-//! | Declare | [`HarnessSpec`] (serde) | Describes tools, prompt sections, skills, hooks, MCP servers, models and a compaction policy. Validates without any config. |
-//! | Analyze | [`analyze`] | Resolves the units' `provides` / `requires` / `conflicts`, rejects missing/ambiguous providers, conflicts and cycles, and derives a deterministic install order. |
-//! | Explain | [`HarnessSpec::explain`] / [`explain`] | Dry-run text rendering of everything above — no processes, no filesystem. |
-//! | Assemble | [`HarnessBuilder::build`] | Produces an [`AssembledRuntime`]: model, tools, prompt ledger, hooks, MCP pool, skills, config surface, and [`harness_loop::LoopDeps`] for the scheduler. |
+//! | Declare | [`HarnessProfile`] (serde) | The capability preset: tools, prompt sections, skills, hooks, MCP servers, models and a compaction policy. Pure data — no validation machinery; mistakes surface at assembly. |
+//! | Assemble | [`HarnessBuilder::build`] | Produces an [`AssembledRuntime`]: model, tools, prompt ledger, hooks, MCP pool, skills, config surface, and [`harness_loop::LoopDeps`] for the scheduler. A declaration the host did not inject fails with a named error. |
 //!
 //! # Design provenance
 //!

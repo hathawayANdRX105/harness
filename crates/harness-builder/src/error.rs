@@ -18,6 +18,8 @@ pub enum BuildError {
     ModelMismatch { expected: String, actual: String },
     #[error("no tool policy was injected; the builder never falls back to allow-all")]
     MissingPolicy,
+    #[error("duplicate hook on seam `{seam}`; a profile may declare at most one hook per seam")]
+    DuplicateHookKind { seam: &'static str },
     #[error("no event sink was injected")]
     MissingEventSink,
     #[error("builtin tools need a working directory; call `with_cwd`")]

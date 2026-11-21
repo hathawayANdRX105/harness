@@ -476,11 +476,93 @@ fn external_tool_requires_injection() {
         "the missing external tool is named: {error:?}"
     );
 }
+/// Purpose: tools install in profile declaration order — the catalog's
+/// `names()` promises a stable order for prefix caching, and a HashMap
+/// iteration would randomize it across daemon starts.
+/// Acceptance: `runtime.tools` follows declaration order in both.
+#[test]
+fn tools_install_in_declaration_order() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
 
-/// Purpose: an external tool declared by the spec is installed only when the
-/// host injects an implementation with the same name.
-/// Scenario: the spec declares `custom`; the builder registers a `FixedTool`
-/// named `custom`.
+    let mut first = HarnessProfile::new("order-a");
+    first.tools.push(builtin_tool("glob"));
+    first.tools.push(builtin_tool("read"));
+    first.models.push(mock_model_entry());
+    first.default_model = Some("mock".into());
+    let runtime = builder_for(first, Arc::new(MockModel::new(Vec::new())))
+        .with_cwd(dir.path().to_path_buf())
+        .build()?;
+    let names: Vec<&str> = runtime.tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(names, vec!["glob", "read"], "declaration order is kept");
+
+    let mut second = HarnessProfile::new("order-b");
+    second.tools.push(builtin_tool("read"));
+    second.tools.push(builtin_tool("glob"));
+    second.models.push(mock_model_entry());
+    second.default_model = Some("mock".into());
+    let runtime = builder_for(second, Arc::new(MockModel::new(Vec::new())))
+        .with_cwd(dir.path().to_path_buf())
+        .build()?;
+    let names: Vec<&str> = runtime.tools.iter().map(|tool| tool.name()).collect();
+    assert_eq!(names, vec!["read", "glob"], "reverse input reverses output");
+    Ok(())
+}
+
+/// Purpose: a profile that declares the same tool name twice must fail at
+/// build time, not silently keep one entry.
+/// Scenario: two builtin `read` entries.
+/// Acceptance: `build` fails with `DuplicateTool`.
+#[test]
+fn duplicate_tool_entry_fails_build() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+
+    let mut spec = HarnessProfile::new("dup-tool");
+    spec.tools.push(builtin_tool("read"));
+    spec.tools.push(builtin_tool("read"));
+    spec.models.push(mock_model_entry());
+    spec.default_model = Some("mock".into());
+
+    let error = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
+        .with_cwd(dir.path().to_path_buf())
+        .build()
+        .err();
+    assert!(
+        matches!(error, Some(BuildError::DuplicateTool { ref name }) if name == "read"),
+        "the duplicate tool entry is rejected: {error:?}"
+    );
+    Ok(())
+}
+
+/// Purpose: at most one hook may occupy a loop seam; two competing hooks
+/// fail at build time instead of the earlier one being silently overwritten.
+/// Scenario: two `DenyTools` hooks on the `before_tool_call` seam.
+/// Acceptance: `build` fails with `DuplicateHookKind` naming the seam.
+#[test]
+fn duplicate_hook_seam_fails_build() {
+    let mut spec = HarnessProfile::new("dup-hook");
+    spec.hooks.push(HookEntry {
+        name: "first".into(),
+        kind: HookKind::DenyTools {
+            tools: vec!["rm".into()],
+        },
+    });
+    spec.hooks.push(HookEntry {
+        name: "second".into(),
+        kind: HookKind::DenyTools {
+            tools: vec!["sudo".into()],
+        },
+    });
+    spec.models.push(mock_model_entry());
+    spec.default_model = Some("mock".into());
+
+    let error = builder_for(spec, Arc::new(MockModel::new(Vec::new())))
+        .build()
+        .err();
+    assert!(
+        matches!(error, Some(BuildError::DuplicateHookKind { seam }) if seam == "before_tool_call"),
+        "two hooks on one seam are rejected: {error:?}"
+    );
+}
 /// Acceptance: `build` succeeds and the runtime carries the injected tool.
 #[test]
 fn external_tool_injection_installs_tool() -> Result<(), Box<dyn std::error::Error>> {

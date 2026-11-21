@@ -122,8 +122,7 @@ impl std::fmt::Debug for LoopDeps {
 impl LoopDeps {
     /// The response-phase chain the driver installs: model → append
     /// (gate) → tool dispatch, assembled from the domain-owned nodes
-    /// (`harness-model`, `harness-tools`) over **this** `LoopDeps`' own
-    /// sinks.
+    /// (`harness-model`, `harness-tools`).
     ///
     /// Assembly happens here, at run time, rather than at build time: the
     /// scheduler and the daemon swap `event_sink` / `transcript_sink` per

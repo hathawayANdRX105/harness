@@ -55,7 +55,7 @@ impl Processor for ModelProcessor {
             temperature: None,
         };
         emit_event(
-            turn.event_sink().as_ref(),
+            turn.seams.event_sink.as_ref(),
             &turn.ctx.run_id,
             &turn.ctx.session_id,
             &turn.seq,
@@ -68,7 +68,7 @@ impl Processor for ModelProcessor {
         let outcome = pump_stream(
             stream,
             &turn.seq,
-            turn.event_sink().as_ref(),
+            turn.seams.event_sink.as_ref(),
             &turn.ctx,
             &control,
         )
@@ -78,7 +78,7 @@ impl Processor for ModelProcessor {
         // Cancelled skips the event, Ok and Error both emit).
         if !matches!(outcome, StreamTurn::Cancelled) {
             emit_event(
-                turn.event_sink().as_ref(),
+                turn.seams.event_sink.as_ref(),
                 &turn.ctx.run_id,
                 &turn.ctx.session_id,
                 &turn.seq,

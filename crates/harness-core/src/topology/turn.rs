@@ -107,11 +107,6 @@ impl Turn {
         }
     }
 
-    /// The sink this run's events go to (see [`RunSeams::event_sink`]).
-    pub fn event_sink(&self) -> &Arc<dyn EventSink> {
-        &self.seams.event_sink
-    }
-
     /// Append one message at the ledger tail.
     ///
     /// A tail append cannot orphan a tool result from its call — pairing

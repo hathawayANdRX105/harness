@@ -54,7 +54,7 @@ impl<'a> DispatchCtx<'a> {
             approval_broker: &turn.seams.approval_broker,
             hooks: &turn.seams.hooks,
             seq: &turn.seq,
-            sink: turn.event_sink().as_ref(),
+            sink: turn.seams.event_sink.as_ref(),
             control: &turn.control,
         }
     }

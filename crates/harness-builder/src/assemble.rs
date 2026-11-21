@@ -595,7 +595,7 @@ impl HarnessBuilder {
             budget: config.budget,
             compactor: self.compactor.take(),
         });
-        let hooks = assemble_hooks(&self.profile);
+        let hooks = assemble_hooks(&self.profile)?;
         let prompt_chain =
             assemble_prompt_chain(&self.profile, &prompt, &self.custom_processors, &compaction);
         let models: Vec<ModelInfo> = self
@@ -674,11 +674,6 @@ fn assemble_tools(
     cwd: Option<&Path>,
     config: &ConfigBindings,
 ) -> Result<ToolAssembly, BuildError> {
-    let by_name: HashMap<&str, &ToolEntry> = profile
-        .tools
-        .iter()
-        .map(|tool| (tool.name.as_str(), tool))
-        .collect();
     let servers: HashMap<&str, &McpServerEntry> = profile
         .mcp_servers
         .iter()
@@ -700,7 +695,7 @@ fn assemble_tools(
     // Tools install in profile order. MCP servers spawn lazily inside
     // `assemble_one_tool` when their first tool is built, so no ordering
     // between servers and their tools is needed.
-    for tool in by_name.values() {
+    for tool in &profile.tools {
         let installed = assemble_one_tool(tool, &context, &mut spawned, &mut assembly.pool)?;
         for tool in installed {
             if !installed_names.insert(tool.name().to_string()) {
@@ -943,21 +938,31 @@ fn register_skill_tool(
 
 type BeforeToolCallFn = Arc<dyn Fn(&ToolRequest) -> Result<(), String> + Send + Sync>;
 
-fn assemble_hooks(profile: &HarnessProfile) -> LoopHooks {
+fn assemble_hooks(profile: &HarnessProfile) -> Result<LoopHooks, BuildError> {
     let mut hooks = LoopHooks::default();
 
     for hook in &profile.hooks {
         match &hook.kind {
             HookKind::DenyTools { tools } => {
+                if hooks.before_tool_call.is_some() {
+                    return Err(BuildError::DuplicateHookKind {
+                        seam: "before_tool_call",
+                    });
+                }
                 hooks.before_tool_call = Some(deny_tools_hook(&hook.name, tools));
             }
             HookKind::TerminateAfterToolBatch => {
+                if hooks.should_terminate_tool_batch.is_some() {
+                    return Err(BuildError::DuplicateHookKind {
+                        seam: "should_terminate_tool_batch",
+                    });
+                }
                 hooks.should_terminate_tool_batch = Some(Arc::new(|_, _| true));
             }
             HookKind::InjectInstruction { .. } => {}
         }
     }
-    hooks
+    Ok(hooks)
 }
 
 /// The prompt-side chain: the system ledger node leads (it must precede

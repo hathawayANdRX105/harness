@@ -203,26 +203,28 @@ pub fn integrity_hash(unit: &Unit, payload: &str) -> Result<String, SessionStore
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// The blocks one message contributes, each with its payload JSON.
+/// The blocks one message contributes, each with its payload JSON. Kinds
+/// come from the message model itself (`Message::kind` / `Content::kind` in
+/// core) — the store never re-derives the taxonomy.
 fn message_blocks(
     message: &Message,
 ) -> Result<Vec<(UnitKind, &'static str, &'static str, String)>, SessionStoreError> {
     match message {
         Message::System { sections } => Ok(vec![(
-            UnitKind::System,
+            message.kind(),
             "system",
             "system",
             serde_json::to_string(sections).map_err(SessionStoreError::Serialization)?,
         )]),
         Message::User { content } => Ok(vec![(
-            UnitKind::Prompt,
+            message.kind(),
             "user",
             "user",
             serde_json::to_string(content).map_err(SessionStoreError::Serialization)?,
         )]),
         Message::Assistant { content } => assistant_blocks(content),
         Message::ToolResult(result) => Ok(vec![(
-            UnitKind::ToolResult,
+            message.kind(),
             "tool",
             "tool",
             serde_json::to_string(result).map_err(SessionStoreError::Serialization)?,
